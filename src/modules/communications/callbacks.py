@@ -280,10 +280,13 @@ def claim_due_retries(connection, *, tenant_id: str,
 
 def reclaim_stale_sending(connection, *, tenant_id: str,
                           now: datetime | None = None) -> int:
-    """Return long-stuck 'sending' attempts to the queue after a worker death.
+    """Return long-stuck 'sending' work to the queue after a worker death.
 
     Only rows untouched for longer than SENDING_STALE_AFTER are reclaimed, so
-    a live worker's in-flight attempt is never stolen mid-send.
+    a live worker's in-flight attempt is never stolen mid-send. This covers
+    both retry attempts and first-dispatch claims (the latter have no attempt
+    row, so they return to 'recorded'; rows with a live sending attempt are
+    reclaimed through the attempt path above and never double-handled).
     """
     moment = now or datetime.now(timezone.utc)
     cutoff = (moment - SENDING_STALE_AFTER).isoformat()
@@ -300,7 +303,18 @@ def reclaim_stale_sending(connection, *, tenant_id: str,
                            version=version+1, updated_at=now()
                     WHERE tenant_id=:tenant AND id = ANY(:comms)"""),
             {"tenant": tenant_id, "comms": comms})
-    return len(comms)
+    orphans = connection.execute(
+        text("""UPDATE communications SET state='recorded',
+                       version=version+1, updated_at=now()
+                WHERE tenant_id=:tenant AND state='sending' AND updated_at <= :cutoff
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dispatch_attempts a
+                      WHERE a.tenant_id=communications.tenant_id
+                        AND a.communication_id=communications.id
+                        AND a.state='sending')
+                RETURNING id"""),
+        {"tenant": tenant_id, "cutoff": cutoff}).mappings().all()
+    return len(comms) + len(orphans)
 
 
 def requeue_dead_letter(connection, *, tenant_id: str, communication_id: str) -> dict:

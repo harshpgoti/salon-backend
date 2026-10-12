@@ -148,15 +148,22 @@ def dispatch_due_communications(
     """
     if now is None:
         now = datetime.now(timezone.utc)
+    # Worker-safe claim first: concurrent dispatchers split the due rows via
+    # SKIP LOCKED, so no message is ever picked up twice — not on first send,
+    # not on retry. Gates below may still reroute a claimed row.
     candidates = connection.execute(
-        text("""SELECT id, client_id, contact_value, channel, purpose,
-                       template_id, template_version, source_id,
-                       expected_entity_version, expires_at
-                FROM communications
-                WHERE tenant_id=:tenant AND state='recorded'
-                  AND (scheduled_at IS NULL OR scheduled_at <= :now)
-                ORDER BY scheduled_at NULLS FIRST
-                LIMIT :limit"""),
+        text("""UPDATE communications SET state='sending',
+                       version=version+1, updated_at=now()
+                WHERE id IN (
+                    SELECT id FROM communications
+                    WHERE tenant_id=:tenant AND state='recorded'
+                      AND (scheduled_at IS NULL OR scheduled_at <= :now)
+                    ORDER BY scheduled_at NULLS FIRST
+                    LIMIT :limit
+                    FOR UPDATE SKIP LOCKED)
+                RETURNING id, client_id, contact_value, channel, purpose,
+                          template_id, template_version, source_id,
+                          expected_entity_version, expires_at"""),
         {"tenant": tenant_id, "now": now.isoformat(), "limit": limit},
     ).mappings().all()
 
@@ -287,14 +294,39 @@ def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict
             return
         sender_identity = decision["sender"]["phone_number"]
 
+    # AC-1 / TASK-049: hold the estimated cost before sending. The budget row
+    # locks first, so concurrent dispatchers serialize per tenant and the
+    # ceiling holds exactly. Over-ceiling sends fail visibly (retryable after
+    # the ceiling moves) instead of spending unapproved money.
+    from modules.budgets import (BudgetModuleError, reconcile_reservation,
+                                 reserve_usage, void_reservation)
+    try:
+        reserve_usage(connection, tenant_id=tenant_id,
+                      communication_id=comm["id"], channel=comm["channel"], now=now)
+    except BudgetModuleError as exc:
+        connection.execute(
+            text("""UPDATE communications
+                    SET state='failed',
+                        skip_reason=:reason, version=version+1, updated_at=now()
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": comm["id"],
+             "reason": f"budget_exceeded: {exc}"[:240]})
+        summary["failed"] += 1
+        return
+
     # Dispatch through the injected adapter. Errors propagate: the caller
     # (booking dispatch or retry worker) schedules the backoff retry.
-    receipt = adapter.send(
-        channel=comm["channel"],
-        recipient=comm["contact_value"],
-        template=comm["purpose"],
-        sender=sender_identity,
-    )
+    try:
+        receipt = adapter.send(
+            channel=comm["channel"],
+            recipient=comm["contact_value"],
+            template=comm["purpose"],
+            sender=sender_identity,
+        )
+    except Exception:
+        void_reservation(connection, tenant_id=tenant_id,
+                         communication_id=comm["id"])
+        raise
     connection.execute(
         text("""UPDATE communications
                 SET state='dispatched', dispatched_at=now(),
@@ -307,6 +339,9 @@ def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict
     record_message_cost(connection, tenant_id=tenant_id,
                         communication_id=comm["id"],
                         channel=comm["channel"])
+    # TASK-049: settle the held estimate to the ledgered actual.
+    reconcile_reservation(connection, tenant_id=tenant_id,
+                          communication_id=comm["id"])
     summary["dispatched"] += 1
 
 
