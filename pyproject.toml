@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "salon-api"
+version = "0.1.0"
+description = "Tenant-safe salon operations API"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.141.1", "uvicorn==0.52.4", "SQLAlchemy==2.0.52",
+  "psycopg==3.3.4", "alembic==1.19.1", "PyJWT[crypto]==2.15.1", "cryptography==50.0.2",
+]
+[project.optional-dependencies]
+test = ["pytest==9.1.1", "httpx==0.28.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["modules*", "salon_platform*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+# Local compatibility receipt: Python 3.12.10; FastAPI 0.141.1; Uvicorn 0.52.4;
+# SQLAlchemy 2.0.52; Psycopg 3.3.4; Alembic 1.19.1; pytest 9.1.1; httpx 0.28.1.
+# npm lock pins Next.js 16.2.4 and React 19.3.0; production build and HTTP smoke passed.
+# PostgreSQL 17.11 (Docker) migrations 001-003, tenant-policy checks, runtime-role API connection, and /health HTTP smoke passed.
+# OIDC uses patched PyJWT[crypto] 2.15.1 and cryptography 50.0.2; synthetic RS256, PKCE, session-boundary and logout checks passed.
