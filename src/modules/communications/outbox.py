@@ -46,9 +46,11 @@ REMINDER_OFFSETS_HOURS = (24, 2)
 
 
 def _dedupe_key(source_id: str, purpose: str, entity_version: int, channel: str,
-                suffix: str = "") -> str:
-    """Business dedupe key: one message per appointment, purpose, version and channel."""
+                suffix: str = "", client_id: str | None = None) -> str:
+    """Business dedupe key: one message per source, purpose, version, channel and client."""
     key = f"appointment:{source_id}:{purpose}:v{entity_version}:{channel}"
+    if client_id is not None:
+        key = f"{key}:{client_id}"
     return f"{key}:{suffix}" if suffix else key
 
 
@@ -75,9 +77,11 @@ def record_booking_communication(
     Returns the inserted row (as a dict) or ``None`` when the dedupe key already
     exists — a replayed booking command must not create a second message.
     """
-    if source_type not in ("appointment", "location_broadcast", "rebooking_cycle"):
+    if source_type not in ("appointment", "location_broadcast", "rebooking_cycle",
+                           "campaign"):
         raise ValueError(f"unknown source_type {source_type!r}")
-    key = _dedupe_key(appointment_id, purpose, entity_version, channel, dedupe_suffix)
+    key = _dedupe_key(appointment_id, purpose, entity_version, channel, dedupe_suffix,
+                      client_id)
     row = connection.execute(
         text("""INSERT INTO communications
                 (tenant_id, id, client_id, contact_value, channel, purpose,

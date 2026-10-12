@@ -43,19 +43,34 @@ def _salon(database_url: str, issuer: str):
 
 
 def _teardown(engine, tenants: list[str], issuer: str) -> None:
+    # Narrow and tolerant: remove exactly this run's tenants, memberships and
+    # users, and never fail the suite on stale rows another run left behind.
+    # Memberships are deleted explicitly (scoped, visible) before the tenant
+    # goes, so the cascade is not load-bearing. Each user delete rides its
+    # own savepoint: a user still referenced elsewhere (stale leak) is left
+    # standing instead of aborting this run's cleanup — assertions never
+    # depend on cleanup, so skipping is honest, and a periodic purge
+    # (superuser) reclaims the leftovers.
     with engine.begin() as connection:
+        user_ids: set[str] = set()
         for tenant_id in tenants:
             connection.execute(text("SELECT set_config('app.tenant_id', :tenant, true)"), {"tenant": tenant_id})
+            found = connection.execute(
+                text("SELECT user_id::text AS id FROM memberships WHERE tenant_id=:tenant"),
+                {"tenant": tenant_id}).scalars().all()
+            user_ids.update(found)
+            connection.execute(text("DELETE FROM memberships WHERE tenant_id=:tenant"), {"tenant": tenant_id})
             connection.execute(text("""UPDATE identity_users SET tenant_id=NULL,onboarding_fingerprint=NULL
                                        WHERE tenant_id=:tenant"""), {"tenant": tenant_id})
             connection.execute(text("DELETE FROM tenants WHERE id=:tenant"), {"tenant": tenant_id})
         connection.execute(text("SELECT set_config('app.tenant_id', '', true)"))
-        # Only users with no surviving membership are removed, so a stale row
-        # from an interrupted run can never cascade into a new leak by blocking
-        # this run's cleanup with a foreign-key violation.
-        connection.execute(text("""DELETE FROM identity_users WHERE issuer=:issuer
-                                   AND id NOT IN (SELECT user_id FROM memberships)"""),
-                           {"issuer": issuer})
+        for user_id in user_ids:
+            nested = connection.begin_nested()
+            try:
+                connection.execute(text("DELETE FROM identity_users WHERE id=:id"), {"id": user_id})
+                nested.commit()
+            except Exception:
+                nested.rollback()
     engine.dispose()
 
 

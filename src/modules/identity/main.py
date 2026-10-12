@@ -41,6 +41,7 @@ from modules.booking.transitions import register_transition_routes
 from modules.booking.receipts import register_receipt_routes
 from modules.analytics import register_analytics_routes
 from modules.budgets import register_budget_routes
+from modules.campaigns import register_campaign_routes
 from modules.company import register_company_routes, start_trial
 from modules.communications.callbacks import register_callback_routes
 from modules.communications.inbox import register_inbox_routes
@@ -1493,6 +1494,14 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
     )
 
     register_budget_routes(
+        app,
+        require_identity=require_identity,
+        membership_scope=_membership_scope,
+        require_permission=_require_permission,
+        insert_audit=_insert_audit,
+    )
+
+    register_campaign_routes(
         app,
         require_identity=require_identity,
         membership_scope=_membership_scope,
