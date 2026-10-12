@@ -35,15 +35,16 @@ class RecordingAdapter:
     def __init__(self):
         self.records = []
 
-    def send(self, *, channel, recipient, template):
-        self.records.append({"channel": channel, "recipient": recipient, "template": template})
+    def send(self, *, channel, recipient, template, sender=None):
+        self.records.append({"channel": channel, "recipient": recipient, "template": template,
+                             "sender": sender})
         return {"status": "recorded", "id": f"recorded-{len(self.records)}"}
 
 
 class FailingAdapter:
     """Adapter that always raises — simulates a provider outage."""
 
-    def send(self, *, channel, recipient, template):
+    def send(self, *, channel, recipient, template, sender=None):
         raise RuntimeError("provider unavailable")
 
 

@@ -39,6 +39,7 @@ from modules.booking.holds import register_hold_routes
 from modules.booking.calendar import register_calendar_routes
 from modules.booking.transitions import register_transition_routes
 from modules.booking.receipts import register_receipt_routes
+from modules.communications.senders import register_sender_routes
 
 DEMO_SALON = {"name": "Maple Demo Salon", "timezone": "America/Toronto"}
 
@@ -50,9 +51,11 @@ class RecordingDeliveryAdapter:
         self.records: list[dict[str, str]] = []
 
     def send(
-        self, *, channel: Literal["email", "sms", "whatsapp"], recipient: str, template: str
+        self, *, channel: Literal["email", "sms", "whatsapp"], recipient: str, template: str,
+        sender: str | None = None,
     ) -> dict[str, str]:
-        self.records.append({"channel": channel, "recipient": recipient, "template": template})
+        self.records.append({"channel": channel, "recipient": recipient, "template": template,
+                             "sender": sender})
         return {"status": "recorded", "id": f"recorded-{len(self.records)}"}
 
 
@@ -567,7 +570,8 @@ ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
     "manager": frozenset({"tenant.summary.read", "locations.read", "appointments.read", "appointments.manage",
                            "clients.operational.read", "clients.operational.write", "clients.sensitive.read",
                            "clients.merge", "clients.privacy.manage", "services.read", "services.manage",
-                           "staff.read", "staff.manage", "hours.read", "hours.manage", "resources.read", "resources.manage", "reports.read"}),
+                           "staff.read", "staff.manage", "hours.read", "hours.manage", "resources.read", "resources.manage", "reports.read",
+                           "communications.manage"}),
     "receptionist": frozenset({"locations.read", "appointments.read", "appointments.manage", "clients.operational.read",
                                "services.read", "staff.read", "hours.read", "resources.read"}),
     "stylist": frozenset({"locations.read", "appointments.own.read", "clients.assigned.read", "services.read",
@@ -1401,6 +1405,14 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
     )
 
     register_receipt_routes(
+        app,
+        require_identity=require_identity,
+        membership_scope=_membership_scope,
+        require_permission=_require_permission,
+        insert_audit=_insert_audit,
+    )
+
+    register_sender_routes(
         app,
         require_identity=require_identity,
         membership_scope=_membership_scope,

@@ -30,7 +30,10 @@ def test_recording_delivery_is_local_and_does_not_contact_a_provider():
     receipt = adapter.send(channel="email", recipient="client@example.invalid", template="appointment-confirmation")
 
     assert receipt == {"status": "recorded", "id": "recorded-1"}
-    assert adapter.records == [{"channel": "email", "recipient": "client@example.invalid", "template": "appointment-confirmation"}]
+    # TASK-029 stamps the sender identity on every record (None when the
+    # channel carries no sender, e.g. email); the adapter still only records.
+    assert adapter.records == [{"channel": "email", "recipient": "client@example.invalid",
+                                "template": "appointment-confirmation", "sender": None}]
     assert DEMO_SALON == {"name": "Maple Demo Salon", "timezone": "America/Toronto"}
 
 

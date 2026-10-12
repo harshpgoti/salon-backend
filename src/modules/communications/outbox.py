@@ -35,6 +35,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import text
 
 from modules.communications.consent import check_consented, check_suppressed
+from modules.communications.senders import get_verified_sender, record_message_cost
 
 # Reminder offsets in hours before the appointment start (FR-042 default).
 REMINDER_OFFSETS_HOURS = (24, 2)
@@ -222,12 +223,32 @@ def dispatch_due_communications(
             summary["suppressed"] += 1
             continue
 
+        # AC-1 / TASK-029: SMS routes only through the tenant's verified sender,
+        # stamped on the send so the client always sees their own salon's
+        # identity. Without one the message fails (retryable once a sender is
+        # verified) rather than borrowing another salon's number.
+        sender_identity = None
+        if comm["channel"] == "sms":
+            sender = get_verified_sender(connection, tenant_id=tenant_id)
+            if sender is None:
+                connection.execute(
+                    text("""UPDATE communications
+                            SET state='failed',
+                                skip_reason=:reason, version=version+1, updated_at=now()
+                            WHERE tenant_id=:tenant AND id=:id"""),
+                    {"tenant": tenant_id, "id": comm["id"],
+                     "reason": "no verified SMS sender for this salon"})
+                summary["failed"] += 1
+                continue
+            sender_identity = sender["sender_identity"]
+
         # Dispatch through the injected adapter.
         try:
             receipt = adapter.send(
                 channel=comm["channel"],
                 recipient=comm["contact_value"],
                 template=comm["purpose"],
+                sender=sender_identity,
             )
             connection.execute(
                 text("""UPDATE communications
@@ -236,6 +257,11 @@ def dispatch_due_communications(
                         WHERE tenant_id=:tenant AND id=:id"""),
                 {"tenant": tenant_id, "id": comm["id"],
                  "ref": receipt.get("id") if isinstance(receipt, dict) else None})
+            # TASK-029 / FR-044: every dispatch writes its CAD segment-cost
+            # ledger row, so spend is visible before the next campaign.
+            record_message_cost(connection, tenant_id=tenant_id,
+                                communication_id=comm["id"],
+                                channel=comm["channel"])
             summary["dispatched"] += 1
         except Exception as exc:  # noqa: BLE001 — adapter failure is classified, not fatal
             connection.execute(

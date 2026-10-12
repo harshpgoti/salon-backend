@@ -114,7 +114,7 @@ def record_suppression(
     connection,
     *,
     tenant_id: str,
-    client_id: str,
+    client_id: str | None,
     contact_value: str,
     channel: str,
     reason: str,
@@ -124,7 +124,9 @@ def record_suppression(
 
     The unique key is (tenant, normalized contact value, channel), so a
     repeated STOP/unsubscribe refreshes the row instead of duplicating it, and
-    the block survives client edits, merges and re-imports.
+    the block survives client edits, merges and re-imports. ``client_id`` may
+    be None for inbound STOP from a number the salon never stored (TASK-029):
+    the value block is what protects future sends.
     """
     if channel not in CHANNELS:
         raise SuppressionModuleError(f"unknown channel {channel!r}")
