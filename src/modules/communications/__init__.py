@@ -17,6 +17,12 @@ from modules.communications.consent import (
     record_consent,
     record_suppression,
 )
+from modules.communications.inbox import (
+    InboxModuleError,
+    create_task_for_inbound,
+    list_inbox,
+    resolve_task,
+)
 from modules.communications.outbox import (
     dispatch_claimed_retries,
     dispatch_due_communications,
@@ -48,6 +54,7 @@ from modules.communications.whatsapp import (
 
 __all__ = [
     "CallbackModuleError",
+    "InboxModuleError",
     "SenderModuleError",
     "WhatsAppModuleError",
     "approve_sender",
@@ -56,11 +63,13 @@ __all__ = [
     "check_suppressed",
     "check_wa_eligible",
     "claim_due_retries",
+    "create_task_for_inbound",
     "create_template",
     "dispatch_due_communications",
     "get_verified_sender",
     "handle_inbound_sms",
     "ingest_callback",
+    "list_inbox",
     "normalize_contact_value",
     "queue_retry",
     "reclaim_stale_sending",
@@ -73,6 +82,7 @@ __all__ = [
     "reject_sender",
     "reject_template",
     "requeue_dead_letter",
+    "resolve_task",
     "schedule_booking_reminders",
     "sign_callback_body",
     "submit_sender",

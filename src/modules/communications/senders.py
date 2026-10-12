@@ -195,17 +195,19 @@ def handle_inbound_sms(connection, *, sender_identity: str, from_value: str,
                            client_id=resolved["client_id"] if resolved else None,
                            contact_value=value, channel=channel, reason="stop",
                            source="provider")
+    inbound_id = str(uuid.uuid4())
     connection.execute(
         text("""INSERT INTO inbound_messages
-                (tenant_id, id, sender_id, from_value, channel, keyword, action)
-                VALUES (:tenant, :id, :sender, :from, :channel, :keyword, :action)"""),
-        {"tenant": tenant_id, "id": str(uuid.uuid4()),
+                (tenant_id, id, sender_id, from_value, channel, keyword, action, body)
+                VALUES (:tenant, :id, :sender, :from, :channel, :keyword, :action, :body)"""),
+        {"tenant": tenant_id, "id": inbound_id,
          "sender": sender["id"] if channel == "sms" else None,
          "from": from_value.strip(), "channel": channel,
          "keyword": keyword if keyword in ("stop", "help") else "other",
-         "action": action},
+         "action": action, "body": body[:2000]},
     )
-    result: dict = {"action": action, "tenant_id": tenant_id}
+    result: dict = {"action": action, "tenant_id": tenant_id,
+                    "inbound_id": inbound_id}
     if keyword == "help":
         result["reply"] = ("Thanks for contacting your salon. Reply STOP to opt out "
                            "of SMS reminders. For anything else, call the salon directly.")
