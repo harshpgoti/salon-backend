@@ -386,3 +386,207 @@ def register_analytics_routes(
             }
         finally:
             engine.dispose()
+
+    @app.get("/v1/tenants/{tenant_id}/reports/clients", tags=["reports"])
+    def clients_report(tenant_id: uuid.UUID, as_of: date | None = None,
+                       location_id: uuid.UUID | None = None,
+                       identity=Depends(require_identity)) -> dict:
+        """Client cohorts, retention and data quality (FR-060/FR-062).
+
+        Cohorts group by first completed-visit month: size, repeaters and
+        average first-to-second return gap. Cohorts younger than ninety days
+        are flagged immature — their return figures are provisional, never
+        final. Deleted clients never count; import-sourced clients carry
+        their provenance. Data quality lists the fixable gaps: no contact,
+        no primary, unverified primary, open duplicate candidates and import
+        error rows.
+        """
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "reports.read")
+                locations = _scope_locations(role, assigned, location_id)
+                moment = as_of or date.today()
+                loc_filter = ""
+                params: dict = {"tenant": str(tenant_id)}
+                if locations is not None:
+                    loc_filter = "AND c.preferred_location_id = ANY(:locs)"
+                    params["locs"] = locations
+
+                firsts = connection.execute(
+                    text(f"""SELECT c.id::text AS client_id,
+                                    min(v.completed_at)::date AS first_visit
+                             FROM clients c
+                             LEFT JOIN visits v ON v.tenant_id=c.tenant_id
+                                               AND v.client_id=c.id
+                             WHERE c.tenant_id=:tenant AND c.deleted_at IS NULL
+                               {loc_filter}
+                             GROUP BY c.id"""),
+                    params).mappings().all()
+                cohorts: dict[str, dict] = {}
+                for row in firsts:
+                    key = row["first_visit"].strftime("%Y-%m") if row["first_visit"] else "never"
+                    bucket = cohorts.setdefault(key, {"clients": [], "month": key})
+                    bucket["clients"].append(row["client_id"])
+                cohort_rows = []
+                for key in sorted(cohorts):
+                    ids = cohorts[key]["clients"]
+                    if key == "never":
+                        cohort_rows.append({"cohort": key, "clients": len(ids),
+                                            "repeaters": 0, "avg_return_days": None,
+                                            "immature": False})
+                        continue
+                    gaps = connection.execute(
+                        text("""SELECT client_id::text AS client_id,
+                                       count(*) AS visits,
+                                       min(completed_at)::date AS first_visit,
+                                       max(completed_at)::date AS last_visit
+                                FROM visits WHERE tenant_id=:tenant AND client_id = ANY(:ids)
+                                GROUP BY client_id"""),
+                        {"tenant": str(tenant_id), "ids": ids}).mappings().all()
+                    repeaters = sum(1 for g in gaps if g["visits"] > 1)
+                    returned_gaps = []
+                    for g in gaps:
+                        if g["visits"] > 1:
+                            second = connection.execute(
+                                text("""SELECT completed_at::date FROM visits
+                                        WHERE tenant_id=:tenant AND client_id=:client
+                                        ORDER BY completed_at LIMIT 1 OFFSET 1"""),
+                                {"tenant": str(tenant_id),
+                                 "client": g["client_id"]}).scalar_one()
+                            returned_gaps.append((second - g["first_visit"]).days)
+                    cohort_age = (moment - date(
+                        int(key[:4]), int(key[5:7]), 1)).days
+                    cohort_rows.append({
+                        "cohort": key, "clients": len(ids), "repeaters": repeaters,
+                        "avg_return_days": (round(sum(returned_gaps) / len(returned_gaps), 1)
+                                            if returned_gaps else None),
+                        "immature": cohort_age < 90})
+
+                facts = connection.execute(
+                    text(f"""SELECT c.id::text AS client_id, c.name, c.source,
+                                    (SELECT min(v.completed_at) FROM visits v
+                                      WHERE v.tenant_id=c.tenant_id AND v.client_id=c.id)
+                                    AS first_visit,
+                                    (SELECT max(v.completed_at) FROM visits v
+                                      WHERE v.tenant_id=c.tenant_id AND v.client_id=c.id)
+                                    AS last_visit,
+                                    (SELECT s.service_name FROM visit_services s
+                                      JOIN visits v ON v.tenant_id=s.tenant_id
+                                                   AND v.id=s.visit_id
+                                      WHERE v.tenant_id=c.tenant_id AND v.client_id=c.id
+                                      ORDER BY v.completed_at DESC LIMIT 1) AS last_service,
+                                    (SELECT min(a.starts_at) FROM appointments a
+                                      WHERE a.tenant_id=c.tenant_id AND a.client_id=c.id
+                                        AND a.starts_at > now()
+                                        AND a.status IN ('pending_approval', 'confirmed',
+                                                         'checked_in', 'in_service'))
+                                    AS next_appointment,
+                                    EXISTS (SELECT 1 FROM rebooking_cycles r
+                                            WHERE r.tenant_id=c.tenant_id
+                                              AND r.client_id=c.id AND r.status='due')
+                                    AS has_due_cycle,
+                                    EXISTS (SELECT 1 FROM consents co
+                                            WHERE co.tenant_id=c.tenant_id
+                                              AND co.client_id=c.id AND co.status='granted'
+                                              AND co.purpose='marketing') AS reachable
+                             FROM clients c
+                             WHERE c.tenant_id=:tenant AND c.deleted_at IS NULL
+                               {loc_filter}
+                             ORDER BY c.created_at DESC LIMIT 200"""),
+                    params).mappings().all()
+                client_facts = []
+                for fact in facts:
+                    item = dict(fact)
+                    for stamp in ("first_visit", "last_visit", "next_appointment"):
+                        item[stamp] = item[stamp].isoformat() if item[stamp] else None
+                    client_facts.append(item)
+
+                inactive = {}
+                for days in (30, 60, 90):
+                    inactive[f"inactive_{days}d"] = connection.execute(
+                        text(f"""SELECT count(DISTINCT c.id) FROM clients c
+                                 WHERE c.tenant_id=:tenant AND c.deleted_at IS NULL
+                                   {loc_filter}
+                                   AND NOT EXISTS (
+                                     SELECT 1 FROM visits v
+                                     WHERE v.tenant_id=c.tenant_id AND v.client_id=c.id
+                                       AND v.completed_at > now() - (:days || ' days')::interval)"""),
+                        {**params, "days": str(days)}).scalar_one()
+                due_cycles = connection.execute(
+                    text("""SELECT count(*) FROM rebooking_cycles
+                            WHERE tenant_id=:tenant AND status='due'"""),
+                    {"tenant": str(tenant_id)}).scalar_one()
+
+                no_contact = connection.execute(
+                    text(f"""SELECT count(*) FROM clients c
+                             WHERE c.tenant_id=:tenant AND c.deleted_at IS NULL
+                               {loc_filter}
+                               AND NOT EXISTS (
+                                 SELECT 1 FROM client_contacts cc
+                                 WHERE cc.tenant_id=c.tenant_id AND cc.client_id=c.id)"""),
+                    params).scalar_one()
+                no_primary = connection.execute(
+                    text(f"""SELECT count(*) FROM clients c
+                             WHERE c.tenant_id=:tenant AND c.deleted_at IS NULL
+                               {loc_filter}
+                               AND EXISTS (SELECT 1 FROM client_contacts cc
+                                           WHERE cc.tenant_id=c.tenant_id
+                                             AND cc.client_id=c.id)
+                               AND NOT EXISTS (SELECT 1 FROM client_contacts cc
+                                               WHERE cc.tenant_id=c.tenant_id
+                                                 AND cc.client_id=c.id AND cc.is_primary)"""),
+                    params).scalar_one()
+                unverified_primary = connection.execute(
+                    text(f"""SELECT count(*) FROM clients c
+                             WHERE c.tenant_id=:tenant AND c.deleted_at IS NULL
+                               {loc_filter}
+                               AND EXISTS (SELECT 1 FROM client_contacts cc
+                                           WHERE cc.tenant_id=c.tenant_id
+                                             AND cc.client_id=c.id AND cc.is_primary
+                                             AND cc.verification <> 'verified')"""),
+                    params).scalar_one()
+                open_dupes = connection.execute(
+                    text("""SELECT count(*) FROM client_duplicate_candidates
+                            WHERE tenant_id=:tenant AND resolution IS NULL"""),
+                    {"tenant": str(tenant_id)}).scalar_one()
+                import_errors = connection.execute(
+                    text("""SELECT COALESCE(SUM(error_rows), 0) FROM imports
+                            WHERE tenant_id=:tenant"""),
+                    {"tenant": str(tenant_id)}).scalar_one()
+                by_source = connection.execute(
+                    text(f"""SELECT c.source, count(*) FROM clients c
+                             WHERE c.tenant_id=:tenant AND c.deleted_at IS NULL
+                               {loc_filter}
+                             GROUP BY c.source"""),
+                    params).mappings().all()
+            return {
+                "as_of": moment.isoformat(),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "filters": {"location_id": str(location_id) if location_id else None},
+                "cohorts": cohort_rows,
+                "clients": client_facts,
+                "segments": {"due_cycles": due_cycles, **inactive},
+                "consent_reachability": {
+                    "reachable_clients": sum(1 for f in client_facts if f["reachable"]),
+                    "listed_clients": len(client_facts)},
+                "data_quality": {
+                    "clients_without_contacts": no_contact,
+                    "clients_without_primary": no_primary,
+                    "unverified_primaries": unverified_primary,
+                    "open_duplicate_candidates": open_dupes,
+                    "import_error_rows": int(import_errors or 0),
+                    "clients_by_source": {r["source"]: r["count"] for r in by_source}},
+                "definitions": {
+                    "cohort": "First completed-visit month; 'never' visited separately.",
+                    "repeaters": "Cohort clients with 2+ completed visits.",
+                    "avg_return_days": "Mean first-to-second visit gap among repeaters; "
+                                       "null without repeaters.",
+                    "immature": "Cohort younger than 90 days: return figures provisional.",
+                    "reachable": "A current granted marketing consent exists.",
+                    "inactive_30/60/90d": "No completed visit in the window (never-visited counts).",
+                },
+            }
+        finally:
+            engine.dispose()
