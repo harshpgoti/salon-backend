@@ -367,6 +367,11 @@ def register_hold_routes(
                 attribute_booking(connection, tenant_id=tenant_id,
                                   attribution_token=payload.attribution_token,
                                   appointment_id=str(appointment_id))
+                # FR-056: the same token attributes a campaign send in-window.
+                from modules.attribution import attribute_campaign_booking
+                attribute_campaign_booking(connection, tenant_id=tenant_id,
+                                           attribution_token=payload.attribution_token,
+                                           appointment_id=str(appointment_id))
             return {"appointment_id": str(appointment_id), "replayed": False,
                     "management_token": management_token,
                     "marketing_opt_in_recorded": False}

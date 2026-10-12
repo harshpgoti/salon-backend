@@ -251,6 +251,11 @@ def register_calendar_routes(
                     attribute_booking(connection, tenant_id=str(tenant_id),
                                       attribution_token=payload.attribution_token,
                                       appointment_id=str(appointment_id))
+                    # FR-056: the same token attributes a campaign send in-window.
+                    from modules.attribution import attribute_campaign_booking
+                    attribute_campaign_booking(connection, tenant_id=str(tenant_id),
+                                               attribution_token=payload.attribution_token,
+                                               appointment_id=str(appointment_id))
                 except IntegrityError as exc:
                     # The EXCLUDE constraint refuses an overlapping slot, or a racing
                     # replay claimed the idempotency key. Either way the winner stands and
