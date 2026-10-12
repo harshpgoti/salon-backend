@@ -38,6 +38,7 @@ from modules.communications.senders import (
     suspend_sender,
     verify_sender,
 )
+from modules.communications.templates import resolve_template
 from modules.communications.whatsapp import (
     WhatsAppModuleError,
     approve_sender,
@@ -83,6 +84,7 @@ __all__ = [
     "reject_template",
     "requeue_dead_letter",
     "resolve_task",
+    "resolve_template",
     "schedule_booking_reminders",
     "sign_callback_body",
     "submit_sender",
