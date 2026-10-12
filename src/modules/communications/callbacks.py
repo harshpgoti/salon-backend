@@ -125,23 +125,28 @@ def ingest_callback(
         raise CallbackModuleError("provider event id is required")
 
     comm_id = None
+    comm_trace = None
     if communication_id is not None:
         found = connection.execute(
-            text("""SELECT id::text AS id, state, provider_ref FROM communications
+            text("""SELECT id::text AS id, state, provider_ref, trace_id::text AS trace_id
+                    FROM communications
                     WHERE tenant_id=:tenant AND id=:id"""),
             {"tenant": tenant_id, "id": communication_id}).mappings().one_or_none()
         if found is not None:
             comm_id = found["id"]
             current_state, current_ref = found["state"], found["provider_ref"]
+            comm_trace = found["trace_id"]
     if comm_id is None and provider_ref is not None:
         found = connection.execute(
-            text("""SELECT id::text AS id, state, provider_ref FROM communications
+            text("""SELECT id::text AS id, state, provider_ref, trace_id::text AS trace_id
+                    FROM communications
                     WHERE tenant_id=:tenant AND provider_ref=:ref
                     ORDER BY created_at DESC LIMIT 1"""),
             {"tenant": tenant_id, "ref": provider_ref}).mappings().one_or_none()
         if found is not None:
             comm_id = found["id"]
             current_state, current_ref = found["state"], found["provider_ref"]
+            comm_trace = found["trace_id"]
     if comm_id is None:
         # Unknown acceptance: never invent delivery, never drop the evidence.
         connection.execute(
@@ -165,6 +170,12 @@ def ingest_callback(
     ).mappings().one_or_none()
     if inserted is None:
         return {"status": "duplicate", "communication_id": comm_id}
+    # TASK-053 / FR-077: the provider hop joins the request's trace.
+    if comm_trace is not None:
+        from modules.trace import record_trace_event
+        record_trace_event(connection, tenant_id=tenant_id, trace_id=comm_trace,
+                           span="provider_callback",
+                           detail={"communication_id": comm_id, "event": event})
 
     # Success evidence moves forward only; a late failure never un-delivers.
     if event == "failed":

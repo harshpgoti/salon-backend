@@ -60,6 +60,7 @@ def record_booking_communication(
     template_version: int | None = None,
     scheduled_at: datetime | None = None,
     expires_at: datetime | None = None,
+    trace_id: str | None = None,
 ) -> dict | None:
     """Record one communication row inside the caller's transaction.
 
@@ -71,18 +72,28 @@ def record_booking_communication(
         text("""INSERT INTO communications
                 (tenant_id, id, client_id, contact_value, channel, purpose,
                  template_id, template_version, source_type, source_id,
-                 expected_entity_version, state, scheduled_at, expires_at, dedupe_key)
+                 expected_entity_version, state, scheduled_at, expires_at, dedupe_key,
+                 trace_id)
                 VALUES (:tenant, :id, :client, :contact, :channel, :purpose,
                         :template, :template_version, 'appointment', :source,
-                        :entity_version, 'recorded', :scheduled, :expires, :dedupe)
+                        :entity_version, 'recorded', :scheduled, :expires, :dedupe,
+                        :trace)
                 ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
                 RETURNING id, state, dedupe_key, expected_entity_version"""),
         {"tenant": tenant_id, "id": str(uuid.uuid4()), "client": client_id,
          "contact": contact_value, "channel": channel, "purpose": purpose,
          "template": template_id, "template_version": template_version,
          "source": appointment_id, "entity_version": entity_version,
-         "scheduled": scheduled_at, "expires": expires_at, "dedupe": key},
+         "scheduled": scheduled_at, "expires": expires_at, "dedupe": key,
+         "trace": trace_id},
     ).mappings().one_or_none()
+    if row is not None and trace_id is not None:
+        from modules.trace import record_trace_event
+        record_trace_event(connection, tenant_id=tenant_id, trace_id=trace_id,
+                           span="outbox_record",
+                           detail={"communication_id": row["id"], "purpose": purpose,
+                                   "channel": channel, "source": "appointment",
+                                   "source_id": appointment_id})
     return dict(row) if row else None
 
 
@@ -163,7 +174,8 @@ def dispatch_due_communications(
                     FOR UPDATE SKIP LOCKED)
                 RETURNING id, client_id, contact_value, channel, purpose,
                           template_id, template_version, source_id,
-                          expected_entity_version, expires_at"""),
+                          expected_entity_version, expires_at,
+                          trace_id::text AS trace_id"""),
         {"tenant": tenant_id, "now": now.isoformat(), "limit": limit},
     ).mappings().all()
 
@@ -342,6 +354,13 @@ def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict
     # TASK-049: settle the held estimate to the ledgered actual.
     reconcile_reservation(connection, tenant_id=tenant_id,
                           communication_id=comm["id"])
+    # TASK-053 / FR-077: the worker hop joins the request's trace.
+    if comm.get("trace_id"):
+        from modules.trace import record_trace_event
+        record_trace_event(connection, tenant_id=tenant_id, trace_id=comm["trace_id"],
+                           span="worker_send",
+                           detail={"communication_id": comm["id"],
+                                   "channel": comm["channel"], "purpose": comm["purpose"]})
     summary["dispatched"] += 1
 
 
@@ -367,7 +386,8 @@ def dispatch_claimed_retries(connection, *, tenant_id: str, adapter,
         comm = connection.execute(
             text("""SELECT id, client_id, contact_value, channel, purpose,
                            template_id, template_version, source_id,
-                           expected_entity_version, expires_at
+                           expected_entity_version, expires_at,
+                           trace_id::text AS trace_id
                     FROM communications
                     WHERE tenant_id=:tenant AND id=:id"""),
             {"tenant": tenant_id, "id": job["communication_id"]},

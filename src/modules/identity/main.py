@@ -48,6 +48,7 @@ from modules.communications.senders import register_sender_routes
 from modules.retention import register_retention_routes
 from modules.segments import register_segment_routes
 from modules.support import register_support_routes
+from modules.trace import register_trace_routes
 from modules.communications.whatsapp import register_wa_sender_routes
 
 DEMO_SALON = {"name": "Maple Demo Salon", "timezone": "America/Toronto"}
@@ -638,6 +639,22 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
     app = FastAPI(title="Salon Operations API", version="0.1.0")
     app.state.engine_factory = engine_factory or (lambda: create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True, connect_args={"connect_timeout": 2}))
     app.state.delivery_adapter = RecordingDeliveryAdapter()
+
+    @app.middleware("http")
+    async def trace_requests(request: Request, call_next):
+        # TASK-053 / FR-077: every request carries a trace id end to end. An
+        # inbound X-Trace-ID is echoed when it parses as a UUID; otherwise a
+        # fresh one is minted. It lands on request.state for handlers and on
+        # the response so callers (and tests) can correlate.
+        incoming = request.headers.get("x-trace-id", "")
+        try:
+            trace_id = str(uuid.UUID(incoming)) if incoming else str(uuid.uuid4())
+        except (ValueError, AttributeError):
+            trace_id = str(uuid.uuid4())
+        request.state.trace_id = trace_id
+        response = await call_next(request)
+        response.headers["X-Trace-ID"] = trace_id
+        return response
 
     @app.middleware("http")
     async def protect_cookie_mutations(request: Request, call_next):
@@ -1497,6 +1514,11 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
         membership_scope=_membership_scope,
         require_permission=_require_permission,
         insert_audit=_insert_audit,
+    )
+
+    register_trace_routes(
+        app,
+        require_company_identity=require_company_identity,
     )
 
     register_wa_sender_routes(
