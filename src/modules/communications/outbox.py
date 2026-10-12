@@ -41,9 +41,9 @@ from modules.communications.senders import get_verified_sender, record_message_c
 REMINDER_OFFSETS_HOURS = (24, 2)
 
 
-def _dedupe_key(source_id: str, purpose: str, entity_version: int) -> str:
-    """Business dedupe key: one message per appointment, purpose and version."""
-    return f"appointment:{source_id}:{purpose}:v{entity_version}"
+def _dedupe_key(source_id: str, purpose: str, entity_version: int, channel: str) -> str:
+    """Business dedupe key: one message per appointment, purpose, version and channel."""
+    return f"appointment:{source_id}:{purpose}:v{entity_version}:{channel}"
 
 
 def record_booking_communication(
@@ -67,7 +67,7 @@ def record_booking_communication(
     Returns the inserted row (as a dict) or ``None`` when the dedupe key already
     exists — a replayed booking command must not create a second message.
     """
-    key = _dedupe_key(appointment_id, purpose, entity_version)
+    key = _dedupe_key(appointment_id, purpose, entity_version, channel)
     row = connection.execute(
         text("""INSERT INTO communications
                 (tenant_id, id, client_id, contact_value, channel, purpose,
@@ -180,7 +180,8 @@ def dispatch_due_communications(
     ).mappings().all()
 
     summary = {"dispatched": 0, "skipped_stale": 0, "skipped_expired": 0,
-               "suppressed": 0, "retry_scheduled": 0, "failed": 0}
+               "suppressed": 0, "retry_scheduled": 0, "failed": 0,
+               "deferred": 0, "fallback_created": 0}
     for comm in candidates:
         try:
             _route_candidate(connection, tenant_id=tenant_id, comm=comm,
@@ -192,9 +193,24 @@ def dispatch_due_communications(
             outcome = queue_retry(connection, tenant_id=tenant_id,
                                   communication_id=comm["id"],
                                   error=str(exc), now=now)
-            summary["retry_scheduled" if outcome["status"] == "retry_scheduled" else "failed"] += 1
+            if outcome["status"] == "retry_scheduled":
+                summary["retry_scheduled"] += 1
+            else:
+                summary["failed"] += 1
+                _maybe_fallback(connection, tenant_id=tenant_id, comm=comm,
+                                summary=summary, now=now)
 
     return summary
+
+
+def _maybe_fallback(connection, *, tenant_id: str, comm, summary: dict,
+                    now: datetime) -> None:
+    """Record a fallback-channel send after retries exhausted (TASK-032)."""
+    from modules.quiet import try_fallback_on_exhaustion
+    created = try_fallback_on_exhaustion(connection, tenant_id=tenant_id,
+                                         comm=comm, now=now)
+    if created is not None:
+        summary["fallback_created"] += 1
 
 
 def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict,
@@ -206,6 +222,19 @@ def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict
     exactly like a first attempt. Gated outcomes update state and the summary;
     only a successful adapter call returns normally.
     """
+    from modules.quiet import (defer_past_quiet, in_quiet_hours,
+                               load_messaging_settings, _location_now)
+    settings = load_messaging_settings(connection, tenant_id=tenant_id)
+    # AC-2 / FR-047: the emergency stop defers everything, visibly. Flipping
+    # it off resumes the queue; nothing is lost, nothing sneaks through.
+    if settings["emergency_stop"]:
+        connection.execute(
+            text("""UPDATE communications SET state='recorded',
+                           version=version+1, updated_at=now()
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": comm["id"]})
+        summary["deferred"] += 1
+        return
     # Re-read the current appointment version.
     current = connection.execute(
         text("""SELECT version FROM appointments
@@ -234,6 +263,57 @@ def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict
              "reason": "reminder window passed before dispatch"})
         summary["skipped_expired"] += 1
         return
+
+    # AC-1 / FR-047: quiet hours defer the send to the window end — unless the
+    # deferral itself passes usefulness, in which case it expires now.
+    local_now, _ = _location_now(connection, tenant_id=tenant_id, now=now)
+    if in_quiet_hours(settings["quiet_start"], settings["quiet_end"], local_now):
+        deferred_to = defer_past_quiet(connection, tenant_id=tenant_id,
+                                       communication_id=comm["id"], now=now)
+        expires = comm["expires_at"]
+        if expires is not None:
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            if deferred_to > expires:
+                connection.execute(
+                    text("""UPDATE communications
+                            SET state='skipped_expired',
+                                skip_reason=:reason, version=version+1, updated_at=now()
+                            WHERE tenant_id=:tenant AND id=:id"""),
+                    {"tenant": tenant_id, "id": comm["id"],
+                     "reason": "quiet deferral passed the reminder window"})
+                summary["skipped_expired"] += 1
+                return
+        connection.execute(
+            text("""UPDATE communications SET state='recorded',
+                           version=version+1, updated_at=now()
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": comm["id"]})
+        summary["deferred"] += 1
+        return
+
+    # AC-1 / FR-047: per-recipient daily cap throttles by deferring a day.
+    cap = settings["max_per_recipient_per_day"]
+    if cap is not None:
+        day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        sent_today = connection.execute(
+            text("""SELECT count(*) FROM communications
+                    WHERE tenant_id=:tenant AND client_id=:client
+                      AND channel=:channel AND state IN ('dispatched', 'delivered', 'read')
+                      AND dispatched_at >= :day_start"""),
+            {"tenant": tenant_id, "client": comm["client_id"],
+             "channel": comm["channel"], "day_start": day_start.isoformat()},
+        ).scalar_one()
+        if sent_today >= cap:
+            connection.execute(
+                text("""UPDATE communications
+                        SET scheduled_at=:at, state='recorded',
+                            version=version+1, updated_at=now()
+                        WHERE tenant_id=:tenant AND id=:id"""),
+                {"tenant": tenant_id, "id": comm["id"],
+                 "at": (local_now + timedelta(days=1)).isoformat()})
+            summary["deferred"] += 1
+            return
 
     # AC-2 / FR-041: an opt-out written after the message was recorded —
     # the unsubscribe/STOP race — blocks this send. Suppression is keyed by
@@ -380,7 +460,8 @@ def dispatch_claimed_retries(connection, *, tenant_id: str, adapter,
     if now is None:
         now = datetime.now(timezone.utc)
     summary = {"dispatched": 0, "skipped_stale": 0, "skipped_expired": 0,
-               "suppressed": 0, "retry_scheduled": 0, "failed": 0}
+               "suppressed": 0, "retry_scheduled": 0, "failed": 0,
+               "deferred": 0, "fallback_created": 0}
     claimed = claim_due_retries(connection, tenant_id=tenant_id, now=now, limit=limit)
     for job in claimed:
         comm = connection.execute(
@@ -403,8 +484,12 @@ def dispatch_claimed_retries(connection, *, tenant_id: str, adapter,
             queued = queue_retry(connection, tenant_id=tenant_id,
                                  communication_id=comm["id"],
                                  error=str(exc), now=now)
-            summary["retry_scheduled" if queued["status"] == "retry_scheduled" else "failed"] += 1
-            if queued["status"] != "retry_scheduled":
+            if queued["status"] == "retry_scheduled":
+                summary["retry_scheduled"] += 1
+            else:
+                summary["failed"] += 1
+                _maybe_fallback(connection, tenant_id=tenant_id, comm=comm,
+                                summary=summary, now=now)
                 outcome = "exhausted"
         connection.execute(
             text("""UPDATE dispatch_attempts SET state=:state, updated_at=now()

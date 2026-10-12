@@ -40,6 +40,7 @@ services:
       - ./db/migrations/029_sms_senders.sql:/docker-entrypoint-initdb.d/029_sms_senders.sql:ro
       - ./db/migrations/030_delivery_callbacks.sql:/docker-entrypoint-initdb.d/030_delivery_callbacks.sql:ro
       - ./db/migrations/031_whatsapp_onboarding.sql:/docker-entrypoint-initdb.d/031_whatsapp_onboarding.sql:ro
+      - ./db/migrations/032_quiet_hours_fallback.sql:/docker-entrypoint-initdb.d/032_quiet_hours_fallback.sql:ro
       - ./db/migrations/034_follow_up_tasks.sql:/docker-entrypoint-initdb.d/034_follow_up_tasks.sql:ro
       - ./db/migrations/035_rebooking_cycles.sql:/docker-entrypoint-initdb.d/035_rebooking_cycles.sql:ro
       - ./db/migrations/036_rebooking_rules.sql:/docker-entrypoint-initdb.d/036_rebooking_rules.sql:ro

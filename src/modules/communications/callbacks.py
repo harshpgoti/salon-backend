@@ -345,6 +345,18 @@ def requeue_dead_letter(connection, *, tenant_id: str, communication_id: str) ->
         {"tenant": tenant_id, "comm": communication_id}).mappings().one_or_none()
     if row is None:
         raise CallbackModuleError("no open exhausted-retries dead letter for this message")
+    # FR-047: manual retries are blocked for opted-out contacts — the human
+    # reviews the dead letter, but consent still rules.
+    comm = connection.execute(
+        text("""SELECT contact_value, channel FROM communications
+                WHERE tenant_id=:tenant AND id=:comm"""),
+        {"tenant": tenant_id, "comm": communication_id}).mappings().one_or_none()
+    if comm is not None:
+        from modules.communications.consent import check_suppressed
+        if check_suppressed(connection, tenant_id=tenant_id,
+                            contact_value=comm["contact_value"],
+                            channel=comm["channel"]):
+            raise CallbackModuleError("contact opted out; manual retry blocked")
     last = connection.execute(
         text("""SELECT COALESCE(MAX(attempt), 0) AS n FROM dispatch_attempts
                 WHERE tenant_id=:tenant AND communication_id=:comm"""),
