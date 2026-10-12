@@ -44,6 +44,7 @@ services:
       - ./db/migrations/035_rebooking_cycles.sql:/docker-entrypoint-initdb.d/035_rebooking_cycles.sql:ro
       - ./db/migrations/036_rebooking_rules.sql:/docker-entrypoint-initdb.d/036_rebooking_rules.sql:ro
       - ./db/migrations/038_client_segments.sql:/docker-entrypoint-initdb.d/038_client_segments.sql:ro
+      - ./db/migrations/046_billing_foundation.sql:/docker-entrypoint-initdb.d/046_billing_foundation.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U salon -d salon"]
       interval: 3s

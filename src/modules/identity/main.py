@@ -39,6 +39,7 @@ from modules.booking.holds import register_hold_routes
 from modules.booking.calendar import register_calendar_routes
 from modules.booking.transitions import register_transition_routes
 from modules.booking.receipts import register_receipt_routes
+from modules.company import register_company_routes, start_trial
 from modules.communications.callbacks import register_callback_routes
 from modules.communications.inbox import register_inbox_routes
 from modules.communications.senders import register_sender_routes
@@ -404,6 +405,9 @@ def _create_tenant(engine: Engine, identity: AuthenticatedIdentity, request: Onb
             text("INSERT INTO memberships (tenant_id, user_id, role) VALUES (:tenant_id, :user_id, 'owner')"),
             {"tenant_id": tenant_id, "user_id": str(user["id"])},
         )
+        # TASK-046 / FR-066: every new salon starts on an Essential trial, in
+        # the same transaction as the tenant itself.
+        start_trial(connection, tenant_id=tenant_id)
         connection.execute(
             text("UPDATE identity_users SET tenant_id=:tenant_id, onboarding_fingerprint=:fingerprint WHERE id=:user_id"),
             {"tenant_id": tenant_id, "fingerprint": fingerprint, "user_id": str(user["id"])},
@@ -1457,6 +1461,14 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
         require_identity=require_identity,
         membership_scope=_membership_scope,
         require_permission=_require_permission,
+    )
+
+    register_company_routes(
+        app,
+        require_identity=require_identity,
+        membership_scope=_membership_scope,
+        require_permission=_require_permission,
+        insert_audit=_insert_audit,
     )
 
     register_segment_routes(
