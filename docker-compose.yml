@@ -46,6 +46,7 @@ services:
       - ./db/migrations/038_client_segments.sql:/docker-entrypoint-initdb.d/038_client_segments.sql:ro
       - ./db/migrations/046_billing_foundation.sql:/docker-entrypoint-initdb.d/046_billing_foundation.sql:ro
       - ./db/migrations/047_billing_webhooks.sql:/docker-entrypoint-initdb.d/047_billing_webhooks.sql:ro
+      - ./db/migrations/048_billing_lifecycle.sql:/docker-entrypoint-initdb.d/048_billing_lifecycle.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U salon -d salon"]
       interval: 3s

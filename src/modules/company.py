@@ -30,14 +30,20 @@ from sqlalchemy.exc import IntegrityError
 
 __all__ = [
     "TRIAL_DAYS",
+    "GRACE_DAYS",
     "SyntheticStripeAdapter",
+    "assert_bookings_allowed",
     "rebuild_entitlements",
     "register_company_routes",
+    "run_billing_tick",
     "start_trial",
 ]
 
 # Trial length is a commercial hypothesis, not a constant of nature.
 TRIAL_DAYS = 14
+# Failed payments keep full booking operations for seven days while
+# discretionary marketing stays paused; past the window the account restricts.
+GRACE_DAYS = 7
 
 
 class CompanyModuleError(Exception):
@@ -99,6 +105,8 @@ def _subscription(connection, tenant_id: str) -> dict | None:
     row = connection.execute(
         text("""SELECT s.status, s.stripe_customer_ref, s.stripe_subscription_ref,
                        s.trial_ends_at, s.current_period_end, s.cancel_at_period_end,
+                       s.grace_until, s.scheduled_plan_id::text AS scheduled_plan_id,
+                       s.scheduled_applies_at,
                        p.id::text AS plan_id, p.code AS plan_code, p.name AS plan_name,
                        p.price_minor, p.currency, p.limits, p.version AS plan_version
                 FROM tenant_subscriptions s
@@ -108,9 +116,77 @@ def _subscription(connection, tenant_id: str) -> dict | None:
     if row is None:
         return None
     out = dict(row)
-    for key in ("trial_ends_at", "current_period_end"):
+    for key in ("trial_ends_at", "current_period_end", "grace_until",
+                "scheduled_applies_at"):
         out[key] = out[key].isoformat() if out[key] else None
     return out
+
+
+def assert_bookings_allowed(connection, *, tenant_id: str) -> None:
+    """Enforce billing lifecycle gates on new bookings (FR-068).
+
+    Restricted accounts keep reads, exports and existing-appointment
+    resolution, but no new bookings (402). Security suspension is independent
+    of billing and blocks harder (403). Everything else — including the
+    past-due grace window — keeps full booking operations.
+    """
+    status = connection.execute(
+        text("SELECT status FROM tenant_subscriptions WHERE tenant_id=:tenant"),
+        {"tenant": tenant_id}).scalar_one_or_none()
+    if status == "restricted":
+        raise HTTPException(status_code=402, detail={
+            "code": "billing_restricted",
+            "message": "new bookings are paused until billing recovers; "
+                       "existing appointments, exports and billing stay available"})
+    if status == "suspended":
+        raise HTTPException(status_code=403, detail={
+            "code": "account_suspended",
+            "message": "this account is suspended for security review"})
+
+
+def run_billing_tick(connection, *, tenant_id: str,
+                     now: datetime | None = None) -> dict:
+    """Worker step: apply this tenant's due scheduled downgrade and grace expiry.
+
+    Per-tenant like every other worker seam: the caller scopes the connection
+    and the cron enumerates its tenants. Idempotent: applying a scheduled plan
+    swaps the subscription and rebuilds entitlements; expiring grace moves
+    past_due to restricted. Nothing is destroyed — appointments, exports and
+    recovery paths keep working in every state.
+    """
+    moment = now or datetime.now(timezone.utc)
+    connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                       {"t": tenant_id})
+    applied = restricted = 0
+    due = connection.execute(
+        text("""SELECT scheduled_plan_id::text AS plan_id FROM tenant_subscriptions
+                WHERE tenant_id=:tenant AND scheduled_plan_id IS NOT NULL
+                  AND scheduled_applies_at IS NOT NULL
+                  AND scheduled_applies_at <= :now"""),
+        {"tenant": tenant_id, "now": moment.isoformat()}).mappings().all()
+    for row in due:
+        connection.execute(
+            text("""UPDATE tenant_subscriptions
+                    SET plan_id=:plan, scheduled_plan_id=NULL, scheduled_applies_at=NULL,
+                        version=version+1, updated_at=now()
+                    WHERE tenant_id=:tenant AND scheduled_plan_id=:plan"""),
+            {"tenant": tenant_id, "plan": row["plan_id"]})
+        rebuild_entitlements(connection, tenant_id=tenant_id)
+        applied += 1
+    expired = connection.execute(
+        text("""SELECT 1 FROM tenant_subscriptions
+                WHERE tenant_id=:tenant AND status='past_due' AND grace_until IS NOT NULL
+                  AND grace_until <= :now"""),
+        {"tenant": tenant_id, "now": moment.isoformat()}).scalar_one_or_none()
+    if expired is not None:
+        connection.execute(
+            text("""UPDATE tenant_subscriptions SET status='restricted',
+                           version=version+1, updated_at=now()
+                    WHERE tenant_id=:tenant AND status='past_due'"""),
+            {"tenant": tenant_id})
+        rebuild_entitlements(connection, tenant_id=tenant_id)
+        restricted = 1
+    return {"scheduled_applied": applied, "grace_expired": restricted}
 
 
 class CheckoutIn(BaseModel):
@@ -294,18 +370,24 @@ def _apply_stateful_event(connection, *, tenant_id: str, event_type: str,
         connection.execute(
             text("""UPDATE tenant_subscriptions
                     SET status='active', current_period_end=:period,
-                        last_provider_event_at=:at,
+                        grace_until=NULL, last_provider_event_at=:at,
                         version=version+1, updated_at=now()
                     WHERE tenant_id=:tenant"""),
             {"tenant": tenant_id, "period": data.get("period_end"),
              "at": moment.isoformat()})
     elif event_type == "invoice.payment_failed":
+        # The seven-day grace window runs from the failure (or the existing
+        # window, whichever is later — a second failure never shortens it).
+        grace_at = moment + timedelta(days=GRACE_DAYS)
         connection.execute(
             text("""UPDATE tenant_subscriptions
-                    SET status='past_due', last_provider_event_at=:at,
+                    SET status='past_due',
+                        grace_until=GREATEST(COALESCE(grace_until, now()), :grace_at),
+                        last_provider_event_at=:at,
                         version=version+1, updated_at=now()
                     WHERE tenant_id=:tenant AND status NOT IN ('cancelled', 'suspended')"""),
-            {"tenant": tenant_id, "at": moment.isoformat()})
+            {"tenant": tenant_id, "grace_at": grace_at.isoformat(),
+             "at": moment.isoformat()})
     elif event_type == "customer.subscription.updated":
         mapped = PROVIDER_STATUS_MAP.get(data.get("provider_status", ""))
         if mapped is None:
@@ -326,6 +408,14 @@ class WebhookIn(BaseModel):
     type: str
     occurred_at: datetime | None = None
     data: dict = Field(default_factory=dict)
+
+
+class PlanChangeIn(BaseModel):
+    plan_code: str = Field(pattern="^(essential|growth|multi_location)$")
+
+
+class CancelIn(BaseModel):
+    at_period_end: bool = True
 
 
 def register_company_routes(
@@ -504,5 +594,97 @@ def register_company_routes(
                 if not entitlements:
                     raise HTTPException(status_code=404, detail={"code": "entitlements_not_found"})
             return entitlements
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/tenants/{tenant_id}/billing/subscription/plan", tags=["company"])
+    def change_plan(tenant_id: uuid.UUID, payload: PlanChangeIn,
+                    request: Request, identity=Depends(require_identity)) -> dict:
+        """Upgrade now, downgrade at period end (FR-068: never strand live data).
+
+        Upgrades apply immediately with rebuilt entitlements. Downgrades are
+        scheduled for the current period end so shrinking limits cannot strand
+        locations, staff or data mid-cycle; the worker tick applies them.
+        """
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "team.manage")
+                sub = connection.execute(
+                    text("""SELECT s.status, s.current_period_end, p.price_minor AS current_price
+                            FROM tenant_subscriptions s
+                            JOIN billing_plans p ON p.id=s.plan_id
+                            WHERE s.tenant_id=:tenant"""),
+                    {"tenant": str(tenant_id)}).mappings().one_or_none()
+                if sub is None:
+                    raise HTTPException(status_code=404, detail={"code": "subscription_not_found"})
+                if sub["status"] in ("suspended", "restricted"):
+                    raise HTTPException(status_code=409, detail={
+                        "code": "plan_change_blocked",
+                        "message": "recover billing first; plan changes wait"})
+                plan = connection.execute(
+                    text("""SELECT id::text AS id, code, price_minor FROM billing_plans
+                            WHERE code=:code AND is_active ORDER BY version DESC LIMIT 1"""),
+                    {"code": payload.plan_code}).mappings().one_or_none()
+                if plan is None:
+                    raise HTTPException(status_code=422, detail={"code": "unknown_plan"})
+                if plan["price_minor"] >= sub["current_price"]:
+                    connection.execute(
+                        text("""UPDATE tenant_subscriptions
+                                SET plan_id=:plan, scheduled_plan_id=NULL,
+                                    scheduled_applies_at=NULL,
+                                    version=version+1, updated_at=now()
+                                WHERE tenant_id=:tenant"""),
+                        {"tenant": str(tenant_id), "plan": plan["id"]})
+                    rebuild_entitlements(connection, tenant_id=str(tenant_id))
+                    effective = "immediate"
+                    applies_at = None
+                else:
+                    applies_at = (sub["current_period_end"].isoformat()
+                                  if sub["current_period_end"]
+                                  else (datetime.now(timezone.utc) + timedelta(days=30)).isoformat())
+                    connection.execute(
+                        text("""UPDATE tenant_subscriptions
+                                SET scheduled_plan_id=:plan, scheduled_applies_at=:at,
+                                    version=version+1, updated_at=now()
+                                WHERE tenant_id=:tenant"""),
+                        {"tenant": str(tenant_id), "plan": plan["id"], "at": applies_at})
+                    effective = "period_end"
+                insert_audit(connection, tenant_id, identity, action="billing.plan_changed",
+                             resource_type="tenant_subscription", resource_id=str(tenant_id),
+                             reason=f"{payload.plan_code} {effective}",
+                             request_id=request.state.request_id,
+                             changed_fields=["plan_id"])
+            return {"plan_code": payload.plan_code, "effective": effective,
+                    "applies_at": applies_at}
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/tenants/{tenant_id}/billing/subscription/cancel", tags=["company"])
+    def cancel_subscription(tenant_id: uuid.UUID, payload: CancelIn,
+                            request: Request, identity=Depends(require_identity)) -> dict:
+        """Cancel at period end (or clear the flag): operations continue till then."""
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "team.manage")
+                row = connection.execute(
+                    text("""UPDATE tenant_subscriptions SET cancel_at_period_end=:flag,
+                                   version=version+1, updated_at=now()
+                            WHERE tenant_id=:tenant
+                            RETURNING status, cancel_at_period_end"""),
+                    {"tenant": str(tenant_id), "flag": payload.at_period_end},
+                ).mappings().one_or_none()
+                if row is None:
+                    raise HTTPException(status_code=404, detail={"code": "subscription_not_found"})
+                insert_audit(connection, tenant_id, identity, action="billing.cancel_flagged",
+                             resource_type="tenant_subscription", resource_id=str(tenant_id),
+                             reason=f"cancel_at_period_end={payload.at_period_end}",
+                             request_id=request.state.request_id,
+                             changed_fields=["cancel_at_period_end"])
+            return {"status": row["status"],
+                    "cancel_at_period_end": row["cancel_at_period_end"]}
         finally:
             engine.dispose()

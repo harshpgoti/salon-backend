@@ -26,6 +26,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from modules.company import assert_bookings_allowed
+
 APPOINTMENT_STATUSES = ("pending_approval", "confirmed", "checked_in", "in_service",
                         "completed", "cancelled", "no_show", "rejected")
 BOOKING_SOURCES = ("staff", "walk_in")
@@ -153,6 +155,8 @@ def register_calendar_routes(
             with engine.begin() as connection:
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "appointments.manage")
+                # FR-068: restricted/suspended salons take no new bookings.
+                assert_bookings_allowed(connection, tenant_id=str(tenant_id))
                 # Idempotent replay: the same key returns the booking it already created.
                 existing = connection.execute(
                     text("SELECT id::text AS id FROM appointments WHERE tenant_id=:tenant AND idempotency_key=:key"),

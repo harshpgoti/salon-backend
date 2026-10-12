@@ -30,6 +30,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from modules.company import assert_bookings_allowed
+
 # Proposed hold lifetime (FR-029). Short enough that an abandoned hold frees the slot soon.
 HOLD_MINUTES = 5
 
@@ -260,6 +262,9 @@ def register_hold_routes(
             with engine.begin() as connection:
                 location = resolve_public_location(connection, booking_slug)
                 tenant_id = location["tenant_id"]
+                # FR-068: restricted/suspended salons take no new bookings
+                # (reschedules and cancellations of existing ones stay open).
+                assert_bookings_allowed(connection, tenant_id=tenant_id)
                 _sweep_expired(connection, tenant_id)
 
                 hold = connection.execute(
