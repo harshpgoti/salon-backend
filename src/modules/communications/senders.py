@@ -156,21 +156,31 @@ def resolve_client_for_value(connection, *, tenant_id: str, contact_value: str) 
     return dict(row) if row else None
 
 
-def handle_inbound_sms(connection, *, sender_identity: str, from_value: str, body: str) -> dict:
-    """Handle one inbound SMS from the (recording) provider.
+def handle_inbound_sms(connection, *, sender_identity: str, from_value: str,
+                       body: str, channel: str = "sms") -> dict:
+    """Handle one inbound message from the (recording) provider.
 
     The sender identity maps to exactly one tenant — an unknown identity is
     logged as unresolved and no tenant state changes. STOP (any case,
     surrounding whitespace) creates or refreshes a suppression for the
-    normalized sender value, resolving the client when the number is known.
-    HELP answers with help text and never suppresses. Anything else is logged
-    for the staff inbox (TASK-034).
+    normalized sender value on the same channel, resolving the client when
+    the number is known. HELP answers with help text and never suppresses.
+    Anything else is logged for the staff inbox (TASK-034). A WhatsApp inbound
+    additionally opens the 24h conversation window (TASK-031).
     """
+    if channel not in ("sms", "whatsapp"):
+        raise SenderModuleError(f"unknown channel {channel!r}")
     identity = _check_identity(sender_identity)
-    sender = connection.execute(
-        text("""SELECT tenant_id::text AS tenant_id, id::text AS id FROM sms_senders
-                WHERE sender_identity=:identity"""),
-        {"identity": identity}).mappings().one_or_none()
+    if channel == "sms":
+        sender = connection.execute(
+            text("""SELECT tenant_id::text AS tenant_id, id::text AS id FROM sms_senders
+                    WHERE sender_identity=:identity"""),
+            {"identity": identity}).mappings().one_or_none()
+    else:
+        sender = connection.execute(
+            text("""SELECT tenant_id::text AS tenant_id, id::text AS id FROM whatsapp_senders
+                    WHERE phone_number=:identity"""),
+            {"identity": identity}).mappings().one_or_none()
     if sender is None:
         return {"action": "unresolved", "tenant_id": None}
     tenant_id = sender["tenant_id"]
@@ -183,14 +193,16 @@ def handle_inbound_sms(connection, *, sender_identity: str, from_value: str, bod
         # is what protects future sends (TASK-028 keying).
         record_suppression(connection, tenant_id=tenant_id,
                            client_id=resolved["client_id"] if resolved else None,
-                           contact_value=value, channel="sms", reason="stop",
+                           contact_value=value, channel=channel, reason="stop",
                            source="provider")
     connection.execute(
         text("""INSERT INTO inbound_messages
-                (tenant_id, id, sender_id, from_value, keyword, action)
-                VALUES (:tenant, :id, :sender, :from, :keyword, :action)"""),
-        {"tenant": tenant_id, "id": str(uuid.uuid4()), "sender": sender["id"],
-         "from": from_value.strip(), "keyword": keyword if keyword in ("stop", "help") else "other",
+                (tenant_id, id, sender_id, from_value, channel, keyword, action)
+                VALUES (:tenant, :id, :sender, :from, :channel, :keyword, :action)"""),
+        {"tenant": tenant_id, "id": str(uuid.uuid4()),
+         "sender": sender["id"] if channel == "sms" else None,
+         "from": from_value.strip(), "channel": channel,
+         "keyword": keyword if keyword in ("stop", "help") else "other",
          "action": action},
     )
     result: dict = {"action": action, "tenant_id": tenant_id}
@@ -204,15 +216,17 @@ def record_message_cost(connection, *, tenant_id: str, communication_id: str,
                         channel: str, body_chars: int | None = None) -> dict:
     """Write the CAD segment-cost ledger row for one dispatched message.
 
-    SMS segments are 160 chars (synthetic single-part default of 1); other
-    channels cost nothing in this ledger but keep a row so spend reports can
-    distinguish "free channel" from "unrecorded". Idempotent per
-    communication: replays keep the first row.
+    Synthetic dev-only rates (not vendor quotes, not product prices): SMS and
+    WhatsApp cost one cent per 160-char segment; email keeps a zero-cost row
+    so spend reports can distinguish "free channel" from "unrecorded".
+    Idempotent per communication: replays keep the first row.
     """
-    if channel == "sms":
+    rates = {"sms": SMS_COST_MINOR_PER_SEGMENT, "whatsapp": SMS_COST_MINOR_PER_SEGMENT}
+    per_segment = rates.get(channel, 0)
+    if per_segment:
         chars = body_chars if body_chars and body_chars > 0 else SMS_SEGMENT_CHARS
         segments = (chars + SMS_SEGMENT_CHARS - 1) // SMS_SEGMENT_CHARS
-        cost = segments * SMS_COST_MINOR_PER_SEGMENT
+        cost = segments * per_segment
     else:
         segments, cost = 1, 0
     row = connection.execute(

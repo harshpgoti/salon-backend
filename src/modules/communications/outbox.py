@@ -266,6 +266,27 @@ def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict
             return
         sender_identity = sender["sender_identity"]
 
+    # AC-1/AC-2 / TASK-031: WhatsApp needs an approved sender with acceptable
+    # quality, plus an approved template outside the open 24h window. A
+    # restricted sender or template fails visibly (staff follow-up) instead of
+    # sending; the row itself is the unsent task.
+    if comm["channel"] == "whatsapp":
+        from modules.communications.whatsapp import check_wa_eligible
+        decision = check_wa_eligible(connection, tenant_id=tenant_id,
+                                     contact_value=comm["contact_value"],
+                                     template_id=comm["template_id"], now=now)
+        if not decision["ok"]:
+            connection.execute(
+                text("""UPDATE communications
+                        SET state='failed',
+                            skip_reason=:reason, version=version+1, updated_at=now()
+                        WHERE tenant_id=:tenant AND id=:id"""),
+                {"tenant": tenant_id, "id": comm["id"],
+                 "reason": decision["reason"][:240]})
+            summary["failed"] += 1
+            return
+        sender_identity = decision["sender"]["phone_number"]
+
     # Dispatch through the injected adapter. Errors propagate: the caller
     # (booking dispatch or retry worker) schedules the backoff retry.
     receipt = adapter.send(
