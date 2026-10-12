@@ -189,6 +189,56 @@ def register_closure_impacts_routes(
                 }
         finally:
             engine.dispose()
+    @app.get("/v1/tenants/{tenant_id}/closures/{location_id}/impacts/preview", tags=["closure"])
+    def preview_closure_impacts(
+        tenant_id: uuid.UUID, location_id: uuid.UUID,
+        exception_date: date = Query(...),
+        identity=Depends(require_identity),
+    ) -> dict:
+        """Find live appointments overlapping a closure date, before recording.
+
+        AC-1 lists the appointments a published closure affects so each can be
+        resolved explicitly. Only bookable states count — completed, cancelled,
+        no-show and rejected history is never an impact. Days are compared in
+        the location's own timezone. Already-recorded appointments carry their
+        impact id so the UI can skip them.
+        """
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "closures.read")
+                rows = connection.execute(
+                    text("""SELECT a.id::text AS appointment_id, a.client_id::text AS client_id,
+                                   a.staff_id::text AS staff_id, a.status,
+                                   a.starts_at, a.ends_at,
+                                   ci.id::text AS impact_id, ci.status AS impact_status
+                            FROM appointments a
+                            JOIN locations l ON l.tenant_id=a.tenant_id
+                                            AND l.id=a.location_id
+                            LEFT JOIN closure_impacts ci
+                              ON ci.tenant_id=a.tenant_id
+                             AND ci.appointment_id=a.id
+                             AND ci.location_id=:location
+                             AND ci.exception_date=:date
+                            WHERE a.tenant_id=:tenant AND a.location_id=:location
+                              AND (a.starts_at AT TIME ZONE l.timezone)::date = :date
+                              AND a.status IN ('pending_approval', 'confirmed',
+                                               'checked_in', 'in_service')
+                            ORDER BY a.starts_at"""),
+                    {"tenant": str(tenant_id), "location": str(location_id),
+                     "date": str(exception_date)}).mappings().all()
+                items = [
+                    {"appointment_id": r["appointment_id"], "client_id": r["client_id"],
+                     "staff_id": r["staff_id"], "status": r["status"],
+                     "starts_at": r["starts_at"].isoformat(), "ends_at": r["ends_at"].isoformat(),
+                     "impact_id": r["impact_id"], "impact_status": r["impact_status"]}
+                    for r in rows
+                ]
+                return {"items": items, "total": len(items)}
+        finally:
+            engine.dispose()
+
     @app.get("/v1/tenants/{tenant_id}/closures/{location_id}/impacts", tags=["closure"])
     def list_closure_impacts(
         tenant_id: uuid.UUID, location_id: uuid.UUID,
@@ -239,7 +289,14 @@ def register_closure_impacts_routes(
         tenant_id: uuid.UUID, location_id: uuid.UUID,
         identity=Depends(require_identity),
     ) -> dict:
-        """List all active, unresolved impacts across all closure dates for follow-up."""
+        """List all active, unresolved impacts across all closure dates for follow-up.
+
+        AC-2: each item carries reachability — the client's primary contact, the
+        channels it is suppressed on, and whether staff must follow up by other
+        means (no usable contact, or every channel suppressed). Resolving an
+        impact removes it from this list, so the list always reflects explicit
+        decisions.
+        """
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
@@ -247,27 +304,50 @@ def register_closure_impacts_routes(
                 require_permission(role, "closures.read")
                 rows = connection.execute(
                     text("""SELECT id, appointment_id, location_id, exception_date,
-                               status, resolution, resolved_at, resolved_by,
-                               resolution_reason, client_id, staff_id, starts_at, ends_at
-                          FROM closure_impacts
-                          WHERE tenant_id=:tenant AND location_id=:location
-                            AND status = 'active'
-                          ORDER BY exception_date, starts_at"""),
+                                status, resolution, resolved_at, resolved_by,
+                                resolution_reason, client_id, staff_id, starts_at, ends_at
+                           FROM closure_impacts
+                           WHERE tenant_id=:tenant AND location_id=:location
+                             AND status = 'active'
+                           ORDER BY exception_date, starts_at"""),
                     {"tenant": str(tenant_id), "location": str(location_id)}).mappings().all()
-                impacts = [
-                    {
-                        "id": str(r["id"]), "appointment_id": str(r["appointment_id"]),
-                        "location_id": str(r["location_id"]), "exception_date": str(r["exception_date"]),
-                        "status": r["status"], "resolution": r["resolution"],
-                        "resolved_at": str(r["resolved_at"]) if r["resolved_at"] else None,
-                        "resolved_by": str(r["resolved_by"]) if r["resolved_by"] else None,
-                        "resolution_reason": r["resolution_reason"],
-                        "client_id": str(r["client_id"]),
-                        "staff_id": str(r["staff_id"]) if r["staff_id"] else None,
-                        "starts_at": str(r["starts_at"]), "ends_at": str(r["ends_at"]),
-                    }
-                    for r in rows
-                ]
+                impacts = []
+                for r in rows:
+                    contact = connection.execute(
+                        text("""SELECT kind, normalized_value FROM client_contacts
+                                WHERE tenant_id=:tenant AND client_id=:client
+                                ORDER BY is_primary DESC, created_at LIMIT 1"""),
+                        {"tenant": str(tenant_id),
+                         "client": str(r["client_id"])}).mappings().one_or_none()
+                    suppressed: list[str] = []
+                    if contact is not None:
+                        suppressed = connection.execute(
+                            text("""SELECT channel FROM suppressions
+                                    WHERE tenant_id=:tenant
+                                      AND contact_value=:value"""),
+                            {"tenant": str(tenant_id),
+                             "value": contact["normalized_value"]}).scalars().all()
+                    reachable = contact is not None and (
+                        (contact["kind"] == "email" and "email" not in suppressed)
+                        or (contact["kind"] == "phone"
+                            and ("sms" not in suppressed or "whatsapp" not in suppressed)))
+                    impacts.append(
+                        {
+                            "id": str(r["id"]), "appointment_id": str(r["appointment_id"]),
+                            "location_id": str(r["location_id"]), "exception_date": str(r["exception_date"]),
+                            "status": r["status"], "resolution": r["resolution"],
+                            "resolved_at": str(r["resolved_at"]) if r["resolved_at"] else None,
+                            "resolved_by": str(r["resolved_by"]) if r["resolved_by"] else None,
+                            "resolution_reason": r["resolution_reason"],
+                            "client_id": str(r["client_id"]),
+                            "staff_id": str(r["staff_id"]) if r["staff_id"] else None,
+                            "starts_at": str(r["starts_at"]), "ends_at": str(r["ends_at"]),
+                            "contact_kind": contact["kind"] if contact else None,
+                            "suppressed_channels": sorted(suppressed),
+                            "reachable": reachable,
+                            "follow_up": not reachable,
+                        }
+                    )
                 return {"unsent_impacts": impacts, "total": len(impacts)}
         finally:
             engine.dispose()

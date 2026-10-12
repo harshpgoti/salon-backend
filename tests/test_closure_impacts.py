@@ -152,3 +152,110 @@ def test_closure_impact_unsent_returns_active_only(database_url):
         assert unsent["unsent_impacts"][0]["appointment_id"] == appt_id
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def _book_at(client, base, service, staff, client_id, tomorrow, hour, key):
+    starts = datetime.combine(tomorrow, datetime.min.time()) + timedelta(hours=hour)
+    starts = starts.replace(tzinfo=timezone.utc)
+    created = client.post(f"{base}/appointments", json={
+        "client_id": client_id, "staff_id": staff, "service_id": service,
+        "starts_at": starts.isoformat(), "source": "staff",
+        "idempotency_key": key})
+    assert created.status_code == 201, created.text
+    return created.json()["appointment_id"]
+
+
+def test_closure_preview_lists_live_and_skips_history(database_url):
+    """AC-1: preview finds overlapping live appointments, never history."""
+    issuer = "https://identity.example.invalid/closure-5"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    base = f"/v1/tenants/{tenant['tenant_id']}"
+    try:
+        loc, service, staff, client_id, appt_id, tomorrow = _bookable_salon_with_appointment(
+            client, database_url, tenant)
+        exc = client.post(f"{base}/locations/{loc}/exceptions", json={
+            "exception_date": tomorrow.isoformat(), "kind": "closed"}).json()["id"]
+        client.post(f"{base}/locations/{loc}/exceptions/{exc}/publish", json={"published": True})
+        doomed = _book_at(client, base, service, staff, client_id, tomorrow, 14, "closure-prev-2")
+        cancelled = client.post(f"{base}/appointments/{doomed}/transitions", json={
+            "to_status": "cancelled", "expected_version": 1,
+            "idempotency_key": "closure-prev-cancel-1", "reason": "client request"})
+        assert cancelled.status_code == 200, cancelled.text
+        preview = client.get(f"{base}/closures/{loc}/impacts/preview",
+                             params={"exception_date": tomorrow.isoformat()}).json()
+        found = {item["appointment_id"] for item in preview["items"]}
+        assert appt_id in found
+        assert doomed not in found
+        assert preview["total"] == 1
+        # Recording the impact marks it in later previews.
+        rec = client.post(f"{base}/closures/{loc}/impacts", json={
+            "appointment_id": appt_id, "location_id": loc,
+            "exception_date": tomorrow.isoformat()})
+        assert rec.status_code == 200, rec.text
+        recorded = rec.json()
+        again = client.get(f"{base}/closures/{loc}/impacts/preview",
+                           params={"exception_date": tomorrow.isoformat()}).json()
+        marked = next(i for i in again["items"] if i["appointment_id"] == appt_id)
+        assert marked["impact_id"] == recorded["id"]
+        assert marked["impact_status"] == "active"
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_closure_unsent_flags_unreachable_follow_up(database_url):
+    """AC-2: suppressed or contact-less clients surface as staff follow-up."""
+    issuer = "https://identity.example.invalid/closure-6"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    base = f"/v1/tenants/{tenant['tenant_id']}"
+    try:
+        loc, service, staff, client_id, appt_id, tomorrow = _bookable_salon_with_appointment(
+            client, database_url, tenant)
+        # Client One has no contacts: unreachable by definition.
+        exc = client.post(f"{base}/locations/{loc}/exceptions", json={
+            "exception_date": tomorrow.isoformat(), "kind": "closed"}).json()["id"]
+        client.post(f"{base}/locations/{loc}/exceptions/{exc}/publish", json={"published": True})
+        client.post(f"{base}/closures/{loc}/impacts", json={
+            "appointment_id": appt_id, "location_id": loc,
+            "exception_date": tomorrow.isoformat()})
+        # Second client with an email contact that is suppressed on email.
+        second = client.post(f"{base}/clients", json={
+            "name": "Quiet Client",
+            "contacts": [{"kind": "email", "value": "quiet@example.com", "is_primary": True}],
+        }).json()
+        appt2 = _book_at(client, base, service, staff, second["id"], tomorrow, 14, "closure-fu-2")
+        client.post(f"{base}/closures/{loc}/impacts", json={
+            "appointment_id": appt2, "location_id": loc,
+            "exception_date": tomorrow.isoformat()})
+        with engine.begin() as connection:
+            connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                               {"t": tenant["tenant_id"]})
+            connection.execute(
+                text("""INSERT INTO suppressions (tenant_id, id, client_id, contact_value,
+                                                  channel, reason)
+                        VALUES (:t, gen_random_uuid(), :c, 'quiet@example.com',
+                                'email', 'unsubscribe')"""),
+                {"t": tenant["tenant_id"], "c": second["id"]})
+        unsent = client.get(f"{base}/closures/{loc}/impacts/unsent").json()
+        assert unsent["total"] == 2
+        by_appt = {item["appointment_id"]: item for item in unsent["unsent_impacts"]}
+        lonely = by_appt[appt_id]
+        assert lonely["reachable"] is False and lonely["follow_up"] is True
+        assert lonely["contact_kind"] is None
+        quiet = by_appt[appt2]
+        assert quiet["reachable"] is False and quiet["follow_up"] is True
+        assert quiet["contact_kind"] == "email"
+        assert quiet["suppressed_channels"] == ["email"]
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_closure_permissions_mirror_hours_scopes():
+    """AC-1: managers resolve closures, receptionists read them (like hours)."""
+    from modules.identity.main import ROLE_PERMISSIONS
+    assert "closures.manage" in ROLE_PERMISSIONS["manager"]
+    assert "closures.read" in ROLE_PERMISSIONS["manager"]
+    assert "closures.read" in ROLE_PERMISSIONS["receptionist"]
+    assert "closures.manage" not in ROLE_PERMISSIONS["receptionist"]
+    assert "closures.manage" not in ROLE_PERMISSIONS["stylist"]
