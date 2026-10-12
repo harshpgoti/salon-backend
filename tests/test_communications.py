@@ -216,7 +216,7 @@ def test_expired_reminder_skipped(database_url):
 
 
 def test_provider_failure_does_not_affect_appointment(database_url):
-    """AC-2: a failing adapter marks the communication failed; the appointment is intact."""
+    """AC-2: a failing adapter schedules a backoff retry; the appointment is intact."""
     issuer = "https://identity.example.invalid/comm-5"
     engine, owner, tenant = _salon(database_url, issuer)
     client = _client(database_url, owner)
@@ -237,7 +237,9 @@ def test_provider_failure_does_not_affect_appointment(database_url):
             summary = dispatch_due_communications(
                 connection=conn, tenant_id=tenant["tenant_id"],
                 adapter=FailingAdapter())
-        assert summary["failed"] == 1
+        # TASK-030: the failure schedules attempt 1 with backoff instead of
+        # failing terminally; the booking itself is untouched either way.
+        assert summary["retry_scheduled"] == 1
         assert summary["dispatched"] == 0
         with engine.connect() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
@@ -245,7 +247,15 @@ def test_provider_failure_does_not_affect_appointment(database_url):
             status = conn.execute(
                 text("SELECT status FROM appointments WHERE tenant_id=:t AND id=:id"),
                 {"t": tenant["tenant_id"], "id": appt_id}).scalar_one()
+            comm_state = conn.execute(
+                text("SELECT state FROM communications WHERE tenant_id=:t"),
+                {"t": tenant["tenant_id"]}).scalar_one()
+            attempt = conn.execute(
+                text("SELECT attempt, state FROM dispatch_attempts WHERE tenant_id=:t"),
+                {"t": tenant["tenant_id"]}).mappings().one()
         assert status == "confirmed"
+        assert comm_state == "retry_scheduled"
+        assert (attempt["attempt"], attempt["state"]) == (1, "queued")
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 

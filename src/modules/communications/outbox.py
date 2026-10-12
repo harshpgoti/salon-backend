@@ -161,116 +161,177 @@ def dispatch_due_communications(
     ).mappings().all()
 
     summary = {"dispatched": 0, "skipped_stale": 0, "skipped_expired": 0,
-               "suppressed": 0, "failed": 0}
+               "suppressed": 0, "retry_scheduled": 0, "failed": 0}
     for comm in candidates:
-        # Re-read the current appointment version.
-        current = connection.execute(
-            text("""SELECT version FROM appointments
-                    WHERE tenant_id=:tenant AND id=:id"""),
-            {"tenant": tenant_id, "id": comm["source_id"]},
-        ).scalar_one_or_none()
-
-        if current is None or current != comm["expected_entity_version"]:
-            connection.execute(
-                text("""UPDATE communications
-                        SET state='skipped_stale',
-                            skip_reason=:reason, version=version+1, updated_at=now()
-                        WHERE tenant_id=:tenant AND id=:id"""),
-                {"tenant": tenant_id, "id": comm["id"],
-                 "reason": f"appointment version changed (expected {comm['expected_entity_version']}, current {current})"})
-            summary["skipped_stale"] += 1
-            continue
-
-        if comm["expires_at"] is not None and comm["expires_at"] <= now:
-            connection.execute(
-                text("""UPDATE communications
-                        SET state='skipped_expired',
-                            skip_reason=:reason, version=version+1, updated_at=now()
-                        WHERE tenant_id=:tenant AND id=:id"""),
-                {"tenant": tenant_id, "id": comm["id"],
-                 "reason": "reminder window passed before dispatch"})
-            summary["skipped_expired"] += 1
-            continue
-
-        # AC-2 / FR-041: an opt-out written after the message was recorded —
-        # the unsubscribe/STOP race — blocks this send. Suppression is keyed by
-        # contact value, so it holds even if the client row changed since.
-        if check_suppressed(connection, tenant_id=tenant_id,
-                            contact_value=comm["contact_value"],
-                            channel=comm["channel"]):
-            connection.execute(
-                text("""UPDATE communications
-                        SET state='suppressed',
-                            skip_reason=:reason, version=version+1, updated_at=now()
-                        WHERE tenant_id=:tenant AND id=:id"""),
-                {"tenant": tenant_id, "id": comm["id"],
-                 "reason": "contact opted out for this channel before dispatch"})
-            summary["suppressed"] += 1
-            continue
-
-        # AC-1 / FR-040: marketing sends need a current grant; a later
-        # revocation always wins over an earlier grant.
-        if comm["purpose"] == "marketing" and not check_consented(
-                connection, tenant_id=tenant_id, client_id=comm["client_id"],
-                channel=comm["channel"], purpose=comm["purpose"], now=now):
-            connection.execute(
-                text("""UPDATE communications
-                        SET state='suppressed',
-                            skip_reason=:reason, version=version+1, updated_at=now()
-                        WHERE tenant_id=:tenant AND id=:id"""),
-                {"tenant": tenant_id, "id": comm["id"],
-                 "reason": "no current marketing consent for this client/channel"})
-            summary["suppressed"] += 1
-            continue
-
-        # AC-1 / TASK-029: SMS routes only through the tenant's verified sender,
-        # stamped on the send so the client always sees their own salon's
-        # identity. Without one the message fails (retryable once a sender is
-        # verified) rather than borrowing another salon's number.
-        sender_identity = None
-        if comm["channel"] == "sms":
-            sender = get_verified_sender(connection, tenant_id=tenant_id)
-            if sender is None:
-                connection.execute(
-                    text("""UPDATE communications
-                            SET state='failed',
-                                skip_reason=:reason, version=version+1, updated_at=now()
-                            WHERE tenant_id=:tenant AND id=:id"""),
-                    {"tenant": tenant_id, "id": comm["id"],
-                     "reason": "no verified SMS sender for this salon"})
-                summary["failed"] += 1
-                continue
-            sender_identity = sender["sender_identity"]
-
-        # Dispatch through the injected adapter.
         try:
-            receipt = adapter.send(
-                channel=comm["channel"],
-                recipient=comm["contact_value"],
-                template=comm["purpose"],
-                sender=sender_identity,
-            )
-            connection.execute(
-                text("""UPDATE communications
-                        SET state='dispatched', dispatched_at=now(),
-                            provider_ref=:ref, version=version+1, updated_at=now()
-                        WHERE tenant_id=:tenant AND id=:id"""),
-                {"tenant": tenant_id, "id": comm["id"],
-                 "ref": receipt.get("id") if isinstance(receipt, dict) else None})
-            # TASK-029 / FR-044: every dispatch writes its CAD segment-cost
-            # ledger row, so spend is visible before the next campaign.
-            record_message_cost(connection, tenant_id=tenant_id,
-                                communication_id=comm["id"],
-                                channel=comm["channel"])
-            summary["dispatched"] += 1
+            _route_candidate(connection, tenant_id=tenant_id, comm=comm,
+                             adapter=adapter, summary=summary, now=now)
         except Exception as exc:  # noqa: BLE001 — adapter failure is classified, not fatal
+            # TASK-030 / FR-043: a provider raise schedules a backoff retry
+            # instead of failing terminally; the booking is never touched.
+            from modules.communications.callbacks import queue_retry
+            outcome = queue_retry(connection, tenant_id=tenant_id,
+                                  communication_id=comm["id"],
+                                  error=str(exc), now=now)
+            summary["retry_scheduled" if outcome["status"] == "retry_scheduled" else "failed"] += 1
+
+    return summary
+
+
+def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict,
+                     now: datetime) -> None:
+    """Apply gates and send one candidate; adapter errors propagate.
+
+    Shared by the booking-time dispatch and the retry worker so a retried send
+    re-checks versions, expiry, suppressions, consent and the SMS sender —
+    exactly like a first attempt. Gated outcomes update state and the summary;
+    only a successful adapter call returns normally.
+    """
+    # Re-read the current appointment version.
+    current = connection.execute(
+        text("""SELECT version FROM appointments
+                WHERE tenant_id=:tenant AND id=:id"""),
+        {"tenant": tenant_id, "id": comm["source_id"]},
+    ).scalar_one_or_none()
+
+    if current is None or current != comm["expected_entity_version"]:
+        connection.execute(
+            text("""UPDATE communications
+                    SET state='skipped_stale',
+                        skip_reason=:reason, version=version+1, updated_at=now()
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": comm["id"],
+             "reason": f"appointment version changed (expected {comm['expected_entity_version']}, current {current})"})
+        summary["skipped_stale"] += 1
+        return
+
+    if comm["expires_at"] is not None and comm["expires_at"] <= now:
+        connection.execute(
+            text("""UPDATE communications
+                    SET state='skipped_expired',
+                        skip_reason=:reason, version=version+1, updated_at=now()
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": comm["id"],
+             "reason": "reminder window passed before dispatch"})
+        summary["skipped_expired"] += 1
+        return
+
+    # AC-2 / FR-041: an opt-out written after the message was recorded —
+    # the unsubscribe/STOP race — blocks this send. Suppression is keyed by
+    # contact value, so it holds even if the client row changed since.
+    if check_suppressed(connection, tenant_id=tenant_id,
+                        contact_value=comm["contact_value"],
+                        channel=comm["channel"]):
+        connection.execute(
+            text("""UPDATE communications
+                    SET state='suppressed',
+                        skip_reason=:reason, version=version+1, updated_at=now()
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": comm["id"],
+             "reason": "contact opted out for this channel before dispatch"})
+        summary["suppressed"] += 1
+        return
+
+    # AC-1 / FR-040: marketing sends need a current grant; a later
+    # revocation always wins over an earlier grant.
+    if comm["purpose"] == "marketing" and not check_consented(
+            connection, tenant_id=tenant_id, client_id=comm["client_id"],
+            channel=comm["channel"], purpose=comm["purpose"], now=now):
+        connection.execute(
+            text("""UPDATE communications
+                    SET state='suppressed',
+                        skip_reason=:reason, version=version+1, updated_at=now()
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": comm["id"],
+             "reason": "no current marketing consent for this client/channel"})
+        summary["suppressed"] += 1
+        return
+
+    # AC-1 / TASK-029: SMS routes only through the tenant's verified sender,
+    # stamped on the send so the client always sees their own salon's
+    # identity. Without one the message fails (retryable once a sender is
+    # verified) rather than borrowing another salon's number.
+    sender_identity = None
+    if comm["channel"] == "sms":
+        sender = get_verified_sender(connection, tenant_id=tenant_id)
+        if sender is None:
             connection.execute(
                 text("""UPDATE communications
-                        SET state='failed', skip_reason=:reason,
-                            version=version+1, updated_at=now()
+                        SET state='failed',
+                            skip_reason=:reason, version=version+1, updated_at=now()
                         WHERE tenant_id=:tenant AND id=:id"""),
                 {"tenant": tenant_id, "id": comm["id"],
-                 "reason": str(exc)[:240]})
+                 "reason": "no verified SMS sender for this salon"})
             summary["failed"] += 1
+            return
+        sender_identity = sender["sender_identity"]
 
+    # Dispatch through the injected adapter. Errors propagate: the caller
+    # (booking dispatch or retry worker) schedules the backoff retry.
+    receipt = adapter.send(
+        channel=comm["channel"],
+        recipient=comm["contact_value"],
+        template=comm["purpose"],
+        sender=sender_identity,
+    )
+    connection.execute(
+        text("""UPDATE communications
+                SET state='dispatched', dispatched_at=now(),
+                    provider_ref=:ref, version=version+1, updated_at=now()
+                WHERE tenant_id=:tenant AND id=:id"""),
+        {"tenant": tenant_id, "id": comm["id"],
+         "ref": receipt.get("id") if isinstance(receipt, dict) else None})
+    # TASK-029 / FR-044: every dispatch writes its CAD segment-cost
+    # ledger row, so spend is visible before the next campaign.
+    record_message_cost(connection, tenant_id=tenant_id,
+                        communication_id=comm["id"],
+                        channel=comm["channel"])
+    summary["dispatched"] += 1
+
+
+def dispatch_claimed_retries(connection, *, tenant_id: str, adapter,
+                             now: datetime | None = None, limit: int = 25) -> dict:
+    """Worker step: claim due retries and send each through the shared gates.
+
+    One function so a worker process (or a test) performs claim, re-gated send
+    and bookkeeping atomically per batch: claimed attempts that send become
+    ``succeeded``/``dispatched``; adapter raises mark the attempt and schedule
+    the next backoff via :func:`callbacks.queue_retry`; gated outcomes (stale,
+    expired, suppressed) resolve inside ``_route_candidate`` and mark the
+    attempt ``succeeded`` — the message reached a terminal state, so no further
+    attempt must fire.
+    """
+    from modules.communications.callbacks import claim_due_retries, queue_retry
+    if now is None:
+        now = datetime.now(timezone.utc)
+    summary = {"dispatched": 0, "skipped_stale": 0, "skipped_expired": 0,
+               "suppressed": 0, "retry_scheduled": 0, "failed": 0}
+    claimed = claim_due_retries(connection, tenant_id=tenant_id, now=now, limit=limit)
+    for job in claimed:
+        comm = connection.execute(
+            text("""SELECT id, client_id, contact_value, channel, purpose,
+                           template_id, template_version, source_id,
+                           expected_entity_version, expires_at
+                    FROM communications
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": job["communication_id"]},
+        ).mappings().one_or_none()
+        if comm is None:
+            continue
+        try:
+            _route_candidate(connection, tenant_id=tenant_id, comm=comm,
+                             adapter=adapter, summary=summary, now=now)
+            outcome = "succeeded"
+        except Exception as exc:  # noqa: BLE001 — adapter failure is classified, not fatal
+            outcome = "retry_scheduled"
+            queued = queue_retry(connection, tenant_id=tenant_id,
+                                 communication_id=comm["id"],
+                                 error=str(exc), now=now)
+            summary["retry_scheduled" if queued["status"] == "retry_scheduled" else "failed"] += 1
+            if queued["status"] != "retry_scheduled":
+                outcome = "exhausted"
+        connection.execute(
+            text("""UPDATE dispatch_attempts SET state=:state, updated_at=now()
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": job["id"], "state": outcome})
     return summary
