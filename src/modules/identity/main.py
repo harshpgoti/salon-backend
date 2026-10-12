@@ -42,6 +42,7 @@ from modules.booking.receipts import register_receipt_routes
 from modules.communications.callbacks import register_callback_routes
 from modules.communications.inbox import register_inbox_routes
 from modules.communications.senders import register_sender_routes
+from modules.analytics import register_analytics_routes
 from modules.retention import register_retention_routes
 from modules.segments import register_segment_routes
 from modules.communications.whatsapp import register_wa_sender_routes
@@ -1449,6 +1450,13 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
         membership_scope=_membership_scope,
         require_permission=_require_permission,
         insert_audit=_insert_audit,
+    )
+
+    register_analytics_routes(
+        app,
+        require_identity=require_identity,
+        membership_scope=_membership_scope,
+        require_permission=_require_permission,
     )
 
     register_segment_routes(
