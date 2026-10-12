@@ -50,7 +50,12 @@ def _teardown(engine, tenants: list[str], issuer: str) -> None:
                                        WHERE tenant_id=:tenant"""), {"tenant": tenant_id})
             connection.execute(text("DELETE FROM tenants WHERE id=:tenant"), {"tenant": tenant_id})
         connection.execute(text("SELECT set_config('app.tenant_id', '', true)"))
-        connection.execute(text("DELETE FROM identity_users WHERE issuer=:issuer"), {"issuer": issuer})
+        # Only users with no surviving membership are removed, so a stale row
+        # from an interrupted run can never cascade into a new leak by blocking
+        # this run's cleanup with a foreign-key violation.
+        connection.execute(text("""DELETE FROM identity_users WHERE issuer=:issuer
+                                   AND id NOT IN (SELECT user_id FROM memberships)"""),
+                           {"issuer": issuer})
     engine.dispose()
 
 

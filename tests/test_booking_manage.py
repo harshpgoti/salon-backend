@@ -133,15 +133,17 @@ def test_booking_succeeds_without_marketing_consent_and_records_none(database_ur
         appointment_id, token = _confirm(client, slug, service, staff, client_id, day)
         view = client.get(f"/v1/public/salons/{slug}/manage/{appointment_id}", params={"token": token})
         assert view.status_code == 200, view.text
-        # No consent table exists for FR-040 yet, and none was created: the client is
-        # marketing-ineligible. This guards against a future task silently opting in.
+        # Booking stores no consent: the client stays marketing-ineligible unless
+        # they explicitly opt in. (Written before TASK-028 this asserted the
+        # consent table did not exist yet; now that it does, the guard is zero
+        # consent *rows* for this client.) This guards against silently opting in.
         with engine.begin() as connection:
             connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant["tenant_id"]})
-            tables = connection.execute(
-                text("""SELECT count(*) FROM information_schema.tables
-                        WHERE table_schema='public' AND table_name IN
-                        ('consents','communication_consents','client_consents')""")).scalar_one()
-        assert tables == 0
+            rows = connection.execute(
+                text("""SELECT count(*) FROM consents
+                        WHERE tenant_id=:t AND client_id=:c"""),
+                {"t": tenant["tenant_id"], "c": client_id}).scalar_one()
+        assert rows == 0
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 

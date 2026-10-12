@@ -36,6 +36,7 @@ services:
       - ./db/migrations/022_salon_receipts.sql:/docker-entrypoint-initdb.d/022_salon_receipts.sql:ro
       - ./db/migrations/026_closure_impacts.sql:/docker-entrypoint-initdb.d/026_closure_impacts.sql:ro
       - ./db/migrations/027_communications.sql:/docker-entrypoint-initdb.d/027_communications.sql:ro
+      - ./db/migrations/028_consents_suppressions.sql:/docker-entrypoint-initdb.d/028_consents_suppressions.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U salon -d salon"]
       interval: 3s

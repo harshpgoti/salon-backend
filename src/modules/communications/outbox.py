@@ -14,9 +14,14 @@ Three concerns, one module:
   has passed (FR-042). Provider failure never touches the booking — the adapter
   records or fails on its own.
 
-- **Schedule reminders.** `schedule_booking_reminders` creates two reminder
-  communications per appointment (24 h and 2 h before start) during the same
-  transaction that creates or reschedules the booking.
+    - **Schedule reminders.** `schedule_booking_reminders` creates two reminder
+    communications per appointment (24 h and 2 h before start) during the same
+    transaction that creates or reschedules the booking.
+
+- **Honour consent.** Before each send the dispatcher re-checks suppressions
+  (FR-041) and, for ``marketing`` purposes, the current consent state (FR-040).
+  A blocked message moves to ``suppressed`` with a reason; the adapter is never
+  called for it.
 
 The delivery adapter is injected, so the module works with the existing
 `RecordingDeliveryAdapter` today and any real provider adapter later.
@@ -28,6 +33,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
+
+from modules.communications.consent import check_consented, check_suppressed
 
 # Reminder offsets in hours before the appointment start (FR-042 default).
 REMINDER_OFFSETS_HOURS = (24, 2)
@@ -129,11 +136,14 @@ def dispatch_due_communications(
     For each candidate the current appointment version is re-read. If it no
     longer matches ``expected_entity_version`` the row is marked
     ``skipped_stale``. If ``expires_at`` has passed the row is marked
-    ``skipped_expired``. Otherwise the adapter is called and the row advances
-    to ``dispatched`` (or ``failed`` on a provider error).
+    ``skipped_expired``. Then suppressions are re-checked (FR-041) and, for
+    ``marketing`` purposes, the current consent state (FR-040); a blocked
+    message is marked ``suppressed`` and the adapter is never called for it.
+    Otherwise the adapter is called and the row advances to ``dispatched``
+    (or ``failed`` on a provider error).
 
     Returns a summary dict: ``{"dispatched": n, "skipped_stale": n,
-    "skipped_expired": n, "failed": n}``.
+    "skipped_expired": n, "suppressed": n, "failed": n}``.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -149,7 +159,8 @@ def dispatch_due_communications(
         {"tenant": tenant_id, "now": now.isoformat(), "limit": limit},
     ).mappings().all()
 
-    summary = {"dispatched": 0, "skipped_stale": 0, "skipped_expired": 0, "failed": 0}
+    summary = {"dispatched": 0, "skipped_stale": 0, "skipped_expired": 0,
+               "suppressed": 0, "failed": 0}
     for comm in candidates:
         # Re-read the current appointment version.
         current = connection.execute(
@@ -178,6 +189,37 @@ def dispatch_due_communications(
                 {"tenant": tenant_id, "id": comm["id"],
                  "reason": "reminder window passed before dispatch"})
             summary["skipped_expired"] += 1
+            continue
+
+        # AC-2 / FR-041: an opt-out written after the message was recorded —
+        # the unsubscribe/STOP race — blocks this send. Suppression is keyed by
+        # contact value, so it holds even if the client row changed since.
+        if check_suppressed(connection, tenant_id=tenant_id,
+                            contact_value=comm["contact_value"],
+                            channel=comm["channel"]):
+            connection.execute(
+                text("""UPDATE communications
+                        SET state='suppressed',
+                            skip_reason=:reason, version=version+1, updated_at=now()
+                        WHERE tenant_id=:tenant AND id=:id"""),
+                {"tenant": tenant_id, "id": comm["id"],
+                 "reason": "contact opted out for this channel before dispatch"})
+            summary["suppressed"] += 1
+            continue
+
+        # AC-1 / FR-040: marketing sends need a current grant; a later
+        # revocation always wins over an earlier grant.
+        if comm["purpose"] == "marketing" and not check_consented(
+                connection, tenant_id=tenant_id, client_id=comm["client_id"],
+                channel=comm["channel"], purpose=comm["purpose"], now=now):
+            connection.execute(
+                text("""UPDATE communications
+                        SET state='suppressed',
+                            skip_reason=:reason, version=version+1, updated_at=now()
+                        WHERE tenant_id=:tenant AND id=:id"""),
+                {"tenant": tenant_id, "id": comm["id"],
+                 "reason": "no current marketing consent for this client/channel"})
+            summary["suppressed"] += 1
             continue
 
         # Dispatch through the injected adapter.
