@@ -175,13 +175,14 @@ def resolve_segment(connection, *, tenant_id: str, segment_id: str,
         if contact is None:
             exclusions["unreachable"] += 1
             continue
-        if not check_consented(connection, tenant_id=tenant_id, client_id=client_id,
-                               channel=channel, purpose="marketing"):
-            exclusions["no_consent"] += 1
-            continue
+        # Suppression first: an explicit opt-out sorts before a missing grant.
         if check_suppressed(connection, tenant_id=tenant_id,
                             contact_value=contact["normalized_value"], channel=channel):
             exclusions["suppressed"] += 1
+            continue
+        if not check_consented(connection, tenant_id=tenant_id, client_id=client_id,
+                               channel=channel, purpose="marketing"):
+            exclusions["no_consent"] += 1
             continue
         eligible.append(client_id)
         numbers[contact["normalized_value"]] = numbers.get(contact["normalized_value"], 0) + 1

@@ -34,7 +34,11 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from modules.communications.consent import check_consented, check_suppressed
+from modules.communications.consent import (
+    CONSENT_GATED_PURPOSES,
+    check_consented,
+    check_suppressed,
+)
 from modules.communications.senders import get_verified_sender, record_message_cost
 
 # Reminder offsets in hours before the appointment start (FR-042 default).
@@ -61,12 +65,15 @@ def record_booking_communication(
     scheduled_at: datetime | None = None,
     expires_at: datetime | None = None,
     trace_id: str | None = None,
+    source_type: str = "appointment",
 ) -> dict | None:
     """Record one communication row inside the caller's transaction.
 
     Returns the inserted row (as a dict) or ``None`` when the dedupe key already
     exists — a replayed booking command must not create a second message.
     """
+    if source_type not in ("appointment", "location_broadcast"):
+        raise ValueError(f"unknown source_type {source_type!r}")
     key = _dedupe_key(appointment_id, purpose, entity_version, channel)
     row = connection.execute(
         text("""INSERT INTO communications
@@ -75,7 +82,7 @@ def record_booking_communication(
                  expected_entity_version, state, scheduled_at, expires_at, dedupe_key,
                  trace_id)
                 VALUES (:tenant, :id, :client, :contact, :channel, :purpose,
-                        :template, :template_version, 'appointment', :source,
+                        :template, :template_version, :source_type, :source,
                         :entity_version, 'recorded', :scheduled, :expires, :dedupe,
                         :trace)
                 ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
@@ -83,7 +90,8 @@ def record_booking_communication(
         {"tenant": tenant_id, "id": str(uuid.uuid4()), "client": client_id,
          "contact": contact_value, "channel": channel, "purpose": purpose,
          "template": template_id, "template_version": template_version,
-         "source": appointment_id, "entity_version": entity_version,
+         "source_type": source_type, "source": appointment_id,
+         "entity_version": entity_version,
          "scheduled": scheduled_at, "expires": expires_at, "dedupe": key,
          "trace": trace_id},
     ).mappings().one_or_none()
@@ -173,7 +181,7 @@ def dispatch_due_communications(
                     LIMIT :limit
                     FOR UPDATE SKIP LOCKED)
                 RETURNING id, client_id, contact_value, channel, purpose,
-                          template_id, template_version, source_id,
+                          template_id, template_version, source_type, source_id,
                           expected_entity_version, expires_at,
                           trace_id::text AS trace_id"""),
         {"tenant": tenant_id, "now": now.isoformat(), "limit": limit},
@@ -235,14 +243,19 @@ def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict
             {"tenant": tenant_id, "id": comm["id"]})
         summary["deferred"] += 1
         return
-    # Re-read the current appointment version.
-    current = connection.execute(
-        text("""SELECT version FROM appointments
-                WHERE tenant_id=:tenant AND id=:id"""),
-        {"tenant": tenant_id, "id": comm["source_id"]},
-    ).scalar_one_or_none()
+    # Re-read the current appointment version — appointment sources only.
+    # Broadcasts carry no appointment version; their gates are consent,
+    # suppression, quiet hours and budget, checked below like all sends.
+    current = None
+    if comm.get("source_type", "appointment") == "appointment":
+        current = connection.execute(
+            text("""SELECT version FROM appointments
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": comm["source_id"]},
+        ).scalar_one_or_none()
 
-    if current is None or current != comm["expected_entity_version"]:
+    if (comm.get("source_type", "appointment") == "appointment"
+            and (current is None or current != comm["expected_entity_version"])):
         connection.execute(
             text("""UPDATE communications
                     SET state='skipped_stale',
@@ -331,9 +344,9 @@ def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict
         summary["suppressed"] += 1
         return
 
-    # AC-1 / FR-040: marketing sends need a current grant; a later
-    # revocation always wins over an earlier grant.
-    if comm["purpose"] == "marketing" and not check_consented(
+    # AC-1 / FR-040: gated purposes (marketing, closure broadcasts) need a
+    # current grant; a later revocation always wins over an earlier grant.
+    if comm["purpose"] in CONSENT_GATED_PURPOSES and not check_consented(
             connection, tenant_id=tenant_id, client_id=comm["client_id"],
             channel=comm["channel"], purpose=comm["purpose"], now=now):
         connection.execute(
@@ -466,7 +479,7 @@ def dispatch_claimed_retries(connection, *, tenant_id: str, adapter,
     for job in claimed:
         comm = connection.execute(
             text("""SELECT id, client_id, contact_value, channel, purpose,
-                           template_id, template_version, source_id,
+                           template_id, template_version, source_type, source_id,
                            expected_entity_version, expires_at,
                            trace_id::text AS trace_id
                     FROM communications

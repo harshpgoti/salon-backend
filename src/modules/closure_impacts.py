@@ -1,19 +1,22 @@
-"""Closure impact resolution (FR-025, FR-026, TASK-026).
+"""Closure impact resolution (FR-025, FR-026, TASK-026) and notices (TASK-033).
 
 When a closure exception is published, existing appointments that overlap
 with the closure are tracked so owners can explicitly choose to reschedule,
 cancel, or leave them. A booking never vanishes automatically.
 
-The `closure_impacts` table records each appointment affected by a dated
-closure exception. Each record has a status and a resolution (who, when,
-why) so the salon can later generate targeted notifications and reports.
+TASK-033 notices: recorded impacts notify their client (transactional
+closure_notice, immediate priority); broader location audiences follow
+purpose policy (marketing consent required, no fallback, suppressed contacts
+skipped). Unreachable impact clients open a staff follow-up task instead of
+an unlawful fallback send; broadcasts leave one summary task with the
+unreachable count.
 """
 
 from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -349,5 +352,173 @@ def register_closure_impacts_routes(
                         }
                     )
                 return {"unsent_impacts": impacts, "total": len(impacts)}
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/tenants/{tenant_id}/closures/{location_id}/impacts/{impact_id}/notify",
+              tags=["closure"])
+    def notify_impact(tenant_id: uuid.UUID, location_id: uuid.UUID, impact_id: uuid.UUID,
+                      request: Request, identity=Depends(require_identity),
+                      template_id: uuid.UUID | None = None) -> dict:
+        """Notify one impact's client now (affected bookings prioritized).
+
+        Records a transactional closure_notice for immediate dispatch. When
+        the client has no usable contact or the channel is suppressed, no
+        fallback fires (AC-2: never unlawful) — a closure_follow_up task
+        opens for staff instead.
+        """
+        from modules.communications.consent import check_suppressed
+        from modules.communications.outbox import record_booking_communication
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "communications.manage")
+                impact = connection.execute(
+                    text("""SELECT id::text AS id, appointment_id::text AS appointment_id,
+                                   client_id::text AS client_id, status
+                            FROM closure_impacts
+                            WHERE tenant_id=:tenant AND id=:id"""),
+                    {"tenant": str(tenant_id), "id": str(impact_id)}).mappings().one_or_none()
+                if impact is None:
+                    raise HTTPException(status_code=404, detail={"code": "impact_not_found"})
+                contact = connection.execute(
+                    text("""SELECT kind, normalized_value FROM client_contacts
+                            WHERE tenant_id=:tenant AND client_id=:client
+                            ORDER BY is_primary DESC, created_at LIMIT 1"""),
+                    {"tenant": str(tenant_id),
+                     "client": impact["client_id"]}).mappings().one_or_none()
+                channel = "email" if contact is None or contact["kind"] == "email" else "sms"
+                blocked = contact is None or check_suppressed(
+                    connection, tenant_id=str(tenant_id),
+                    contact_value=contact["normalized_value"], channel=channel)
+                if blocked:
+                    task = connection.execute(
+                        text("""INSERT INTO follow_up_tasks
+                                (tenant_id, id, client_id, kind, title, detail,
+                                 source_type, source_id)
+                                VALUES (:tenant, :id, :client, 'closure_follow_up',
+                                        'Closure notice unreachable',
+                                        'No usable contact: staff must call or see the client.',
+                                        'closure_impact', :source)
+                                ON CONFLICT (tenant_id, source_type, source_id) DO NOTHING
+                                RETURNING id::text AS id"""),
+                        {"tenant": str(tenant_id), "id": str(uuid.uuid4()),
+                         "client": impact["client_id"], "source": impact["id"]},
+                    ).mappings().one_or_none()
+                    insert_audit(connection, tenant_id, identity,
+                                 action="closure_impact.follow_up_opened",
+                                 resource_type="closure", resource_id=str(location_id),
+                                 reason=f"impact {impact_id} unreachable, no fallback sent",
+                                 request_id=request.state.request_id,
+                                 changed_fields=["follow_up"])
+                    return {"notified": False, "follow_up_task_id":
+                            task["id"] if task else None}
+                version = connection.execute(
+                    text("SELECT version FROM appointments WHERE tenant_id=:t AND id=:a"),
+                    {"t": str(tenant_id), "a": impact["appointment_id"]}).scalar_one_or_none()
+                row = record_booking_communication(
+                    connection, tenant_id=str(tenant_id),
+                    appointment_id=impact["appointment_id"], client_id=impact["client_id"],
+                    contact_value=contact["normalized_value"], channel=channel,
+                    purpose="closure_notice", entity_version=version or 1,
+                    template_id=str(template_id) if template_id else None)
+                insert_audit(connection, tenant_id, identity,
+                             action="closure_impact.notified",
+                             resource_type="closure", resource_id=str(location_id),
+                             reason=f"impact {impact_id} notice recorded",
+                             request_id=request.state.request_id,
+                             changed_fields=["notified"])
+            return {"notified": True, "communication_id": row["id"] if row else None}
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/tenants/{tenant_id}/closures/{location_id}/notify-audience",
+              tags=["closure"])
+    def notify_audience(tenant_id: uuid.UUID, location_id: uuid.UUID,
+                        request: Request, identity=Depends(require_identity),
+                        channel: str = "email") -> dict:
+        """Notice a location's clients under purpose policy (AC-1/AC-2).
+
+        Location-wide closure news is treated as marketing: only currently
+        consented, unsuppressed clients are recorded — no fallback, no silent
+        expansion. Suppressed and unreachable contacts are counted, not
+        messaged, and one summary follow-up task carries the count for staff.
+        """
+        from modules.communications.consent import check_consented, check_suppressed
+        from modules.communications.outbox import record_booking_communication
+        if channel not in ("email", "sms", "whatsapp"):
+            raise HTTPException(status_code=422, detail={"code": "unknown_channel"})
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "communications.manage")
+                clients = connection.execute(
+                    text("""SELECT DISTINCT c.id::text AS client_id FROM clients c
+                            WHERE c.tenant_id=:tenant AND c.deleted_at IS NULL
+                              AND (c.preferred_location_id=:loc OR EXISTS (
+                                     SELECT 1 FROM visits v
+                                     WHERE v.tenant_id=c.tenant_id AND v.client_id=c.id
+                                       AND v.location_id=:loc))"""),
+                    {"tenant": str(tenant_id), "loc": str(location_id)}).mappings().all()
+                recorded = skipped_consent = skipped_suppressed = unreachable = 0
+                for entry in clients:
+                    contact = connection.execute(
+                        text("""SELECT normalized_value FROM client_contacts
+                                WHERE tenant_id=:tenant AND client_id=:client
+                                ORDER BY is_primary DESC, created_at LIMIT 1"""),
+                        {"tenant": str(tenant_id),
+                         "client": entry["client_id"]}).mappings().one_or_none()
+                    if contact is None:
+                        unreachable += 1
+                        continue
+                    # Suppression is the stronger signal: an explicit opt-out
+                    # sorts before a missing grant.
+                    if check_suppressed(connection, tenant_id=str(tenant_id),
+                                        contact_value=contact["normalized_value"],
+                                        channel=channel):
+                        skipped_suppressed += 1
+                        continue
+                    if not check_consented(
+                            connection, tenant_id=str(tenant_id), client_id=entry["client_id"],
+                            channel=channel, purpose="marketing"):
+                        skipped_consent += 1
+                        continue
+                    # Deprioritized behind impact notices: broadcasts wait an
+                    # hour while affected bookings go now.
+                    row = record_booking_communication(
+                        connection, tenant_id=str(tenant_id),
+                        appointment_id=str(location_id),
+                        client_id=entry["client_id"],
+                        contact_value=contact["normalized_value"], channel=channel,
+                        purpose="closure_broadcast", entity_version=1,
+                        source_type="location_broadcast",
+                        scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1))
+                    if row is not None:
+                        recorded += 1
+                task = connection.execute(
+                    text("""INSERT INTO follow_up_tasks
+                            (tenant_id, id, kind, title, detail,
+                             source_type, source_id)
+                            VALUES (:tenant, :id, 'closure_follow_up',
+                                    'Closure broadcast summary',
+                                    :detail, 'closure_broadcast', :source)
+                            ON CONFLICT (tenant_id, source_type, source_id) DO NOTHING
+                            RETURNING id::text AS id"""),
+                    {"tenant": str(tenant_id), "id": str(uuid.uuid4()),
+                     "detail": f"{recorded} recorded, {skipped_consent} no consent, "
+                               f"{skipped_suppressed} suppressed, {unreachable} unreachable",
+                     "source": str(location_id)},
+                ).mappings().one_or_none()
+                insert_audit(connection, tenant_id, identity,
+                             action="closure.audience_notified",
+                             resource_type="closure", resource_id=str(location_id),
+                             reason=f"{recorded} recorded",
+                             request_id=request.state.request_id,
+                             changed_fields=["notified"])
+            return {"recorded": recorded, "skipped_no_consent": skipped_consent,
+                    "skipped_suppressed": skipped_suppressed, "unreachable": unreachable,
+                    "summary_task_id": task["id"] if task else None}
         finally:
             engine.dispose()

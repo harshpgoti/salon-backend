@@ -42,6 +42,9 @@ SUPPRESSION_REASONS = ("unsubscribe", "stop", "bounce", "complaint", "channel_un
 # Sources that may only ever record transactional consent, never marketing.
 IMPLIED_SOURCES = ("booking", "import")
 MARKETING_PURPOSE = "marketing"
+# Purposes that need a marketing grant to send. closure_broadcast rides the
+# same grant: location-wide closure news follows purpose policy (TASK-033).
+CONSENT_GATED_PURPOSES = frozenset({"marketing", "closure_broadcast"})
 
 
 class ConsentModuleError(Exception):
@@ -165,23 +168,21 @@ def check_consented(
 ) -> bool:
     """Return True when a send of this purpose is currently authorized.
 
-    Transactional purposes (anything but ``marketing``) need no consent row.
-    Marketing needs the latest consent row for this client/channel/purpose to
-    be an unexpired grant — a later revocation always wins over an earlier
-    grant.
+    Transactional purposes (anything outside CONSENT_GATED_PURPOSES) need no
+    consent row. Gated purposes need the latest marketing consent row for
+    this client/channel to be an unexpired grant — a later revocation always
+    wins over an earlier grant. The grant itself is always recorded under
+    purpose 'marketing'; closure_broadcast rides that same grant.
     """
-    if purpose != MARKETING_PURPOSE:
+    if purpose not in CONSENT_GATED_PURPOSES:
         return True
     row = connection.execute(
         text("""SELECT status, expires_at FROM consents
                 WHERE tenant_id=:tenant AND client_id=:client
                   AND channel=:channel AND purpose=:purpose
-                -- granted_at ties (same-transaction writes share now()): ctid
-                -- breaks them in physical insertion order. Consents rows are
-                -- append-only, so the last-inserted row is the current state.
                 ORDER BY granted_at DESC, ctid DESC LIMIT 1"""),
         {"tenant": tenant_id, "client": client_id,
-         "channel": channel, "purpose": purpose},
+         "channel": channel, "purpose": MARKETING_PURPOSE},
     ).mappings().one_or_none()
     if row is None or row["status"] != "granted":
         return False
