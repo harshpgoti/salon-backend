@@ -29,10 +29,12 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 __all__ = [
+    "COMPANY_PERMISSIONS",
     "TRIAL_DAYS",
     "GRACE_DAYS",
     "SyntheticStripeAdapter",
     "assert_bookings_allowed",
+    "company_scope",
     "rebuild_entitlements",
     "register_company_routes",
     "run_billing_tick",
@@ -48,6 +50,55 @@ GRACE_DAYS = 7
 
 class CompanyModuleError(Exception):
     """Base exception for company billing operations."""
+
+
+# Company roles are disjoint from salon roles: a salon owner has no company
+# powers and a company operator has no salon powers unless separately a member.
+COMPANY_PERMISSIONS: dict[str, frozenset[str]] = {
+    "admin": frozenset({"*"}),
+    "finance": frozenset({"company.registry.read", "company.finance.read",
+                           "company.finance.manage"}),
+    "support": frozenset({"company.registry.read", "company.support.manage"}),
+    "success": frozenset({"company.registry.read", "company.success.manage"}),
+}
+
+COMPANY_ROLES = ("admin", "finance", "support", "success")
+
+
+def company_scope(connection, identity) -> str:
+    """Resolve a company identity to its role, enforcing active + MFA.
+
+    Separate from salon membership on purpose: company powers never leak
+    across the surface boundary in either direction.
+    """
+    row = connection.execute(
+        text("""SELECT role, mfa_enrolled, is_active FROM company_staff
+                WHERE issuer=:issuer AND subject=:subject"""),
+        {"issuer": identity.issuer, "subject": identity.subject},
+    ).mappings().one_or_none()
+    if row is None or not row["is_active"]:
+        raise HTTPException(status_code=401, detail={"code": "company_access_revoked"})
+    if not row["mfa_enrolled"]:
+        # Synthetic stand-in for the OIDC amr=mfa evidence company login
+        # requires (D-011).
+        raise HTTPException(status_code=401, detail={"code": "company_mfa_required"})
+    return row["role"]
+
+
+def _require_company(role: str, permission: str) -> None:
+    grants = COMPANY_PERMISSIONS.get(role, frozenset())
+    if "*" not in grants and permission not in grants:
+        raise HTTPException(status_code=403, detail={"code": "permission_denied"})
+
+
+def _company_audit(connection, *, identity, action: str, resource_type: str,
+                   resource_id: str, reason: str = "") -> None:
+    connection.execute(
+        text("""INSERT INTO company_audit_events
+                (actor_issuer, actor_subject, action, resource_type, resource_id, reason)
+                VALUES (:issuer, :subject, :action, :rtype, :rid, :reason)"""),
+        {"issuer": identity.issuer, "subject": identity.subject, "action": action,
+         "rtype": resource_type, "rid": str(resource_id), "reason": reason[:240]})
 
 
 class SyntheticStripeAdapter:
@@ -418,10 +469,56 @@ class CancelIn(BaseModel):
     at_period_end: bool = True
 
 
+class StaffInviteIn(BaseModel):
+    issuer: str = Field(min_length=1, max_length=320)
+    subject: str = Field(min_length=1, max_length=320)
+    display_name: str = Field(min_length=1, max_length=120)
+    role: str = Field(pattern="^(admin|finance|support|success)$")
+    mfa_enrolled: bool = False
+
+
+def _registry_row(connection, tenant_id: str) -> dict | None:
+    """One tenant's safe health overview via the definer function.
+
+    The SQL assembly lives in migration 050's SECURITY DEFINER functions —
+    aggregates only, never client data. This Python only reshapes timestamps.
+    """
+    import json as _json
+    raw = connection.execute(
+        text("SELECT company_registry_tenant(:tenant)"),
+        {"tenant": tenant_id}).scalar_one_or_none()
+    if raw is None:
+        return None
+    row = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+    for key in ("created_at",):
+        if row.get(key):
+            row[key] = str(row[key])
+    channel = {"sms_senders_total": row.pop("sms_senders_total", 0),
+               "sms_senders_verified": row.pop("sms_senders_verified", 0),
+               "whatsapp_senders_total": row.pop("whatsapp_senders_total", 0),
+               "whatsapp_senders_approved": row.pop("whatsapp_senders_approved", 0)}
+    health = {"failed_communications": row.pop("failed_communications", 0),
+              "open_dead_letters": row.pop("open_dead_letters", 0),
+              "open_follow_up_tasks": row.pop("open_follow_up_tasks", 0),
+              "marketing_reachable_clients": row.pop("marketing_reachable_clients", 0)}
+    row["setup_steps"] = row.get("setup_steps") or {}
+    row["channel_setup"] = channel
+    row["health"] = health
+    return row
+
+
+def _registry_list(connection) -> list[dict]:
+    import json as _json
+    raw = connection.execute(text("SELECT company_registry_overview()")).scalar_one()
+    rows = _json.loads(raw) if isinstance(raw, str) else list(raw or [])
+    return rows or []
+
+
 def register_company_routes(
     app: FastAPI,
     *,
     require_identity: Callable,
+    require_company_identity: Callable,
     membership_scope: Callable,
     require_permission: Callable[[str, str], None],
     insert_audit: Callable,
@@ -686,5 +783,128 @@ def register_company_routes(
                              changed_fields=["cancel_at_period_end"])
             return {"status": row["status"],
                     "cancel_at_period_end": row["cancel_at_period_end"]}
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/company/staff", tags=["company"], status_code=201)
+    def invite_staff(payload: StaffInviteIn,
+                     identity=Depends(require_company_identity)) -> dict:
+        """Invite a company employee. Admin-only — except the very first one.
+
+        With no active admins the registry is bootstrapping: the first invite
+        is allowed so the company can exist at all. Every later invite needs
+        an admin, and every invite is company-audited.
+        """
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                admins = connection.execute(
+                    text("""SELECT count(*) FROM company_staff
+                            WHERE role='admin' AND is_active""")).scalar_one()
+                if admins > 0:
+                    role = company_scope(connection, identity)
+                    _require_company(role, "company.staff.manage")
+                else:
+                    role = "bootstrap"
+                    if payload.role != "admin":
+                        raise HTTPException(status_code=422, detail={
+                            "code": "bootstrap_requires_admin",
+                            "message": "the first company employee must be an admin"})
+                connection.execute(
+                    text("""INSERT INTO identity_users (issuer, subject, email_verified)
+                            VALUES (:issuer, :subject, false)
+                            ON CONFLICT (issuer, subject) DO NOTHING"""),
+                    {"issuer": payload.issuer, "subject": payload.subject})
+                try:
+                    row = connection.execute(
+                        text("""INSERT INTO company_staff
+                                (issuer, subject, display_name, role, mfa_enrolled)
+                                VALUES (:issuer, :subject, :name, :role, :mfa)
+                                RETURNING id::text AS id, role, mfa_enrolled, is_active"""),
+                        {"issuer": payload.issuer, "subject": payload.subject,
+                         "name": payload.display_name.strip(), "role": payload.role,
+                         "mfa": payload.mfa_enrolled}).mappings().one()
+                except IntegrityError:
+                    raise HTTPException(status_code=409, detail={"code": "staff_already_exists"})
+                _company_audit(connection, identity=identity, action="company.staff_invited",
+                               resource_type="company_staff", resource_id=row["id"],
+                               reason=f"{payload.role} by {role}")
+            return dict(row)
+        finally:
+            engine.dispose()
+
+    @app.get("/v1/company/staff", tags=["company"])
+    def list_staff(identity=Depends(require_company_identity)) -> dict:
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role = company_scope(connection, identity)
+                _require_company(role, "company.staff.manage")
+                rows = connection.execute(
+                    text("""SELECT id::text AS id, display_name, role, mfa_enrolled,
+                                   is_active FROM company_staff ORDER BY created_at"""),
+                ).mappings().all()
+            return {"items": [dict(r) for r in rows]}
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/company/staff/{staff_id}/deactivate", tags=["company"])
+    def deactivate_staff(staff_id: uuid.UUID,
+                         identity=Depends(require_company_identity)) -> dict:
+        """Offboard an employee: deactivate and revoke company sessions.
+
+        Grants die with the sessions; there is no separate grant table to
+        sweep because company powers derive from the staff row every request.
+        """
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role = company_scope(connection, identity)
+                _require_company(role, "company.staff.manage")
+                row = connection.execute(
+                    text("""UPDATE company_staff SET is_active=false,
+                                   version=version+1, updated_at=now()
+                            WHERE id=:id AND is_active
+                            RETURNING issuer, subject"""),
+                    {"id": str(staff_id)}).mappings().one_or_none()
+                if row is None:
+                    raise HTTPException(status_code=404, detail={"code": "staff_not_found"})
+                revoked = connection.execute(
+                    text("""DELETE FROM auth_sessions
+                            WHERE issuer=:issuer AND subject=:subject
+                              AND surface='company'"""),
+                    {"issuer": row["issuer"], "subject": row["subject"]}).rowcount
+                _company_audit(connection, identity=identity, action="company.staff_deactivated",
+                               resource_type="company_staff", resource_id=str(staff_id),
+                               reason=f"revoked {revoked} session(s)")
+            return {"id": str(staff_id), "is_active": False,
+                    "sessions_revoked": revoked or 0}
+        finally:
+            engine.dispose()
+
+    @app.get("/v1/company/tenants", tags=["company"])
+    def list_registry(identity=Depends(require_company_identity)) -> dict:
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role = company_scope(connection, identity)
+                _require_company(role, "company.registry.read")
+                items = _registry_list(connection)
+            return {"items": items}
+        finally:
+            engine.dispose()
+
+    @app.get("/v1/company/tenants/{tenant_id}", tags=["company"])
+    def read_registry(tenant_id: uuid.UUID,
+                      identity=Depends(require_company_identity)) -> dict:
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role = company_scope(connection, identity)
+                _require_company(role, "company.registry.read")
+                row = _registry_row(connection, str(tenant_id))
+                if row is None:
+                    raise HTTPException(status_code=404, detail={"code": "tenant_not_found"})
+            return row
         finally:
             engine.dispose()

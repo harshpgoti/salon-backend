@@ -1467,6 +1467,7 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
     register_company_routes(
         app,
         require_identity=require_identity,
+        require_company_identity=require_company_identity,
         membership_scope=_membership_scope,
         require_permission=_require_permission,
         insert_audit=_insert_audit,
