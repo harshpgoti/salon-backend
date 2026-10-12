@@ -39,6 +39,7 @@ __all__ = [
     "register_company_routes",
     "run_billing_tick",
     "start_trial",
+    "tenant_health",
 ]
 
 # Trial length is a commercial hypothesis, not a constant of nature.
@@ -477,6 +478,69 @@ class StaffInviteIn(BaseModel):
     mfa_enrolled: bool = False
 
 
+def tenant_health(connection, *, tenant_id: str,
+                  now: datetime | None = None) -> dict:
+    """Explainable 0-100 tenant health from aggregates only (FR-075).
+
+    Starts at 100; every deduction appends its reason, so the score is a
+    reading list, not a black box. Inputs are counts and statuses — no
+    client name, contact, note or message is ever read here, which is what
+    keeps salon client data out of company sales motion.
+    """
+    moment = now or datetime.now(timezone.utc)
+    score = 100
+    reasons: list[str] = []
+    sub = connection.execute(
+        text("""SELECT status, trial_ends_at FROM tenant_subscriptions
+                WHERE tenant_id=:tenant"""),
+        {"tenant": tenant_id}).mappings().one_or_none()
+    status = sub["status"] if sub else "unknown"
+    if status in ("past_due", "restricted", "suspended"):
+        score -= 20
+        reasons.append(f"billing status {status} (-20)")
+    if sub is not None and sub["status"] == "trial" and sub["trial_ends_at"] is not None:
+        ends = sub["trial_ends_at"]
+        if ends.tzinfo is None:
+            ends = ends.replace(tzinfo=timezone.utc)
+        if (ends - moment).days < 7:
+            score -= 10
+            reasons.append("trial ends within seven days (-10)")
+    steps = connection.execute(
+        text("""SELECT count(*) FILTER (WHERE state='complete') AS done,
+                       count(*) AS total FROM tenant_setup_steps
+                WHERE tenant_id=:tenant"""),
+        {"tenant": tenant_id}).mappings().one()
+    if steps["total"] and steps["done"] < steps["total"]:
+        score -= 15
+        reasons.append(f"setup {steps['done']}/{steps['total']} steps complete (-15)")
+    recent_bookings = connection.execute(
+        text("""SELECT count(*) FROM appointments
+                WHERE tenant_id=:tenant AND starts_at > :since"""),
+        {"tenant": tenant_id,
+         "since": (moment - timedelta(days=14)).isoformat()}).scalar_one()
+    if not recent_bookings:
+        score -= 10
+        reasons.append("no bookings in fourteen days (-10)")
+    open_cases = connection.execute(
+        text("""SELECT count(*) FROM support_cases
+                WHERE tenant_id=:tenant AND status NOT IN ('resolved', 'closed')"""),
+        {"tenant": tenant_id}).scalar_one()
+    if open_cases:
+        deduction = min(30, 10 * open_cases)
+        score -= deduction
+        reasons.append(f"{open_cases} open support case(s) (-{deduction})")
+    failed = connection.execute(
+        text("""SELECT count(*) FROM communications
+                WHERE tenant_id=:tenant AND state='failed'"""),
+        {"tenant": tenant_id}).scalar_one()
+    if failed:
+        deduction = min(15, 5 * failed)
+        score -= deduction
+        reasons.append(f"{failed} failed message(s) (-{deduction})")
+    return {"tenant_id": tenant_id, "score": max(0, score), "reasons": reasons,
+            "subscription_status": status}
+
+
 def _registry_row(connection, tenant_id: str) -> dict | None:
     """One tenant's safe health overview via the definer function.
 
@@ -512,6 +576,15 @@ def _registry_list(connection) -> list[dict]:
     raw = connection.execute(text("SELECT company_registry_overview()")).scalar_one()
     rows = _json.loads(raw) if isinstance(raw, str) else list(raw or [])
     return rows or []
+
+
+class TaskIn(BaseModel):
+    tenant_id: uuid.UUID | None = None
+    kind: str = Field(pattern="^(lead|onboarding|renewal|risk)$")
+    title: str = Field(min_length=1, max_length=160)
+    detail: str | None = Field(default=None, max_length=2000)
+    assignee_staff_id: uuid.UUID | None = None
+    due_at: datetime | None = None
 
 
 def register_company_routes(
@@ -909,5 +982,162 @@ def register_company_routes(
                 if row is None:
                     raise HTTPException(status_code=404, detail={"code": "tenant_not_found"})
             return row
+        finally:
+            engine.dispose()
+
+    @app.get("/v1/company/tenants/{tenant_id}/health", tags=["company"])
+    def read_health(tenant_id: uuid.UUID,
+                    identity=Depends(require_company_identity)) -> dict:
+        """Explainable tenant health: score plus every deduction reason."""
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role = company_scope(connection, identity)
+                _require_company(role, "company.registry.read")
+                connection.execute(
+                    text("SELECT set_config('app.tenant_id', :t, true)"),
+                    {"t": str(tenant_id)})
+                name = connection.execute(
+                    text("SELECT company_tenant_name(:t)"),
+                    {"t": str(tenant_id)}).scalar_one_or_none()
+                if name is None:
+                    raise HTTPException(status_code=404, detail={"code": "tenant_not_found"})
+                health = tenant_health(connection, tenant_id=str(tenant_id))
+            return health
+        finally:
+            engine.dispose()
+
+    @app.get("/v1/company/tasks/suggestions", tags=["company"])
+    def suggest_tasks(identity=Depends(require_company_identity)) -> dict:
+        """Candidate success work across tenants: expiring trials, stuck
+        onboarding, billing risk and urgent cases. Suggestions only — staff
+        open explicit tasks from them."""
+        import json as _json
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role = company_scope(connection, identity)
+                _require_company(role, "company.success.manage")
+                raw = connection.execute(
+                    text("SELECT company_success_signals()")).scalar_one()
+                signals = _json.loads(raw) if isinstance(raw, str) else list(raw or [])
+            suggestions = []
+            for signal in signals:
+                tid = signal["tenant_id"]
+                if signal["subscription_status"] == "trial" and signal.get("trial_ends_at"):
+                    ends = signal["trial_ends_at"]
+                    from datetime import timezone as _tz
+                    if isinstance(ends, str):
+                        ends = datetime.fromisoformat(ends)
+                    if ends.tzinfo is None:
+                        ends = ends.replace(tzinfo=_tz.utc)
+                    if (ends - datetime.now(_tz.utc)).days < 7:
+                        suggestions.append({"tenant_id": tid, "kind": "renewal",
+                                            "title": "Trial ends within seven days"})
+                if (signal.get("setup_open") or 0) > 0:
+                    suggestions.append({"tenant_id": tid, "kind": "onboarding",
+                                        "title": f"{signal['setup_open']} setup step(s) open"})
+                if signal.get("subscription_status") in ("past_due", "restricted"):
+                    suggestions.append({"tenant_id": tid, "kind": "risk",
+                                        "title": f"Billing {signal['subscription_status']}"})
+                if (signal.get("urgent_cases") or 0) > 0:
+                    suggestions.append({"tenant_id": tid, "kind": "risk",
+                                        "title": f"{signal['urgent_cases']} urgent case(s) open"})
+            return {"suggestions": suggestions}
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/company/tasks", tags=["company"], status_code=201)
+    def create_task(payload: TaskIn,
+                    identity=Depends(require_company_identity)) -> dict:
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role = company_scope(connection, identity)
+                _require_company(role, "company.success.manage")
+                if payload.tenant_id is not None:
+                    name = connection.execute(
+                        text("SELECT company_tenant_name(:t)"),
+                        {"t": str(payload.tenant_id)}).scalar_one_or_none()
+                    if name is None:
+                        raise HTTPException(status_code=404, detail={"code": "tenant_not_found"})
+                if payload.kind != "lead" and payload.tenant_id is None:
+                    raise HTTPException(status_code=422, detail={
+                        "code": "task_needs_tenant",
+                        "message": "only leads float without a tenant"})
+                if payload.assignee_staff_id is not None:
+                    staff = connection.execute(
+                        text("""SELECT 1 FROM company_staff
+                                WHERE id=:id AND is_active"""),
+                        {"id": str(payload.assignee_staff_id)}).scalar_one_or_none()
+                    if staff is None:
+                        raise HTTPException(status_code=422, detail={"code": "assignee_unknown"})
+                row = connection.execute(
+                    text("""INSERT INTO company_tasks
+                            (tenant_id, kind, title, detail, assignee_staff_id, due_at)
+                            VALUES (:tenant, :kind, :title, :detail, :assignee, :due)
+                            RETURNING id::text AS id, status"""),
+                    {"tenant": str(payload.tenant_id) if payload.tenant_id else None,
+                     "kind": payload.kind, "title": payload.title.strip(),
+                     "detail": (payload.detail or "")[:2000],
+                     "assignee": str(payload.assignee_staff_id)
+                     if payload.assignee_staff_id else None,
+                     "due": payload.due_at.isoformat() if payload.due_at else None},
+                ).mappings().one()
+                _company_audit(connection, identity=identity, action="company.task_opened",
+                               resource_type="company_task", resource_id=row["id"],
+                               reason=f"{payload.kind}: {payload.title.strip()[:120]}")
+            return dict(row)
+        finally:
+            engine.dispose()
+
+    @app.get("/v1/company/tasks", tags=["company"])
+    def list_tasks(status: str = "open",
+                   identity=Depends(require_company_identity)) -> dict:
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role = company_scope(connection, identity)
+                _require_company(role, "company.success.manage")
+                if status not in ("open", "done", "dismissed", "all"):
+                    raise HTTPException(status_code=422, detail={"code": "invalid_status"})
+                filt = "" if status == "all" else "AND status = :status"
+                rows = connection.execute(
+                    text(f"""SELECT id::text AS id, tenant_id::text AS tenant_id, kind,
+                                    title, status, assignee_staff_id::text AS assignee,
+                                    due_at, created_at FROM company_tasks
+                             WHERE 1=1 {filt} ORDER BY created_at DESC LIMIT 100"""),
+                    {"status": status}).mappings().all()
+            return {"items": [{**dict(r),
+                               "due_at": r["due_at"].isoformat() if r["due_at"] else None,
+                               "created_at": r["created_at"].isoformat()} for r in rows]}
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/company/tasks/{task_id}/resolve", tags=["company"])
+    def resolve_task(task_id: uuid.UUID, resolution: str = "done",
+                     identity=Depends(require_company_identity)) -> dict:
+        if resolution not in ("done", "dismissed"):
+            raise HTTPException(status_code=422, detail={"code": "invalid_resolution"})
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role = company_scope(connection, identity)
+                _require_company(role, "company.success.manage")
+                row = connection.execute(
+                    text("""UPDATE company_tasks SET status=:resolution,
+                                   resolved_at=now(), version=version+1, updated_at=now()
+                            WHERE id=:id AND status='open'
+                            RETURNING id::text AS id, status"""),
+                    {"id": str(task_id), "resolution": resolution},
+                ).mappings().one_or_none()
+                if row is None:
+                    raise HTTPException(status_code=404, detail={
+                        "code": "task_not_open",
+                        "message": "unknown task or already resolved"})
+                _company_audit(connection, identity=identity, action="company.task_resolved",
+                               resource_type="company_task", resource_id=row["id"],
+                               reason=resolution)
+            return dict(row)
         finally:
             engine.dispose()
