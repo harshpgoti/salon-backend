@@ -45,6 +45,7 @@ services:
       - ./db/migrations/034_follow_up_tasks.sql:/docker-entrypoint-initdb.d/034_follow_up_tasks.sql:ro
       - ./db/migrations/035_rebooking_cycles.sql:/docker-entrypoint-initdb.d/035_rebooking_cycles.sql:ro
       - ./db/migrations/036_rebooking_rules.sql:/docker-entrypoint-initdb.d/036_rebooking_rules.sql:ro
+      - ./db/migrations/037_rebooking_prompts.sql:/docker-entrypoint-initdb.d/037_rebooking_prompts.sql:ro
       - ./db/migrations/038_client_segments.sql:/docker-entrypoint-initdb.d/038_client_segments.sql:ro
       - ./db/migrations/046_billing_foundation.sql:/docker-entrypoint-initdb.d/046_billing_foundation.sql:ro
       - ./db/migrations/047_billing_webhooks.sql:/docker-entrypoint-initdb.d/047_billing_webhooks.sql:ro

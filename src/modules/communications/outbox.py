@@ -45,9 +45,11 @@ from modules.communications.senders import get_verified_sender, record_message_c
 REMINDER_OFFSETS_HOURS = (24, 2)
 
 
-def _dedupe_key(source_id: str, purpose: str, entity_version: int, channel: str) -> str:
+def _dedupe_key(source_id: str, purpose: str, entity_version: int, channel: str,
+                suffix: str = "") -> str:
     """Business dedupe key: one message per appointment, purpose, version and channel."""
-    return f"appointment:{source_id}:{purpose}:v{entity_version}:{channel}"
+    key = f"appointment:{source_id}:{purpose}:v{entity_version}:{channel}"
+    return f"{key}:{suffix}" if suffix else key
 
 
 def record_booking_communication(
@@ -66,15 +68,16 @@ def record_booking_communication(
     expires_at: datetime | None = None,
     trace_id: str | None = None,
     source_type: str = "appointment",
+    dedupe_suffix: str = "",
 ) -> dict | None:
     """Record one communication row inside the caller's transaction.
 
     Returns the inserted row (as a dict) or ``None`` when the dedupe key already
     exists — a replayed booking command must not create a second message.
     """
-    if source_type not in ("appointment", "location_broadcast"):
+    if source_type not in ("appointment", "location_broadcast", "rebooking_cycle"):
         raise ValueError(f"unknown source_type {source_type!r}")
-    key = _dedupe_key(appointment_id, purpose, entity_version, channel)
+    key = _dedupe_key(appointment_id, purpose, entity_version, channel, dedupe_suffix)
     row = connection.execute(
         text("""INSERT INTO communications
                 (tenant_id, id, client_id, contact_value, channel, purpose,
@@ -243,18 +246,25 @@ def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict
             {"tenant": tenant_id, "id": comm["id"]})
         summary["deferred"] += 1
         return
-    # Re-read the current appointment version — appointment sources only.
-    # Broadcasts carry no appointment version; their gates are consent,
-    # suppression, quiet hours and budget, checked below like all sends.
+    # Re-read the current source version — appointments and cycles each
+    # version their own rows. Broadcasts carry no version; their gates are
+    # consent, suppression, quiet hours and budget, checked below like sends.
     current = None
-    if comm.get("source_type", "appointment") == "appointment":
+    source = comm.get("source_type", "appointment")
+    if source == "appointment":
         current = connection.execute(
             text("""SELECT version FROM appointments
                     WHERE tenant_id=:tenant AND id=:id"""),
             {"tenant": tenant_id, "id": comm["source_id"]},
         ).scalar_one_or_none()
+    elif source == "rebooking_cycle":
+        current = connection.execute(
+            text("""SELECT version, status FROM rebooking_cycles
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": comm["source_id"]},
+        ).mappings().one_or_none()
 
-    if (comm.get("source_type", "appointment") == "appointment"
+    if (source == "appointment"
             and (current is None or current != comm["expected_entity_version"])):
         connection.execute(
             text("""UPDATE communications
@@ -263,6 +273,19 @@ def _route_candidate(connection, *, tenant_id: str, comm, adapter, summary: dict
                     WHERE tenant_id=:tenant AND id=:id"""),
             {"tenant": tenant_id, "id": comm["id"],
              "reason": f"appointment version changed (expected {comm['expected_entity_version']}, current {current})"})
+        summary["skipped_stale"] += 1
+        return
+
+    if source == "rebooking_cycle" and (
+            current is None or current["version"] != comm["expected_entity_version"]
+            or current["status"] != "due"):
+        connection.execute(
+            text("""UPDATE communications
+                    SET state='skipped_stale',
+                        skip_reason=:reason, version=version+1, updated_at=now()
+                    WHERE tenant_id=:tenant AND id=:id"""),
+            {"tenant": tenant_id, "id": comm["id"],
+             "reason": "rebooking cycle moved on before dispatch"})
         summary["skipped_stale"] += 1
         return
 

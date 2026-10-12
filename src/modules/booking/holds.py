@@ -59,6 +59,9 @@ class ConfirmRequest(BaseModel):
     # it grants no consent and changes no eligibility (FR-040 / QA-15 - booking never opts
     # a client in). The default is False, so omitting it is the ordinary case.
     marketing_opt_in: bool = False
+    # Tracked rebooking/offer token from a prompt link (FR-052). Matching
+    # closes the attributed cycle; unknown tokens change nothing.
+    attribution_token: str | None = Field(default=None, max_length=64)
 
 
 def register_hold_routes(
@@ -315,10 +318,11 @@ def register_hold_routes(
                     text("""INSERT INTO appointments
                             (tenant_id,id,location_id,client_id,staff_id,starts_at,ends_at,local_timezone,
                              status,source,occupied_range,policy_version,management_token_hash,
-                             management_token_expires_at)
+                             management_token_expires_at,attribution_token)
                             VALUES (:tenant,:id,:location,:client,:staff,:starts,:ends,:tz,
                                     'confirmed','public_booking',
-                                    tstzrange(:occ_from,:occ_to,'[)'),1,:mgmt_hash,:mgmt_expires)"""),
+                                    tstzrange(:occ_from,:occ_to,'[)'),1,:mgmt_hash,:mgmt_expires,
+                                    :attribution)"""),
                     {"tenant": tenant_id, "id": str(appointment_id), "location": location["id"],
                      "client": str(payload.client_id), "staff": str(hold["staff_id"]),
                      "starts": hold["starts_at"].isoformat(), "ends": hold["ends_at"].isoformat(),
@@ -326,7 +330,8 @@ def register_hold_routes(
                      "occ_from": hold["occupied_range"].lower.isoformat(),
                      "occ_to": hold["occupied_range"].upper.isoformat(),
                      "mgmt_hash": hash_token(management_token),
-                     "mgmt_expires": hold["ends_at"].isoformat()})
+                     "mgmt_expires": hold["ends_at"].isoformat(),
+                     "attribution": payload.attribution_token})
                 connection.execute(
                     text("""INSERT INTO appointment_services
                             (tenant_id,id,appointment_id,sequence,service_id,service_version,service_name,
@@ -357,6 +362,11 @@ def register_hold_routes(
                             VALUES (:tenant,:id,:appointment,NULL,'confirmed','public','public_booking',
                                     'confirmed from hold')"""),
                     {"tenant": tenant_id, "id": str(uuid.uuid4()), "appointment": str(appointment_id)})
+                # FR-052: a tracked prompt link closes its cycle atomically here.
+                from modules.retention import attribute_booking
+                attribute_booking(connection, tenant_id=tenant_id,
+                                  attribution_token=payload.attribution_token,
+                                  appointment_id=str(appointment_id))
             return {"appointment_id": str(appointment_id), "replayed": False,
                     "management_token": management_token,
                     "marketing_opt_in_recorded": False}

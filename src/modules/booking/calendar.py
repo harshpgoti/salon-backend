@@ -40,6 +40,8 @@ class ManualBookingIn(BaseModel):
     starts_at: str = Field(min_length=16, max_length=40)
     source: str = "staff"
     idempotency_key: str = Field(min_length=8, max_length=64)
+    # Tracked rebooking/offer token (FR-052); unknown tokens change nothing.
+    attribution_token: str | None = Field(default=None, max_length=64)
 
 
 def _parse_instant(value: str) -> datetime:
@@ -200,15 +202,18 @@ def register_calendar_routes(
                     connection.execute(
                         text("""INSERT INTO appointments
                                 (tenant_id,id,location_id,client_id,staff_id,starts_at,ends_at,local_timezone,
-                                 status,source,occupied_range,policy_version,idempotency_key)
+                                 status,source,occupied_range,policy_version,idempotency_key,
+                                 attribution_token)
                                 VALUES (:tenant,:id,:location,:client,:staff,:starts,:ends,:tz,
-                                        'confirmed',:source,tstzrange(:occ_from,:occ_to,'[)'),1,:key)"""),
+                                        'confirmed',:source,tstzrange(:occ_from,:occ_to,'[)'),1,:key,
+                                        :attribution)"""),
                         {"tenant": str(tenant_id), "id": str(appointment_id), "location": location["id"],
                          "client": str(payload.client_id), "staff": str(payload.staff_id),
                          "starts": starts_at.isoformat(), "ends": ends_at.isoformat(),
                          "tz": location["timezone"], "source": payload.source,
                          "occ_from": occ_from.isoformat(), "occ_to": occ_to.isoformat(),
-                         "key": payload.idempotency_key})
+                         "key": payload.idempotency_key,
+                         "attribution": payload.attribution_token})
                     connection.execute(
                         text("""INSERT INTO appointment_services
                                 (tenant_id,id,appointment_id,sequence,service_id,service_version,service_name,
@@ -241,6 +246,11 @@ def register_calendar_routes(
                                  reason=f"manual booking ({payload.source})",
                                  request_id=request.state.request_id,
                                  changed_fields=["status", "starts_at", "staff_id"])
+                    # FR-052: a tracked prompt link closes its cycle atomically here.
+                    from modules.retention import attribute_booking
+                    attribute_booking(connection, tenant_id=str(tenant_id),
+                                      attribution_token=payload.attribution_token,
+                                      appointment_id=str(appointment_id))
                 except IntegrityError as exc:
                     # The EXCLUDE constraint refuses an overlapping slot, or a racing
                     # replay claimed the idempotency key. Either way the winner stands and

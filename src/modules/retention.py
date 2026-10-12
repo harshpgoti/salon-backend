@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
-from datetime import date
+from datetime import date, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -24,11 +24,19 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 __all__ = [
+    "attribute_booking",
     "create_cycles_for_visit",
     "preview_rule",
     "register_retention_routes",
     "resolve_interval_days",
+    "run_rebooking_prompts",
 ]
+
+# FR-052: one due-day prompt plus one seven-days-later follow-up, two max.
+FOLLOW_UP_DELAY_DAYS = 7
+MAX_PROMPTS_PER_CYCLE = 2
+# Statuses that may still convert (anything else is history, not a booking).
+LIVE_APPOINTMENT_STATUSES = ("pending_approval", "confirmed", "checked_in", "in_service")
 
 
 def resolve_interval_days(connection, *, tenant_id: str, client_id: str,
@@ -168,6 +176,169 @@ class RetentionModuleError(Exception):
     """Base exception for retention operations."""
 
 
+def run_rebooking_prompts(connection, *, tenant_id: str,
+                          now: datetime | None = None) -> dict:
+    """Worker step: prompt due cycles under every suppression (FR-051/052).
+
+    For each active rule, every due cycle whose date arrived is checked in
+    order — snoozed, salon status, client lifecycle, future suitable booking,
+    prompt cap and cooldown, usable contact, consent and suppression. The
+    first failing check names the outcome; only survivors record a prompt
+    communication (purpose marketing, tracked attribution token) and a
+    rebooking_prompts row. Returns the outcome counts.
+    """
+    from datetime import timezone as _tz
+    from modules.communications.consent import check_consented, check_suppressed
+    from modules.communications.outbox import record_booking_communication
+    moment = now or datetime.now(_tz.utc)
+    today = moment.date()
+    summary = {"prompted": 0, "follow_ups": 0, "snoozed_skip": 0,
+               "salon_skip": 0, "inactive_skip": 0, "future_booking_skip": 0,
+               "capped_skip": 0, "cooldown_skip": 0, "invalid_contact_skip": 0,
+               "consent_skip": 0, "suppressed_skip": 0, "channel_skip": 0}
+    rules = connection.execute(
+        text("""SELECT id::text AS id, service_id::text AS service_id, channel
+                FROM rebooking_rules
+                WHERE tenant_id=:tenant AND is_active"""),
+        {"tenant": tenant_id}).mappings().all()
+    if not rules:
+        return summary
+    sub_status = connection.execute(
+        text("SELECT status FROM tenant_subscriptions WHERE tenant_id=:tenant"),
+        {"tenant": tenant_id}).scalar_one_or_none()
+    for rule in rules:
+        cycles = connection.execute(
+            text("""SELECT c.id::text AS id, c.client_id::text AS client_id,
+                           c.service_id::text AS service_id, c.version, c.due_date,
+                           c.snoozed_until, cl.lifecycle
+                    FROM rebooking_cycles c
+                    JOIN clients cl ON cl.tenant_id=c.tenant_id AND cl.id=c.client_id
+                    WHERE c.tenant_id=:tenant AND c.service_id=:service
+                      AND c.status='due' AND c.due_date <= :today
+                    ORDER BY c.due_date"""),
+            {"tenant": tenant_id, "service": rule["service_id"],
+             "today": today.isoformat()}).mappings().all()
+        for cycle in cycles:
+            if cycle["snoozed_until"] is not None and str(cycle["snoozed_until"]) > today.isoformat():
+                summary["snoozed_skip"] += 1
+                continue
+            if sub_status not in ("trial", "active", "cancelled"):
+                summary["salon_skip"] += 1
+                continue
+            if cycle["lifecycle"] == "archived":
+                summary["inactive_skip"] += 1
+                continue
+            booked = connection.execute(
+                text("""SELECT 1 FROM appointments a
+                        JOIN appointment_services s ON s.tenant_id=a.tenant_id
+                                                   AND s.appointment_id=a.id
+                        WHERE a.tenant_id=:tenant AND a.client_id=:client
+                          AND s.service_id=:service AND a.starts_at > :now
+                          AND a.status IN ('pending_approval', 'confirmed',
+                                           'checked_in', 'in_service')
+                        LIMIT 1"""),
+                {"tenant": tenant_id, "client": cycle["client_id"],
+                 "service": cycle["service_id"], "now": moment.isoformat()},
+            ).scalar_one_or_none()
+            if booked is not None:
+                summary["future_booking_skip"] += 1
+                continue
+            sent = connection.execute(
+                text("""SELECT count(*), max(sent_at) FROM rebooking_prompts
+                        WHERE tenant_id=:tenant AND cycle_id=:cycle"""),
+                {"tenant": tenant_id, "cycle": cycle["id"]}).one()
+            if (sent[0] or 0) >= MAX_PROMPTS_PER_CYCLE:
+                summary["capped_skip"] += 1
+                continue
+            kind = "due_prompt" if not sent[0] else "follow_up"
+            if kind == "follow_up" and sent[1] is not None:
+                last = sent[1]
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=_tz.utc)
+                if (moment - last).days < FOLLOW_UP_DELAY_DAYS:
+                    summary["cooldown_skip"] += 1
+                    continue
+            contact = connection.execute(
+                text("""SELECT kind, normalized_value FROM client_contacts
+                        WHERE tenant_id=:tenant AND client_id=:client
+                        ORDER BY is_primary DESC, created_at LIMIT 1"""),
+                {"tenant": tenant_id, "client": cycle["client_id"]},
+            ).mappings().one_or_none()
+            if contact is None:
+                summary["invalid_contact_skip"] += 1
+                continue
+            if not check_consented(connection, tenant_id=tenant_id,
+                                   client_id=cycle["client_id"],
+                                   channel=rule["channel"], purpose="marketing", now=moment):
+                summary["consent_skip"] += 1
+                continue
+            if check_suppressed(connection, tenant_id=tenant_id,
+                                contact_value=contact["normalized_value"],
+                                channel=rule["channel"]):
+                summary["suppressed_skip"] += 1
+                continue
+            if rule["channel"] == "whatsapp":
+                # No template selection on rules yet: WhatsApp prompts wait
+                # for campaign templates (TASK-039) rather than failing loudly.
+                summary["channel_skip"] += 1
+                continue
+            token = uuid.uuid4().hex
+            row = record_booking_communication(
+                connection, tenant_id=tenant_id, appointment_id=cycle["id"],
+                client_id=cycle["client_id"], contact_value=contact["normalized_value"],
+                channel=rule["channel"], purpose="marketing",
+                entity_version=cycle["version"], source_type="rebooking_cycle",
+                dedupe_suffix=kind)
+            if row is None:
+                continue
+            connection.execute(
+                text("""UPDATE communications SET attribution_token=:token
+                        WHERE tenant_id=:tenant AND id=:id"""),
+                {"tenant": tenant_id, "id": row["id"], "token": token})
+            connection.execute(
+                text("""INSERT INTO rebooking_prompts
+                        (tenant_id, id, cycle_id, kind, communication_id)
+                        VALUES (:tenant, :id, :cycle, :kind, :comm)"""),
+                {"tenant": tenant_id, "id": str(uuid.uuid4()), "cycle": cycle["id"],
+                 "kind": kind, "comm": row["id"]})
+            summary["prompted"] += 1
+            if kind == "follow_up":
+                summary["follow_ups"] += 1
+    return summary
+
+
+def attribute_booking(connection, *, tenant_id: str, attribution_token: str | None,
+                      appointment_id: str) -> dict | None:
+    """Close the cycle a tracked booking link earned (FR-052).
+
+    Called inside the confirming transaction: when the token matches a
+    prompt communication, its cycle flips to booked with both ids linked.
+    Organic bookings (no token, unknown token, already-closed cycle) return
+    None and change nothing — attribution is claimed, never inferred.
+    """
+    if not attribution_token:
+        return None
+    prompt = connection.execute(
+        text("""SELECT p.cycle_id::text AS cycle_id, p.communication_id::text AS comm_id
+                FROM rebooking_prompts p
+                JOIN communications c ON c.tenant_id=p.tenant_id
+                                      AND c.id=p.communication_id
+                WHERE p.tenant_id=:tenant AND c.attribution_token=:token"""),
+        {"tenant": tenant_id, "token": attribution_token}).mappings().one_or_none()
+    if prompt is None:
+        return None
+    row = connection.execute(
+        text("""UPDATE rebooking_cycles SET status='booked',
+                       booked_appointment_id=:appt, attributed_communication_id=:comm,
+                       version=version+1, updated_at=now()
+                WHERE tenant_id=:tenant AND id=:cycle AND status='due'
+                RETURNING id::text AS id"""),
+        {"tenant": tenant_id, "cycle": prompt["cycle_id"], "appt": appointment_id,
+         "comm": prompt["comm_id"]}).mappings().one_or_none()
+    return {"cycle_id": row["id"], "appointment_id": appointment_id,
+            "communication_id": prompt["comm_id"]} if row else None
+
+
 class RuleIn(BaseModel):
     # Fixed columns only: unknown fields (a script, an expression, anything
     # else) are rejected, never stored or executed.
@@ -189,6 +360,10 @@ class RulePatch(BaseModel):
     channel: str | None = Field(default=None, pattern="^(email|sms|whatsapp)$")
     send_time_local: str | None = Field(default=None, pattern="^([01][0-9]|2[0-3]):[0-5][0-9]$")
     max_follow_ups: int | None = Field(default=None, ge=0, le=2)
+
+
+class SnoozeIn(BaseModel):
+    until: date
 
 
 def register_retention_routes(
@@ -389,5 +564,71 @@ def register_retention_routes(
                             WHERE r.tenant_id=:tenant ORDER BY s.name"""),
                     {"tenant": str(tenant_id)}).mappings().all()
             return {"items": [dict(r) for r in rows]}
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/tenants/{tenant_id}/rebooking-cycles/{cycle_id}/snooze",
+              tags=["retention"])
+    def snooze_cycle(tenant_id: uuid.UUID, cycle_id: uuid.UUID, payload: SnoozeIn,
+                     request: Request, identity=Depends(require_identity)) -> dict:
+        """Defer prompting a due cycle until a date (FR-051 snooze).
+
+        The row stays due with a snoozed_until date; the worker skips it
+        until then, and the version bump stale-skips any prompt recorded
+        but not yet dispatched.
+        """
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "retention.manage")
+                row = connection.execute(
+                    text("""UPDATE rebooking_cycles
+                            SET snoozed_until=:until,
+                                version=version+1, updated_at=now()
+                            WHERE tenant_id=:tenant AND id=:id AND status='due'
+                            RETURNING id::text AS id, snoozed_until"""),
+                    {"tenant": str(tenant_id), "id": str(cycle_id),
+                     "until": payload.until.isoformat()}).mappings().one_or_none()
+                if row is None:
+                    raise HTTPException(status_code=404, detail={
+                        "code": "cycle_not_due",
+                        "message": "only a due cycle can be snoozed"})
+                insert_audit(connection, tenant_id, identity, action="retention.cycle_snoozed",
+                             resource_type="rebooking_cycle", resource_id=row["id"],
+                             reason=f"snoozed until {payload.until.isoformat()}",
+                             request_id=request.state.request_id,
+                             changed_fields=["snoozed_until"])
+            return {"id": row["id"], "status": "due",
+                    "snoozed_until": str(row["snoozed_until"])}
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/tenants/{tenant_id}/rebooking-cycles/{cycle_id}/dismiss",
+              tags=["retention"])
+    def dismiss_cycle(tenant_id: uuid.UUID, cycle_id: uuid.UUID,
+                      request: Request, identity=Depends(require_identity)) -> dict:
+        """Close a due cycle without booking (FR-051 staff dismissal)."""
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "retention.manage")
+                row = connection.execute(
+                    text("""UPDATE rebooking_cycles SET status='dismissed',
+                                   version=version+1, updated_at=now()
+                            WHERE tenant_id=:tenant AND id=:id AND status='due'
+                            RETURNING id::text AS id, status"""),
+                    {"tenant": str(tenant_id), "id": str(cycle_id)}).mappings().one_or_none()
+                if row is None:
+                    raise HTTPException(status_code=404, detail={
+                        "code": "cycle_not_due",
+                        "message": "only a due cycle can be dismissed"})
+                insert_audit(connection, tenant_id, identity, action="retention.cycle_dismissed",
+                             resource_type="rebooking_cycle", resource_id=row["id"],
+                             reason="staff dismissed",
+                             request_id=request.state.request_id,
+                             changed_fields=["status"])
+            return dict(row)
         finally:
             engine.dispose()
