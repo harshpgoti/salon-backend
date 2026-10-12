@@ -49,6 +49,7 @@ services:
       - ./db/migrations/038_client_segments.sql:/docker-entrypoint-initdb.d/038_client_segments.sql:ro
       - ./db/migrations/039_offer_campaigns.sql:/docker-entrypoint-initdb.d/039_offer_campaigns.sql:ro
       - ./db/migrations/040_offer_redemptions.sql:/docker-entrypoint-initdb.d/040_offer_redemptions.sql:ro
+      - ./db/migrations/045_company_metrics.sql:/docker-entrypoint-initdb.d/045_company_metrics.sql:ro
       - ./db/migrations/046_billing_foundation.sql:/docker-entrypoint-initdb.d/046_billing_foundation.sql:ro
       - ./db/migrations/047_billing_webhooks.sql:/docker-entrypoint-initdb.d/047_billing_webhooks.sql:ro
       - ./db/migrations/048_billing_lifecycle.sql:/docker-entrypoint-initdb.d/048_billing_lifecycle.sql:ro
@@ -57,6 +58,7 @@ services:
       - ./db/migrations/050_company_registry_functions.sql:/docker-entrypoint-initdb.d/050_company_registry_functions.sql:ro
       - ./db/migrations/051_support_cases.sql:/docker-entrypoint-initdb.d/051_support_cases.sql:ro
       - ./db/migrations/052_finance_controls.sql:/docker-entrypoint-initdb.d/052_finance_controls.sql:ro
+      - ./db/migrations/060_ops_alerts.sql:/docker-entrypoint-initdb.d/060_ops_alerts.sql:ro
       - ./db/migrations/062_customer_success.sql:/docker-entrypoint-initdb.d/062_customer_success.sql:ro
       - ./db/migrations/053_request_tracing.sql:/docker-entrypoint-initdb.d/053_request_tracing.sql:ro
     healthcheck:
