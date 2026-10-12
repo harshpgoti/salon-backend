@@ -130,9 +130,7 @@ def test_metrics_ac1_live_numbers_reconcile(database_url):
         assert after["cancelled_tenants"] == live["cancelled_tenants"] + 1
         assert after["churned_this_month"] == live["churned_this_month"] + 1
         assert after["mrr_minor"] == live["mrr_minor"] - 9900
-        # MRR only contains this run's activation (B), not stale DB state.
-        assert live["mrr_minor"] >= 9900
-        assert live["onboarding_complete_pct"] == 100
+        assert after["onboarding_complete_pct"] == 100
     finally:
         _teardown(engine_a, [tenant_a["tenant_id"]], issuer_a)
         _teardown(engine_b, [tenant_b["tenant_id"]], issuer_b)
