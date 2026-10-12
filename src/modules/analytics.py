@@ -590,3 +590,168 @@ def register_analytics_routes(
             }
         finally:
             engine.dispose()
+
+    @app.get("/v1/tenants/{tenant_id}/reports/marketing", tags=["reports"])
+    def marketing_report(tenant_id: uuid.UUID, date_from: date, date_to: date,
+                         identity=Depends(require_identity)) -> dict:
+        """Campaign and message cost performance (FR-061/FR-062).
+
+        Delivery, failure, unsubscribes, campaign bookings, automation
+        conversion, closure resolution and costs — each from ledger rows with
+        its denominator stated. Accepted-but-never-confirmed provider sends
+        are labelled unknown delivery, never successes; stale projections say
+        so. Nothing here measures opens, and nothing claims revenue lift.
+        """
+        from modules.segments import resolve_segment
+        if date_to < date_from:
+            raise HTTPException(status_code=422, detail={"code": "inverted_range"})
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "reports.read")
+                start_iso, end_iso, tzname = _range_tz(
+                    connection, tenant_id=str(tenant_id), locations=None,
+                    day_from=date_from, day_to=date_to)
+                params: dict = {"tenant": str(tenant_id),
+                                "start": start_iso, "end": end_iso}
+
+                delivery = connection.execute(
+                    text("""SELECT channel, state, count(*) FROM communications
+                            WHERE tenant_id=:tenant AND created_at >= :start
+                              AND created_at < :end
+                            GROUP BY channel, state"""),
+                    params).mappings().all()
+                callbacks = connection.execute(
+                    text("""SELECT event, count(*) FROM provider_callbacks
+                            WHERE tenant_id=:tenant AND created_at >= :start
+                              AND created_at < :end
+                            GROUP BY event"""),
+                    params).mappings().all()
+                unknown_delivery = connection.execute(
+                    text("""SELECT count(*) FROM communications c
+                            WHERE c.tenant_id=:tenant AND c.created_at >= :start
+                              AND c.created_at < :end AND c.state='dispatched'
+                              AND NOT EXISTS (
+                                SELECT 1 FROM provider_callbacks p
+                                WHERE p.tenant_id=c.tenant_id
+                                  AND p.communication_id=c.id
+                                  AND p.event IN ('delivered', 'read', 'failed'))"""),
+                    params).scalar_one()
+
+                unsubs = connection.execute(
+                    text("""SELECT reason, count(*) FROM suppressions
+                            WHERE tenant_id=:tenant AND suppressed_at >= :start
+                              AND suppressed_at < :end
+                            GROUP BY reason"""),
+                    params).mappings().all()
+                revoked = connection.execute(
+                    text("""SELECT count(*) FROM consents
+                            WHERE tenant_id=:tenant AND status='revoked'
+                              AND granted_at >= :start AND granted_at < :end"""),
+                    params).scalar_one()
+
+                campaigns = connection.execute(
+                    text("""SELECT c.id::text AS id, c.name, c.channel, c.status,
+                                   c.budget_minor,
+                                   (SELECT count(*) FROM campaign_sends s
+                                     WHERE s.tenant_id=c.tenant_id AND s.campaign_id=c.id
+                                       AND s.state='sent') AS sent,
+                                   (SELECT count(*) FROM campaign_sends s
+                                     WHERE s.tenant_id=c.tenant_id AND s.campaign_id=c.id
+                                       AND s.state LIKE 'skipped%') AS skipped,
+                                   (SELECT count(*) FROM offer_redemptions r
+                                     WHERE r.tenant_id=c.tenant_id AND r.campaign_id=c.id)
+                                   AS attributed,
+                                   (SELECT COALESCE(SUM(mc.cost_minor), 0)
+                                     FROM message_costs mc
+                                     JOIN campaign_sends s
+                                       ON s.tenant_id=mc.tenant_id
+                                      AND s.communication_id=mc.communication_id
+                                     WHERE s.tenant_id=c.tenant_id
+                                       AND s.campaign_id=c.id) AS cost_minor
+                            FROM offer_campaigns c
+                            WHERE c.tenant_id=:tenant AND c.created_at >= :start
+                              AND c.created_at < :end
+                            ORDER BY c.created_at"""),
+                    params).mappings().all()
+
+                prompts_sent = connection.execute(
+                    text("""SELECT count(*) FROM rebooking_prompts p
+                            JOIN rebooking_cycles c ON c.tenant_id=p.tenant_id
+                                                   AND c.id=p.cycle_id
+                            WHERE p.tenant_id=:tenant AND p.sent_at >= :start
+                              AND p.sent_at < :end"""),
+                    params).scalar_one()
+                prompts_booked = connection.execute(
+                    text("""SELECT count(*) FROM rebooking_cycles
+                            WHERE tenant_id=:tenant AND status='booked'
+                              AND attributed_communication_id IS NOT NULL"""),
+                    {"tenant": str(tenant_id)}).scalar_one()
+
+                closures = connection.execute(
+                    text("""SELECT status, resolution, count(*) FROM closure_impacts
+                            WHERE tenant_id=:tenant
+                            GROUP BY status, resolution"""),
+                    {"tenant": str(tenant_id)}).mappings().all()
+
+                costs = connection.execute(
+                    text("""SELECT mc.channel, COALESCE(SUM(mc.cost_minor), 0) AS minor,
+                                   count(*) AS messages FROM message_costs mc
+                            JOIN communications c ON c.tenant_id=mc.tenant_id
+                                                  AND c.id=mc.communication_id
+                            WHERE mc.tenant_id=:tenant AND mc.recorded_at >= :start
+                              AND mc.recorded_at < :end
+                            GROUP BY mc.channel"""),
+                    params).mappings().all()
+
+                segments = connection.execute(
+                    text("""SELECT id::text AS id, name FROM client_segments
+                            WHERE tenant_id=:tenant ORDER BY name LIMIT 20"""),
+                    {"tenant": str(tenant_id)}).mappings().all()
+                audiences = []
+                for segment in segments:
+                    try:
+                        resolved = resolve_segment(
+                            connection, tenant_id=str(tenant_id),
+                            segment_id=segment["id"], channel="email")
+                    except Exception:
+                        continue
+                    audiences.append({"segment_id": segment["id"], "name": segment["name"],
+                                      "candidates": resolved["candidates"],
+                                      "eligible": resolved["eligible_count"],
+                                      "exclusions": resolved["exclusions"]})
+            return {
+                "date_from": date_from.isoformat(), "date_to": date_to.isoformat(),
+                "timezone": tzname,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "delivery_by_channel_state": [
+                    {"channel": r["channel"], "state": r["state"], "count": r["count"]}
+                    for r in delivery],
+                "provider_events": {r["event"]: r["count"] for r in callbacks},
+                "unknown_delivery": unknown_delivery,
+                "unsubscribes_by_reason": {r["reason"]: r["count"] for r in unsubs},
+                "consents_revoked": revoked,
+                "campaigns": [{**dict(c)} for c in campaigns],
+                "automation": {"rebooking_prompts_sent": prompts_sent,
+                               "prompt_attributed_bookings": prompts_booked,
+                               "prompt_conversion": (round(prompts_booked / prompts_sent, 4)
+                                                     if prompts_sent else None)},
+                "closure_resolution": [
+                    {"status": r["status"], "resolution": r["resolution"],
+                     "count": r["count"]} for r in closures],
+                "message_costs": {"by_channel": [dict(r) for r in costs],
+                                  "currency": "CAD"},
+                "audiences": audiences,
+                "definitions": {
+                    "delivery": "Outbox rows created in range by channel and state; "
+                                "denominator: ranged rows.",
+                    "unknown_delivery": "Dispatched with no delivered/read/failed "
+                                        "evidence: labelled, never counted as delivered.",
+                    "prompt_conversion": "Prompt-attributed bookings / prompts sent; "
+                                         "descriptive attribution, not causal lift.",
+                    "costs": "Ledgered CAD minor units in range by channel.",
+                },
+            }
+        finally:
+            engine.dispose()
