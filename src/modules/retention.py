@@ -195,7 +195,13 @@ def run_rebooking_prompts(connection, *, tenant_id: str,
     summary = {"prompted": 0, "follow_ups": 0, "snoozed_skip": 0,
                "salon_skip": 0, "inactive_skip": 0, "future_booking_skip": 0,
                "capped_skip": 0, "cooldown_skip": 0, "invalid_contact_skip": 0,
-               "consent_skip": 0, "suppressed_skip": 0, "channel_skip": 0}
+               "consent_skip": 0, "suppressed_skip": 0, "channel_skip": 0,
+               "flag_disabled": 0}
+    from modules.finance import flag_enabled
+    if not flag_enabled(connection, tenant_id=tenant_id,
+                        flag="rebooking_prompts_enabled", default=True):
+        summary["flag_disabled"] = 1
+        return summary
     rules = connection.execute(
         text("""SELECT id::text AS id, service_id::text AS service_id, channel
                 FROM rebooking_rules

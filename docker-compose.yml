@@ -56,6 +56,7 @@ services:
       - ./db/migrations/050_company_registry.sql:/docker-entrypoint-initdb.d/050_company_registry.sql:ro
       - ./db/migrations/050_company_registry_functions.sql:/docker-entrypoint-initdb.d/050_company_registry_functions.sql:ro
       - ./db/migrations/051_support_cases.sql:/docker-entrypoint-initdb.d/051_support_cases.sql:ro
+      - ./db/migrations/052_finance_controls.sql:/docker-entrypoint-initdb.d/052_finance_controls.sql:ro
       - ./db/migrations/053_request_tracing.sql:/docker-entrypoint-initdb.d/053_request_tracing.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U salon -d salon"]

@@ -662,6 +662,9 @@ def register_company_routes(
             payload = WebhookIn.model_validate_json(raw_body)
         except Exception:
             raise HTTPException(status_code=422, detail={"code": "unreadable_webhook"})
+        from modules.finance import check_provider_rate
+        check_provider_rate((payload.data or {}).get("customer_ref") or "unknown",
+                            "billing_webhooks")
         signature = request.headers.get("x-provider-signature", "")
         engine = app.state.engine_factory()
         try:

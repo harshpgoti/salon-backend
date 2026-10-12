@@ -398,6 +398,8 @@ def register_callback_routes(
         """Provider delivery callback. Authenticates by HMAC signature only."""
         if channel not in ("email", "sms", "whatsapp"):
             raise HTTPException(status_code=422, detail={"code": "unknown_channel"})
+        from modules.finance import check_provider_rate
+        check_provider_rate(str(tenant_id), "provider_callbacks")
         raw_body = await request.body()
         try:
             payload = CallbackIn.model_validate_json(raw_body)

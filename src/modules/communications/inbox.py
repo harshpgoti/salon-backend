@@ -185,6 +185,8 @@ def register_inbox_routes(
         """Provider inbound webhook. Authenticates by HMAC signature only."""
         if channel not in ("sms", "whatsapp"):
             raise HTTPException(status_code=422, detail={"code": "unknown_channel"})
+        from modules.finance import check_provider_rate
+        check_provider_rate(str(tenant_id), "provider_inbound")
         raw_body = await request.body()
         try:
             payload = InboundIn.model_validate_json(raw_body)

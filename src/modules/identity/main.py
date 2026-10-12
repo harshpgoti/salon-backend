@@ -47,6 +47,7 @@ from modules.company import register_company_routes, start_trial
 from modules.communications.callbacks import register_callback_routes
 from modules.communications.inbox import register_inbox_routes
 from modules.communications.senders import register_sender_routes
+from modules.finance import register_finance_routes
 from modules.quiet import register_quiet_routes
 from modules.retention import register_retention_routes
 from modules.segments import register_segment_routes
@@ -1532,6 +1533,11 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
         membership_scope=_membership_scope,
         require_permission=_require_permission,
         insert_audit=_insert_audit,
+    )
+
+    register_finance_routes(
+        app,
+        require_company_identity=require_company_identity,
     )
 
     register_support_routes(
