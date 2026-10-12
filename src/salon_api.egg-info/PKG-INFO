@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: salon-api
+Version: 0.1.0
+Summary: Tenant-safe salon operations API
+Requires-Python: <3.13,>=3.12
+Requires-Dist: fastapi==0.141.1
+Requires-Dist: uvicorn==0.52.4
+Requires-Dist: SQLAlchemy==2.0.52
+Requires-Dist: psycopg==3.3.4
+Requires-Dist: alembic==1.19.1
+Requires-Dist: PyJWT[crypto]==2.15.1
+Requires-Dist: cryptography==50.0.2
+Provides-Extra: test
+Requires-Dist: pytest==9.1.1; extra == "test"
+Requires-Dist: httpx==0.28.1; extra == "test"

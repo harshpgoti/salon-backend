@@ -1,0 +1,46 @@
+name: salon
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: salon
+      POSTGRES_USER: salon
+      POSTGRES_PASSWORD: local-dev-only
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - salon-postgres:/var/lib/postgresql/data
+      - ./db/migrations/000_app_role.sql:/docker-entrypoint-initdb.d/000_app_role.sql:ro
+      - ./db/migrations/001_foundation.sql:/docker-entrypoint-initdb.d/001_foundation.sql:ro
+      - ./db/migrations/002_identity_onboarding.sql:/docker-entrypoint-initdb.d/002_identity_onboarding.sql:ro
+      - ./db/migrations/003_auth_sessions.sql:/docker-entrypoint-initdb.d/003_auth_sessions.sql:ro
+      - ./db/migrations/004_authorization.sql:/docker-entrypoint-initdb.d/004_authorization.sql:ro
+      - ./db/migrations/005_scoped_resources.sql:/docker-entrypoint-initdb.d/005_scoped_resources.sql:ro
+      - ./db/migrations/006_audit_events.sql:/docker-entrypoint-initdb.d/006_audit_events.sql:ro
+      - ./db/migrations/007_membership_lifecycle.sql:/docker-entrypoint-initdb.d/007_membership_lifecycle.sql:ro
+      - ./db/migrations/008_ownership_history.sql:/docker-entrypoint-initdb.d/008_ownership_history.sql:ro
+      - ./db/migrations/009_setup_and_branding.sql:/docker-entrypoint-initdb.d/009_setup_and_branding.sql:ro
+      - ./db/migrations/010_client_contacts.sql:/docker-entrypoint-initdb.d/010_client_contacts.sql:ro
+      - ./db/migrations/011_client_search.sql:/docker-entrypoint-initdb.d/011_client_search.sql:ro
+      - ./db/migrations/012_custom_fields_notes.sql:/docker-entrypoint-initdb.d/012_custom_fields_notes.sql:ro
+      - ./db/migrations/013_client_imports.sql:/docker-entrypoint-initdb.d/013_client_imports.sql:ro
+      - ./db/migrations/014_client_merges.sql:/docker-entrypoint-initdb.d/014_client_merges.sql:ro
+      - ./db/migrations/015_privacy_requests.sql:/docker-entrypoint-initdb.d/015_privacy_requests.sql:ro
+      - ./db/migrations/016_service_catalogue.sql:/docker-entrypoint-initdb.d/016_service_catalogue.sql:ro
+      - ./db/migrations/017_staff_scheduling.sql:/docker-entrypoint-initdb.d/017_staff_scheduling.sql:ro
+      - ./db/migrations/018_location_hours.sql:/docker-entrypoint-initdb.d/018_location_hours.sql:ro
+      - ./db/migrations/019_bookable_resources.sql:/docker-entrypoint-initdb.d/019_bookable_resources.sql:ro
+      - ./db/migrations/020_booking_core.sql:/docker-entrypoint-initdb.d/020_booking_core.sql:ro
+      - ./db/migrations/021_visits.sql:/docker-entrypoint-initdb.d/021_visits.sql:ro
+      - ./db/migrations/022_salon_receipts.sql:/docker-entrypoint-initdb.d/022_salon_receipts.sql:ro
+      - ./db/migrations/026_closure_impacts.sql:/docker-entrypoint-initdb.d/026_closure_impacts.sql:ro
+      - ./db/migrations/027_communications.sql:/docker-entrypoint-initdb.d/027_communications.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U salon -d salon"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  salon-postgres:
