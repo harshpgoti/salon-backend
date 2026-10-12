@@ -41,6 +41,7 @@ services:
       - ./db/migrations/030_delivery_callbacks.sql:/docker-entrypoint-initdb.d/030_delivery_callbacks.sql:ro
       - ./db/migrations/031_whatsapp_onboarding.sql:/docker-entrypoint-initdb.d/031_whatsapp_onboarding.sql:ro
       - ./db/migrations/034_follow_up_tasks.sql:/docker-entrypoint-initdb.d/034_follow_up_tasks.sql:ro
+      - ./db/migrations/035_rebooking_cycles.sql:/docker-entrypoint-initdb.d/035_rebooking_cycles.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U salon -d salon"]
       interval: 3s

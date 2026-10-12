@@ -23,6 +23,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
+from modules.retention import create_cycles_for_visit
+
 # Allowed target statuses from each source status (architecture.md:68). A status not
 # listed has no outgoing edge; reaching a terminal state and leaving it is a correction.
 ALLOWED: dict[str, frozenset[str]] = {
@@ -144,5 +146,9 @@ def _complete_visit(connection, tenant_id: str, appointment_id: str) -> str:
              "price": line["price_minor"], "currency": line["currency"], "duration": line["duration_minutes"],
              "pre": line["pre_buffer_minutes"], "post": line["post_buffer_minutes"],
              "starts": line["starts_at"].isoformat(), "ends": line["ends_at"].isoformat()})
+    # TASK-035 / FR-049: the same transaction opens the rebooking due cycle(s)
+    # for these completed lines, so a committed completion always has its due
+    # date and a rolled-back one never leaves an orphan cycle.
+    create_cycles_for_visit(connection, tenant_id=tenant_id, visit_id=visit_id)
     return visit_id
 
