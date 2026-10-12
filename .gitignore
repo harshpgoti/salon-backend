@@ -7,3 +7,5 @@ coverage.xml
 .env
 .env.*
 !.env.example
+
+*.egg-info/
