@@ -1,0 +1,62 @@
+# TASK-054 / FR-081 — secure CI skeleton (no credentials in files; placeholders only).
+#
+# DQ-003: no cloud spend/provisioning in CI (plan-only; `terraform validate`
+# shape check at most — never apply). DQ-006: sandbox/recording adapters only.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[test]"
+
+      - name: Backend tests
+        working-directory: backend
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: pytest -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail-closed credential-pattern grep. Placeholders named
+      # PLACEHOLDER-* are the only approved stand-ins; anything matching a
+      # real credential shape fails the build.
+      - name: Fail on credential patterns
+        run: |
+          if grep -RInE 'AKIA|BEGIN PRIVATE KEY|password\s*=' --exclude-dir=.git --exclude-dir=.venv --exclude-dir=node_modules --exclude='*.lock' . ; then
+            echo "::error::credential pattern found — use placeholders only, never real secrets"
+            exit 1
+          fi

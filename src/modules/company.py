@@ -1141,3 +1141,89 @@ def register_company_routes(
             return dict(row)
         finally:
             engine.dispose()
+
+    @app.get("/v1/company/metrics", tags=["company"])
+    def read_metrics(identity=Depends(require_company_identity)) -> dict:
+        """Company health: live numbers plus stored snapshots with freshness.
+
+        Snapshots older than a day read back stale:true; months never stored
+        read back as unavailable — never as silent old numbers (FR-064). No
+        client data anywhere in these aggregates (FR-063).
+        """
+        import json as _json
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role = company_scope(connection, identity)
+                _require_company(role, "company.registry.read")
+                live = connection.execute(
+                    text("SELECT company_compute_metrics()")).scalar_one()
+                live = _json.loads(live) if isinstance(live, str) else dict(live)
+                rows = connection.execute(
+                    text("""SELECT metric, period, value_num, value_json, computed_at
+                            FROM company_metric_snapshots ORDER BY metric, period"""),
+                ).mappings().all()
+            now = datetime.now(timezone.utc)
+            snapshots = []
+            for row in rows:
+                age_days = (now - row["computed_at"]).days \
+                    if row["computed_at"].tzinfo else 0
+                snapshots.append({"metric": row["metric"], "period": row["period"],
+                                  "value_num": float(row["value_num"])
+                                  if row["value_num"] is not None else None,
+                                  "value_json": dict(row["value_json"] or {}),
+                                  "computed_at": row["computed_at"].isoformat(),
+                                  "stale": age_days > 1})
+            return {"live": live, "snapshots": snapshots,
+                    "generated_at": now.isoformat()}
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/company/metrics/rebuild", tags=["company"])
+    def rebuild_metrics(payload: dict,
+                        identity=Depends(require_company_identity)) -> dict:
+        """Idempotent full-refresh projection rebuild for the current month.
+
+        Redeliveries converge (upsert); corrections and deletions propagate
+        because every source row is re-read, never incrementally accumulated.
+        Past months refuse: provider history cannot be reconstructed
+        synthetically, and inventing it would be worse than reporting
+        unavailable.
+        """
+        month = (payload or {}).get("period")
+        current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        if month != current_month:
+            raise HTTPException(status_code=422, detail={
+                "code": "month_not_reconstructible",
+                "message": "only the current month rebuilds; past months report "
+                           "stored snapshots or unavailable"})
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role = company_scope(connection, identity)
+                _require_company(role, "company.finance.manage")
+                import json as _json
+                live = connection.execute(
+                    text("SELECT company_compute_metrics()")).scalar_one()
+                live = _json.loads(live) if isinstance(live, str) else dict(live)
+                stored = 0
+                for metric, value in live.items():
+                    numeric = value if isinstance(value, (int, float)) else None
+                    connection.execute(
+                        text("""INSERT INTO company_metric_snapshots
+                                (metric, period, value_num, value_json, source)
+                                VALUES (:metric, :period, :num, :payload, 'live')
+                                ON CONFLICT (metric, period) DO UPDATE SET
+                                    value_num=EXCLUDED.value_num,
+                                    value_json=EXCLUDED.value_json,
+                                    computed_at=now(), source='live'"""),
+                        {"metric": metric, "period": current_month, "num": numeric,
+                         "payload": _json.dumps({"value": value})})
+                    stored += 1
+                _company_audit(connection, identity=identity,
+                               action="company.metrics_rebuilt",
+                               resource_type="company_metrics", resource_id=current_month,
+                               reason=f"{stored} metrics")
+            return {"period": current_month, "stored": stored}
+        finally:
+            engine.dispose()
