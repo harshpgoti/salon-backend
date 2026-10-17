@@ -56,6 +56,10 @@ def test_today_ac1_aggregates_reconcile(database_url):
     client = _client(database_url, owner)
     try:
         base, slug, service, staff, client_id = _bookable(client, database_url, tenant)
+        quiet = client.put(f"{base}/messaging/settings", json={
+            "quiet_start": None, "quiet_end": None,
+            "emergency_stop": False, "max_per_recipient_per_day": None})
+        assert quiet.status_code == 200, quiet.text
         day = date.today() + timedelta(days=1)
         loc = tenant["location_id"]
         tid = tenant["tenant_id"]

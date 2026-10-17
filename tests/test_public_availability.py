@@ -44,9 +44,17 @@ def _bookable_salon(client, database_url, tenant, weekdays=range(6), shift_day=N
     client.put(f"{base}/staff/{staff}/qualifications", json={"service_ids": [service]})
     client.post(f"{base}/staff/{staff}/shifts", json={
         "location_id": loc, "weekday": shift_day if shift_day is not None
-        else (date.today() + timedelta(days=1)).weekday(),
+        else _next_open_day(weekdays).weekday(),
         "starts_at": "09:00", "ends_at": "17:00"})
     return slug, service, staff
+
+
+def _next_open_day(weekdays=range(6)):
+    """Choose a date covered by the fixture's published business hours."""
+    day = date.today() + timedelta(days=1)
+    while day.weekday() not in weekdays:
+        day += timedelta(days=1)
+    return day
 
 
 def test_availability_intersects_hours_shift_and_qualification(database_url):
@@ -57,7 +65,7 @@ def test_availability_intersects_hours_shift_and_qualification(database_url):
     base = f"/v1/tenants/{tenant['tenant_id']}"
     try:
         slug, service, staff = _bookable_salon(client, database_url, tenant)
-        tomorrow = date.today() + timedelta(days=1)
+        tomorrow = _next_open_day()
         resp = client.get(f"/v1/public/salons/{slug}/availability", params={
             "service_id": service, "date_from": tomorrow.isoformat(),
             "date_to": (tomorrow + timedelta(days=1)).isoformat()})
@@ -89,7 +97,7 @@ def test_approved_leave_removes_availability(database_url):
     base = f"/v1/tenants/{tenant['tenant_id']}"
     try:
         slug, service, staff = _bookable_salon(client, database_url, tenant)
-        tomorrow = date.today() + timedelta(days=1)
+        tomorrow = _next_open_day()
         params = {"service_id": service, "date_from": tomorrow.isoformat(),
                   "date_to": (tomorrow + timedelta(days=1)).isoformat()}
         assert len(client.get(f"/v1/public/salons/{slug}/availability", params=params).json()["slots"]) > 0
@@ -110,7 +118,7 @@ def test_published_closure_removes_availability(database_url):
     base = f"/v1/tenants/{tenant['tenant_id']}"
     try:
         slug, service, staff = _bookable_salon(client, database_url, tenant)
-        tomorrow = date.today() + timedelta(days=1)
+        tomorrow = _next_open_day()
         params = {"service_id": service, "date_from": tomorrow.isoformat(),
                   "date_to": (tomorrow + timedelta(days=1)).isoformat()}
         assert len(client.get(f"/v1/public/salons/{slug}/availability", params=params).json()["slots"]) > 0
@@ -134,7 +142,7 @@ def test_graceful_errors_and_bounds(database_url):
     base = f"/v1/tenants/{tenant['tenant_id']}"
     try:
         slug, service, staff = _bookable_salon(client, database_url, tenant)
-        tomorrow = date.today() + timedelta(days=1)
+        tomorrow = _next_open_day()
 
         unknown = client.get("/v1/public/salons/no-such-salon/availability", params={
             "service_id": service, "date_from": tomorrow.isoformat(), "date_to": tomorrow.isoformat()})
@@ -176,7 +184,7 @@ def test_public_availability_intersects_required_resource_reservations(database_
                                     "resource_ids": [room]})
         assert assigned.status_code == 200, assigned.text
 
-        tomorrow = date.today() + timedelta(days=1)
+        tomorrow = _next_open_day()
         params = {"service_id": service, "date_from": tomorrow.isoformat(),
                   "date_to": tomorrow.isoformat(), "staff_id": staff}
         profile = client.get(f"/v1/public/salons/{slug}/booking-profile")

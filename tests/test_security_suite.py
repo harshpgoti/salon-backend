@@ -427,17 +427,24 @@ def test_sec56_budget_spend_is_per_tenant(database_url):
                     connection=conn, tenant_id=tid, appointment_id=appt_id,
                     client_id=client_row, contact_value="+14165550101", channel="sms",
                     purpose=purpose, entity_version=1)
-                return dispatch_due_communications(
-                    connection=conn, tenant_id=tid, adapter=RecordingAdapter())
+                adapter = RecordingAdapter()
+                summary = dispatch_due_communications(
+                    connection=conn, tenant_id=tid, adapter=adapter)
+                return summary, adapter.records
 
         # Sender numbers are globally unique (never pooled across salons), so
-        # each tenant registers its own. A spends its single cent; B is
-        # untouched and still has full headroom.
-        assert _send(engine_a, tid_a, client_a_id, appt_a, "sec56_a_1",
-                     "+14165550111")["dispatched"] == 1
+        # each tenant registers its own. Appointment confirmation delivery may
+        # already have happened during booking, so assert the SMS itself and
+        # the actual per-tenant spend rather than relying on a global message count.
+        summary_a, sends_a = _send(engine_a, tid_a, client_a_id, appt_a, "sec56_a_1",
+                                   "+14165550111")
+        assert summary_a["dispatched"] >= 1
+        assert any(send["channel"] == "sms" for send in sends_a)
         assert client_b.get(f"/v1/tenants/{tid_b}/billing/budget").json()["spent_minor"] == 0
-        assert _send(engine_b, tid_b, client_b_id, appt_b, "sec56_b_1",
-                     "+14165550222")["dispatched"] == 1
+        summary_b, sends_b = _send(engine_b, tid_b, client_b_id, appt_b, "sec56_b_1",
+                                   "+14165550222")
+        assert summary_b["dispatched"] >= 1
+        assert any(send["channel"] == "sms" for send in sends_b)
         report_a = client_a.get(f"/v1/tenants/{tid_a}/billing/budget").json()
         report_b = client_b.get(f"/v1/tenants/{tid_b}/billing/budget").json()
         assert (report_a["spent_minor"], report_b["spent_minor"]) == (1, 1)
