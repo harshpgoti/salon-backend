@@ -1,3 +1,3 @@
--- Local Docker bootstrap role. Production provisions its runtime role through the secrets manager.
+-- Local Docker bootstrap; production provisions its runtime role separately.
 CREATE ROLE salon_app LOGIN PASSWORD 'local-dev-only';
-GRANT CONNECT ON DATABASE salon TO salon_app;
+DO $$ BEGIN EXECUTE format('GRANT CONNECT ON DATABASE %I TO salon_app', current_database()); END $$;

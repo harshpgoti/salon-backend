@@ -17,11 +17,14 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Callable
-from datetime import time
+from datetime import date
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+
+from salon_platform.local_time import clock_minutes
+from modules.catalogue.scheduling_policy import lock_staff_schedule
 
 
 class StaffIn(BaseModel):
@@ -65,18 +68,24 @@ class DeactivateIn(BaseModel):
 
 
 def _minutes(value: str) -> int:
-    hours, minutes = value.split(":")
-    return int(hours) * 60 + int(minutes)
+    try:
+        return clock_minutes(value, allow_end_of_day=True)
+    except ValueError:
+        raise HTTPException(status_code=422, detail={"code": "invalid_local_time"})
 
 
 def validate_breaks(starts_at: str, ends_at: str, breaks: list[BreakInterval]) -> list[dict]:
     """Reject a break outside the shift, or breaks that overlap each other."""
     shift_start, shift_end = _minutes(starts_at), _minutes(ends_at)
+    if shift_start == 1440:
+        raise HTTPException(status_code=422, detail={"code": "invalid_local_time"})
     if shift_end <= shift_start:
         raise HTTPException(status_code=422, detail={"code": "shift_ends_before_start"})
     normalized = []
     for interval in breaks:
         start, end = _minutes(interval.start), _minutes(interval.end)
+        if start == 1440:
+            raise HTTPException(status_code=422, detail={"code": "invalid_local_time"})
         if end <= start:
             raise HTTPException(status_code=422, detail={"code": "break_ends_before_start"})
         if start < shift_start or end > shift_end:
@@ -176,6 +185,7 @@ def register_staff_routes(
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "staff.manage")
                 staff_or_404(connection, tenant_id, staff_id)
+                lock_staff_schedule(connection, str(tenant_id), str(staff_id))
                 # Every named service must belong to this tenant; a foreign id is a 404,
                 # never a silently ignored line.
                 for service_id in payload.service_ids:
@@ -227,6 +237,7 @@ def register_staff_routes(
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "staff.manage")
                 staff_or_404(connection, tenant_id, staff_id)
+                lock_staff_schedule(connection, str(tenant_id), str(staff_id))
                 for location_id in payload.location_ids:
                     owned = connection.execute(
                         text("SELECT 1 FROM locations WHERE tenant_id=:tenant AND id=:id"),
@@ -250,6 +261,23 @@ def register_staff_routes(
         finally:
             engine.dispose()
 
+    @app.get("/v1/tenants/{tenant_id}/staff/{staff_id}/locations", tags=["catalogue"])
+    def get_staff_locations(tenant_id: uuid.UUID, staff_id: uuid.UUID,
+                            identity=Depends(require_identity)) -> dict:
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "staff.read")
+                staff_or_404(connection, tenant_id, staff_id)
+                rows = connection.execute(
+                    text("""SELECT location_id::text FROM staff_locations
+                            WHERE tenant_id=:tenant AND staff_id=:staff ORDER BY location_id"""),
+                    {"tenant": str(tenant_id), "staff": str(staff_id)}).scalars().all()
+            return {"staff_id": str(staff_id), "location_ids": list(rows)}
+        finally:
+            engine.dispose()
+
     @app.post("/v1/tenants/{tenant_id}/staff/{staff_id}/shifts", tags=["catalogue"], status_code=201)
     def create_shift(tenant_id: uuid.UUID, staff_id: uuid.UUID, payload: ShiftIn, request: Request,
                      identity=Depends(require_identity)) -> dict:
@@ -260,6 +288,7 @@ def register_staff_routes(
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "staff.manage")
                 staff = staff_or_404(connection, tenant_id, staff_id)
+                lock_staff_schedule(connection, str(tenant_id), str(staff_id))
                 if not staff["is_bookable"]:
                     raise HTTPException(status_code=422, detail={"code": "staff_not_bookable"})
                 # A shift at a location the staff member is not assigned to would create
@@ -272,6 +301,13 @@ def register_staff_routes(
                 if assigned is None:
                     raise HTTPException(status_code=422, detail={"code": "location_not_assigned"})
                 breaks = validate_breaks(payload.starts_at, payload.ends_at, payload.breaks)
+                try:
+                    effective_from = date.fromisoformat(payload.effective_from) if payload.effective_from else date.today()
+                    effective_to = date.fromisoformat(payload.effective_to) if payload.effective_to else None
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail={"code": "invalid_shift_date"}) from exc
+                if effective_to is not None and effective_to < effective_from:
+                    raise HTTPException(status_code=422, detail={"code": "shift_effective_range_inverted"})
                 connection.execute(
                     text("""INSERT INTO staff_shifts
                             (tenant_id,id,staff_id,location_id,weekday,starts_at,ends_at,breaks,
@@ -281,7 +317,7 @@ def register_staff_routes(
                     {"tenant": str(tenant_id), "id": str(shift_id), "staff": str(staff_id),
                      "location": str(payload.location_id), "weekday": payload.weekday,
                      "starts": payload.starts_at, "ends": payload.ends_at,
-                     "breaks": json.dumps(breaks), "from_date": payload.effective_from,
+                     "breaks": json.dumps(breaks), "from_date": effective_from.isoformat(),
                      "to_date": payload.effective_to})
                 insert_audit(connection, tenant_id, identity, action="staff_shift.created",
                              resource_type="staff_shift", resource_id=shift_id,
@@ -322,6 +358,7 @@ def register_staff_routes(
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "staff.manage")
                 staff_or_404(connection, tenant_id, staff_id)
+                lock_staff_schedule(connection, str(tenant_id), str(staff_id))
                 _validate_leave_range(payload.starts_on, payload.ends_on)
                 connection.execute(
                     text("""INSERT INTO staff_leave
@@ -362,23 +399,27 @@ def register_staff_routes(
         """Future appointments this staff member holds, so deactivation is an explicit choice."""
         engine = app.state.engine_factory()
         try:
+            effective_on = date.fromisoformat(on) if on else date.today()
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_deactivation_date"}) from exc
+        try:
             with engine.begin() as connection:
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "staff.read")
                 staff_or_404(connection, tenant_id, staff_id)
-                # appointments belongs to TASK-020; until it exists there is nothing to list,
-                # and the response says so rather than inventing a result.
                 has_appointments = connection.execute(
                     text("SELECT to_regclass('public.appointments') IS NOT NULL")).scalar_one()
                 affected = []
                 if has_appointments:
                     affected = connection.execute(
-                        text("""SELECT id::text AS id, starts_at FROM appointments
+                        text("""SELECT id::text AS id, starts_at, location_id::text AS location_id
+                                FROM appointments
                                 WHERE tenant_id=:tenant AND staff_id=:staff
-                                  AND starts_at >= now() AND status NOT IN ('cancelled','completed')
+                                  AND starts_at >= (CAST(:on AS date)::timestamp AT TIME ZONE local_timezone)
+                                  AND status NOT IN ('cancelled','completed','no_show','rejected')
                                 ORDER BY starts_at"""),
-                        {"tenant": str(tenant_id), "staff": str(staff_id)}).mappings().all()
-            return {"staff_id": str(staff_id), "on": on, "affected_appointments": [dict(a) for a in affected],
+                        {"tenant": str(tenant_id), "staff": str(staff_id), "on": effective_on.isoformat()}).mappings().all()
+            return {"staff_id": str(staff_id), "on": effective_on.isoformat(), "affected_appointments": [dict(a) for a in affected],
                     "requires_resolution": len(affected) > 0}
         finally:
             engine.dispose()
@@ -388,20 +429,33 @@ def register_staff_routes(
                          identity=Depends(require_identity)) -> dict:
         engine = app.state.engine_factory()
         try:
+            effective_on = date.fromisoformat(payload.deactivated_on)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_deactivation_date"}) from exc
+        try:
             with engine.begin() as connection:
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "staff.manage")
                 staff_or_404(connection, tenant_id, staff_id)
+                lock_staff_schedule(connection, str(tenant_id), str(staff_id))
                 has_appointments = connection.execute(
                     text("SELECT to_regclass('public.appointments') IS NOT NULL")).scalar_one()
-                affected = 0
+                affected = []
                 if has_appointments:
                     affected = connection.execute(
-                        text("""SELECT count(*) FROM appointments
+                        text("""SELECT id::text AS id, starts_at FROM appointments
                                 WHERE tenant_id=:tenant AND staff_id=:staff
-                                  AND starts_at >= :on AND status NOT IN ('cancelled','completed')"""),
+                                  AND starts_at >= (CAST(:on AS date)::timestamp AT TIME ZONE local_timezone)
+                                  AND status NOT IN ('cancelled','completed','no_show','rejected')
+                                ORDER BY starts_at"""),
                         {"tenant": str(tenant_id), "staff": str(staff_id),
-                         "on": payload.deactivated_on}).scalar_one()
+                         "on": effective_on.isoformat()}).mappings().all()
+                if affected:
+                    raise HTTPException(status_code=409, detail={
+                        "code": "staff_bookings_require_resolution",
+                        "affected_appointments": [{**dict(item), "starts_at": item["starts_at"].isoformat()}
+                                                  for item in affected],
+                    })
                 # Deactivation is a date, not an immediate switch-off: a staff member deactivated from a
                 # future date must keep being offered until that date, so `is_bookable` (the manual
                 # toggle) is deliberately left alone here.
@@ -409,13 +463,13 @@ def register_staff_routes(
                     text("""UPDATE staff_profiles SET deactivated_on=:on,
                             version=version+1, updated_at=now()
                             WHERE tenant_id=:tenant AND id=:id RETURNING *"""),
-                    {"on": payload.deactivated_on, "tenant": str(tenant_id),
+                    {"on": effective_on.isoformat(), "tenant": str(tenant_id),
                      "id": str(staff_id)}).mappings().one()
                 insert_audit(connection, tenant_id, identity, action="staff.deactivated",
                              resource_type="staff", resource_id=staff_id,
-                             reason=f"staff deactivated from {payload.deactivated_on}",
+                             reason=f"staff deactivated from {effective_on.isoformat()}",
                              request_id=request.state.request_id,
                              changed_fields=["deactivated_on"])
-            return {**serialize(updated), "affected_appointments": affected}
+            return {**serialize(updated), "affected_appointments": 0}
         finally:
             engine.dispose()

@@ -14,6 +14,7 @@ from sqlalchemy import create_engine, text
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from modules.budgets import reconcile_provider_usage
+from modules.communications.callbacks import ingest_callback, sign_callback_body
 from modules.communications.outbox import (
     dispatch_due_communications,
     record_booking_communication,
@@ -21,6 +22,16 @@ from modules.communications.outbox import (
 from modules.communications.senders import register_sender, verify_sender
 from test_clients import _salon, _client, _teardown
 from test_communications import RecordingAdapter, _booked_appointment
+
+
+def _drain_booking_confirmation(engine, tenant_id):
+    """Keep the appointment's own zero-cost confirmation out of budget assertions."""
+    with engine.begin() as connection:
+        connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                           {"t": tenant_id})
+        summary = dispatch_due_communications(
+            connection=connection, tenant_id=tenant_id, adapter=RecordingAdapter())
+    assert summary["dispatched"] == 1
 
 
 @pytest.fixture
@@ -45,6 +56,7 @@ def test_budget_ac1_ceiling_blocks_and_reconciles(database_url):
     tid = tenant["tenant_id"]
     try:
         _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
+        _drain_booking_confirmation(engine, tid)
         saved = client.put(f"/v1/tenants/{tid}/billing/budget",
                            json={"spend_ceiling_minor": 1})
         assert saved.status_code == 200, saved.text
@@ -68,13 +80,13 @@ def test_budget_ac1_ceiling_blocks_and_reconciles(database_url):
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
             summary = dispatch_due_communications(
                 connection=conn, tenant_id=tid, adapter=adapter)
-        assert summary["dispatched"] == 2
+        assert summary["dispatched"] == 2, summary
         with engine.connect() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
             states = conn.execute(
                 text("SELECT state FROM usage_reservations WHERE tenant_id=:t"),
                 {"t": tid}).scalars().all()
-        assert states == ["reconciled", "reconciled"]
+        assert states == ["reconciled", "reconciled", "reconciled"]
         # A one-cent SMS ceiling is now exhausted by a one-cent send...
         sms = client.put(f"/v1/tenants/{tid}/billing/budget",
                          json={"spend_ceiling_minor": 1})
@@ -125,6 +137,7 @@ def test_budget_ac1_concurrent_dispatch_respects_ceiling(database_url):
     tid = tenant["tenant_id"]
     try:
         _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
+        _drain_booking_confirmation(engine, tid)
         assert client.put(f"/v1/tenants/{tid}/billing/budget",
                           json={"spend_ceiling_minor": 5}).status_code == 200
         with engine.begin() as conn:
@@ -183,6 +196,7 @@ def test_budget_ac2_provider_usage_matches_once(database_url):
     tid = tenant["tenant_id"]
     try:
         _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
+        _drain_booking_confirmation(engine, tid)
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
             row = record_booking_communication(
@@ -200,6 +214,17 @@ def test_budget_ac2_provider_usage_matches_once(database_url):
             assert reconcile_provider_usage(
                 conn, tenant_id=tid, provider_ref="prov-001",
                 communication_id=row["id"], segments=9, cost_minor=99)["status"] == "duplicate"
+            incomplete = reconcile_provider_usage(
+                conn, tenant_id=tid, provider_ref="prov-cost-missing",
+                communication_id=row["id"], segments=1, cost_minor=None)
+            assert incomplete["status"] == "pending"
+            enriched = reconcile_provider_usage(
+                conn, tenant_id=tid, provider_ref="prov-cost-missing",
+                communication_id=row["id"], segments=1, cost_minor=4)
+            assert enriched["status"] == "matched"
+            assert reconcile_provider_usage(
+                conn, tenant_id=tid, provider_ref="prov-cost-missing",
+                communication_id=row["id"], segments=1, cost_minor=40)["status"] == "duplicate"
             ghost = reconcile_provider_usage(
                 conn, tenant_id=tid, provider_ref="prov-ghost",
                 communication_id=None, segments=3, cost_minor=3)
@@ -209,10 +234,76 @@ def test_budget_ac2_provider_usage_matches_once(database_url):
                         WHERE tenant_id=:t ORDER BY provider_ref"""),
                 {"t": tid}).mappings().all()
             assert [(r["provider_ref"], r["state"]) for r in states] == [
-                ("prov-001", "matched"), ("prov-ghost", "pending")]
+                ("prov-001", "matched"), ("prov-cost-missing", "matched"),
+                ("prov-ghost", "pending")]
             conn.commit()
         finally:
             conn.close()
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_budget_ac1_actual_provider_cost_survives_delivery_and_caps_next_send(database_url):
+    """Reconciled actual spend remains billable after delivery and blocks later sends."""
+    issuer = "https://identity.example.invalid/budget-actual"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    tid = tenant["tenant_id"]
+    secret = "usage-webhook-secret-0123456789abcdef"
+    try:
+        _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
+        _drain_booking_confirmation(engine, tid)
+        assert client.put(f"/v1/tenants/{tid}/billing/budget",
+                          json={"spend_ceiling_minor": 8}).status_code == 200
+        body = b"{}"
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            created = register_sender(conn, tenant_id=tid, label="Main",
+                                      sender_identity="+14165550333")
+            verify_sender(conn, tenant_id=tid, sender_id=created["id"],
+                          code=created["verification_code"])
+            conn.execute(text("""INSERT INTO provider_webhook_secrets
+                (tenant_id, channel, secret) VALUES (:tenant, 'sms', :secret)"""),
+                {"tenant": tid, "secret": secret})
+            recorded = record_booking_communication(
+                connection=conn, tenant_id=tid, appointment_id=appt_id,
+                client_id=client_id, contact_value="+14165550103", channel="sms",
+                purpose="actual_cost", entity_version=1)
+        adapter = RecordingAdapter()
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            result = dispatch_due_communications(connection=conn, tenant_id=tid, adapter=adapter)
+        assert result["dispatched"] == 1
+
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            callback = ingest_callback(
+                conn, tenant_id=tid, channel="sms", raw_body=body,
+                signature=sign_callback_body(secret, body), event="delivered",
+                provider_event_id="evt-budget-delivered", communication_id=recorded["id"])
+            assert callback["status"] == "applied"
+            matched = reconcile_provider_usage(
+                conn, tenant_id=tid, provider_ref="prov-actual-001",
+                communication_id=recorded["id"], segments=2, cost_minor=8)
+            assert matched["status"] == "matched"
+            duplicate = reconcile_provider_usage(
+                conn, tenant_id=tid, provider_ref="prov-actual-001",
+                communication_id=recorded["id"], segments=2, cost_minor=80)
+            assert duplicate["status"] == "duplicate"
+
+        report = client.get(f"/v1/tenants/{tid}/billing/budget")
+        assert report.status_code == 200, report.text
+        assert report.json()["spent_minor"] == 8
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            record_booking_communication(
+                connection=conn, tenant_id=tid, appointment_id=appt_id,
+                client_id=client_id, contact_value="+14165550104", channel="sms",
+                purpose="after_actual", entity_version=1)
+            blocked = dispatch_due_communications(
+                connection=conn, tenant_id=tid, adapter=RecordingAdapter())
+        assert blocked["dispatched"] == 0 and blocked["failed"] == 1
+        assert client.get(f"/v1/tenants/{tid}/billing/budget").json()["spent_minor"] == 8
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 

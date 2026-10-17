@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 
 MAX_PRICE_MINOR = 100_000_000
@@ -51,6 +51,16 @@ class ServicePatch(BaseModel):
     price_minor: int | None = Field(default=None, ge=0, le=MAX_PRICE_MINOR)
     rebooking_interval_days: int | None = Field(default=None, ge=1, le=730)
     expected_version: int = Field(ge=1)
+
+
+    @field_validator("name", "duration_minutes", "pre_buffer_minutes",
+                     "post_buffer_minutes", "price_minor")
+    @classmethod
+    def required_patch_value(cls, value):
+        # Omission uses the default without validation; explicit null is invalid.
+        if value is None:
+            raise ValueError("required service fields cannot be null")
+        return value
 
 
 class OverrideIn(BaseModel):

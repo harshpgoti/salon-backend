@@ -88,6 +88,70 @@ def test_import_commit_is_resumable_and_idempotent(database_url):
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
 
+def test_import_invalid_rows_are_corrected_before_atomic_resume(database_url):
+    """AC-1: bad enums stay staged, can be corrected with versions, then commit together."""
+    issuer = "https://identity.example.invalid/import-correction"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    base = f"/v1/tenants/{tenant['tenant_id']}"
+    try:
+        content = (
+            "name,email,lifecycle,locale\n"
+            "Valid Client,valid@example.com,active,en-CA\n"
+            "Bad Lifecycle,lifecycle@example.com,invalid,fr-CA\n"
+            "Bad Locale,locale@example.com,lead,xx-CA\n"
+        )
+        preview = _preview(client, base, "resume.csv", content, {
+            "name": "name", "email": "email", "lifecycle": "lifecycle", "locale": "locale",
+        })
+        assert preview.status_code == 201, preview.text
+        job = preview.json()
+        assert (job["valid_rows"], job["error_rows"]) == (1, 2)
+        error_rows = client.get(f"{base}/imports/{job['id']}/rows", params={"status": "error"}).json()["items"]
+        errors_by_row = {row["row_number"]: row["error_codes"] for row in error_rows}
+        assert "invalid_lifecycle" in errors_by_row[2]
+        assert "invalid_locale" in errors_by_row[3]
+
+        blocked = client.post(f"{base}/imports/{job['id']}/commit", json={
+            "expected_version": job["version"], "idempotency_key": "resume-" + uuid.uuid4().hex,
+        })
+        assert blocked.status_code == 409, blocked.text
+        assert blocked.json()["detail"]["code"] == "import_rows_require_correction"
+        assert client.get(f"{base}/clients/search").json()["total"] == 0
+
+        first_fix = client.patch(f"{base}/imports/{job['id']}/rows/2", json={
+            "expected_version": 1, "values": {"lifecycle": "active"},
+        })
+        assert first_fix.status_code == 200, first_fix.text
+        assert first_fix.json()["status"] == "valid"
+        assert first_fix.json()["version"] == 2
+        stale_fix = client.patch(f"{base}/imports/{job['id']}/rows/3", json={
+            "expected_version": 1, "values": {"locale": "fr-CA"},
+        })
+        assert stale_fix.status_code == 409
+
+        second_fix = client.patch(f"{base}/imports/{job['id']}/rows/3", json={
+            "expected_version": 2, "values": {"locale": "fr-CA"},
+        })
+        assert second_fix.status_code == 200, second_fix.text
+        receipt = client.get(f"{base}/imports").json()["items"][0]
+        assert (receipt["valid_rows"], receipt["error_rows"], receipt["version"]) == (3, 0, 3)
+
+        key = "resume-" + uuid.uuid4().hex
+        committed = client.post(f"{base}/imports/{job['id']}/commit", json={
+            "expected_version": 3, "idempotency_key": key,
+        })
+        assert committed.status_code == 200, committed.text
+        assert committed.json()["committed_rows"] == 3
+        replay = client.post(f"{base}/imports/{job['id']}/commit", json={
+            "expected_version": 3, "idempotency_key": key,
+        })
+        assert replay.status_code == 200 and replay.json()["replayed"] is True
+        assert client.get(f"{base}/clients/search").json()["total"] == 3
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
 def test_import_without_consent_proof_is_not_marketing_eligible(database_url):
     issuer = "https://identity.example.invalid/import-consent"
     """AC-2: a missing consent proof never becomes opt-in, even if the file asserts it."""
@@ -109,6 +173,24 @@ def test_import_without_consent_proof_is_not_marketing_eligible(database_url):
                                json={"consent_proof": "signed form 2026-10-11", "marketing_eligible": True})
         assert patched.status_code == 200
         assert patched.json()["marketing_eligible"] is True
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_imported_consent_reference_requires_explicit_consent_action(database_url):
+    issuer = "https://identity.example.invalid/import-proof-reference"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    base = f"/v1/tenants/{tenant['tenant_id']}"
+    try:
+        preview = _preview(client, base, "proof.csv", "name,email,proof\nAda,ada@example.com,yes\n",
+                          {"name": "name", "email": "email", "consent_proof": "proof"}).json()
+        client.post(f"{base}/imports/{preview['id']}/commit", json={
+            "expected_version": preview["version"], "idempotency_key": "proof-" + uuid.uuid4().hex,
+        })
+        rows = client.get(f"{base}/imports/{preview['id']}/rows").json()["items"]
+        assert rows[0]["consent_proof"] == "yes"
+        assert rows[0]["marketing_eligible"] is False
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -157,8 +239,14 @@ def test_import_rejects_oversized_and_empty_files(database_url):
     base = f"/v1/tenants/{tenant['tenant_id']}"
     try:
         empty = _preview(client, base, "empty.csv", "\n", {"name": "name"})
-        # A file whose only line is blank has a header of one empty column and no rows;
-        # that is a preview of zero rows rather than an error.
-        assert empty.status_code in (201, 422)
+        assert empty.status_code == 422
+        assert empty.json()["detail"]["code"] == "import_header_required"
+        header_only = _preview(client, base, "header-only.csv", "name,email\n", {"name": "name"})
+        assert header_only.status_code == 422
+        assert header_only.json()["detail"]["code"] == "import_no_data_rows"
+        malformed = _preview(client, base, "malformed.csv", 'name,email\n"unclosed,ada@example.com\n',
+                             {"name": "name", "email": "email"})
+        assert malformed.status_code == 422
+        assert malformed.json()["detail"]["code"] == "import_csv_malformed"
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)

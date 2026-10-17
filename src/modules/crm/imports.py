@@ -45,13 +45,19 @@ def escape_spreadsheet_cell(value: str) -> str:
 
 def parse_csv(text_content: str) -> tuple[list[str], list[list[str]]]:
     """Read a CSV into (header, rows). Rejects a file with no header."""
-    reader = csv.reader(io.StringIO(text_content))
+    reader = csv.reader(io.StringIO(text_content), strict=True)
     try:
         header = next(reader)
+        rows = [row for row in reader if any(cell.strip() for cell in row)]
     except StopIteration:
         raise HTTPException(status_code=422, detail={"code": "import_file_empty"})
+    except csv.Error:
+        raise HTTPException(status_code=422, detail={"code": "import_csv_malformed"})
+    if not header or not any(cell.strip() for cell in header):
+        raise HTTPException(status_code=422, detail={"code": "import_header_required"})
+    if not rows:
+        raise HTTPException(status_code=422, detail={"code": "import_no_data_rows"})
     header = [escape_spreadsheet_cell(cell).strip() for cell in header]
-    rows = [row for row in reader if any(cell.strip() for cell in row)]
     if len(rows) > MAX_IMPORT_ROWS:
         raise HTTPException(status_code=422, detail={"code": "import_too_many_rows", "max": MAX_IMPORT_ROWS})
     return header, rows
@@ -68,6 +74,11 @@ class ImportCommitIn(BaseModel):
     expected_version: int = Field(ge=1)
     # A commit is idempotent on this key: re-sending the same key returns the same receipt.
     idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+class ImportRowCorrectionIn(BaseModel):
+    expected_version: int = Field(ge=1)
+    values: dict[str, object]
 
 
 class ConsentIn(BaseModel):
@@ -97,6 +108,57 @@ def _build_row(raw_cells: list[str], header: list[str], mapping: dict[str, str])
     if not normalized.get("name"):
         errors.append("name_required")
     return normalized, errors
+
+
+def _validate_import_row(normalized: dict, normalize_email: Callable[[str], str],
+                         normalize_phone: Callable[[str, str], str]) -> list[str]:
+    """Validate staged fields against the same bounds and enums as ClientIn."""
+    errors: list[str] = []
+    allowed = set(MAPPABLE_FIELDS)
+    if set(normalized) - allowed:
+        errors.append("unknown_import_field")
+    for key, maximum in (("name", 120), ("preferred_name", 120)):
+        value = normalized.get(key)
+        if key == "name" and (not isinstance(value, str) or not value.strip()):
+            errors.append("name_required")
+        elif value is not None:
+            if not isinstance(value, str):
+                errors.append(f"invalid_{key}")
+            else:
+                value = escape_spreadsheet_cell(value.strip())
+                normalized[key] = value
+                if len(value) > maximum:
+                    errors.append(f"{key}_too_long")
+                if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                    errors.append(f"invalid_{key}")
+                if key == "preferred_name" and not value:
+                    errors.append("invalid_preferred_name")
+    lifecycle = normalized.get("lifecycle")
+    if lifecycle is not None and lifecycle not in ("lead", "active", "lapsed", "archived"):
+        errors.append("invalid_lifecycle")
+    locale = normalized.get("locale")
+    if locale is not None and locale not in ("en-CA", "fr-CA"):
+        errors.append("invalid_locale")
+    if email := normalized.get("email"):
+        if not isinstance(email, str):
+            errors.append("invalid_email")
+        else:
+            try:
+                normalize_email(email)
+            except ValueError:
+                errors.append("invalid_email")
+    if phone := normalized.get("phone"):
+        if not isinstance(phone, str):
+            errors.append("invalid_phone")
+        else:
+            try:
+                normalize_phone(phone, "CA")
+            except ValueError:
+                errors.append("invalid_phone")
+    proof = normalized.get("consent_proof")
+    if proof is not None and (not isinstance(proof, str) or not proof.strip() or len(proof) > 240):
+        errors.append("invalid_consent_proof")
+    return list(dict.fromkeys(errors))
 
 
 def register_import_routes(
@@ -152,6 +214,8 @@ def register_import_routes(
                             contacts.append(("phone", normalize_phone(str(phone))))
                         except ValueError:
                             errors.append("invalid_phone")
+                    errors.extend(_validate_import_row(normalized, normalize_email, normalize_phone))
+                    errors = list(dict.fromkeys(errors))
                     if errors:
                         error_count += 1
                         status = "error"
@@ -257,6 +321,92 @@ def register_import_routes(
         finally:
             engine.dispose()
 
+    @app.patch("/v1/tenants/{tenant_id}/imports/{import_id}/rows/{row_number}", tags=["crm"])
+    def correct_import_row(tenant_id: uuid.UUID, import_id: uuid.UUID, row_number: int,
+                          payload: ImportRowCorrectionIn, request: Request,
+                          identity=Depends(require_identity)) -> dict:
+        engine = app.state.engine_factory()
+        if row_number < 1 or not payload.values or set(payload.values) - set(MAPPABLE_FIELDS):
+            raise HTTPException(status_code=422, detail={"code": "invalid_import_row_correction"})
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "clients.operational.write")
+                record = connection.execute(
+                    text("SELECT status, version FROM imports WHERE tenant_id=:tenant AND id=:id FOR UPDATE"),
+                    {"tenant": str(tenant_id), "id": str(import_id)}).mappings().one_or_none()
+                if record is None:
+                    raise HTTPException(status_code=404, detail={"code": "import_not_found"})
+                if record["status"] == "committed":
+                    raise HTTPException(status_code=409, detail={"code": "import_already_committed"})
+                if payload.expected_version != record["version"]:
+                    raise HTTPException(status_code=409, detail={"code": "import_version_conflict"})
+                row = connection.execute(
+                    text("""SELECT id, normalized FROM import_rows WHERE tenant_id=:tenant
+                            AND import_id=:import AND row_number=:row FOR UPDATE"""),
+                    {"tenant": str(tenant_id), "import": str(import_id), "row": row_number}).mappings().one_or_none()
+                if row is None:
+                    raise HTTPException(status_code=404, detail={"code": "import_row_not_found"})
+                normalized = dict(row["normalized"] or {})
+                for key, value in payload.values.items():
+                    if value is not None and not isinstance(value, str):
+                        raise HTTPException(status_code=422, detail={"code": "invalid_import_row_correction"})
+                    if value is None or not value.strip():
+                        normalized.pop(key, None)
+                    else:
+                        normalized[key] = escape_spreadsheet_cell(value.strip())
+                errors = _validate_import_row(normalized, normalize_email, normalize_phone)
+                if {"email", "phone"} & payload.values.keys():
+                    normalized.pop("duplicate_candidate", None)
+                    for kind in ("email", "phone"):
+                        value = normalized.get(kind)
+                        if not value or f"invalid_{kind}" in errors:
+                            continue
+                        try:
+                            normalized_value = (normalize_email(value) if kind == "email"
+                                                else normalize_phone(value, "CA"))
+                        except ValueError:
+                            continue
+                        found = connection.execute(
+                            text("""SELECT 1 FROM client_contacts WHERE tenant_id=:tenant
+                                    AND kind=:kind AND normalized_value=:value LIMIT 1"""),
+                            {"tenant": str(tenant_id), "kind": kind,
+                             "value": normalized_value}).scalar_one_or_none()
+                        if found is not None:
+                            normalized["duplicate_candidate"] = True
+                            break
+                status = "error" if errors else "valid"
+                updated = connection.execute(
+                    text("""UPDATE import_rows SET normalized=:normalized, error_codes=:errors, status=:status
+                            WHERE tenant_id=:tenant AND import_id=:import AND row_number=:row
+                            RETURNING row_number, normalized, error_codes, status"""),
+                    {"normalized": json.dumps(normalized), "errors": errors, "status": status,
+                     "tenant": str(tenant_id), "import": str(import_id), "row": row_number}).mappings().one()
+                counts = connection.execute(
+                    text("""SELECT count(*) AS total,
+                                   count(*) FILTER (WHERE status='valid') AS valid,
+                                   count(*) FILTER (WHERE status='error') AS errors,
+                                   count(*) FILTER (WHERE normalized ? 'duplicate_candidate') AS duplicates
+                            FROM import_rows WHERE tenant_id=:tenant AND import_id=:import"""),
+                    {"tenant": str(tenant_id), "import": str(import_id)}).mappings().one()
+                new_version = connection.execute(
+                    text("""UPDATE imports SET valid_rows=:valid, error_rows=:errors,
+                            duplicate_rows=:duplicates, version=version+1, updated_at=now()
+                            WHERE tenant_id=:tenant AND id=:id RETURNING version"""),
+                    {"valid": counts["valid"], "errors": counts["errors"],
+                     "duplicates": counts["duplicates"], "tenant": str(tenant_id),
+                     "id": str(import_id)}).scalar_one()
+                insert_audit(connection, tenant_id, identity, action="import_row.corrected",
+                             resource_type="import_row", resource_id=row["id"],
+                             reason=f"staged import row {row_number} corrected",
+                             request_id=request.state.request_id,
+                             changed_fields=["normalized", "error_codes", "status"])
+            return {**dict(updated), "version": new_version,
+                    "valid_rows": counts["valid"], "error_rows": counts["errors"],
+                    "duplicate_rows": counts["duplicates"], "total_rows": counts["total"]}
+        finally:
+            engine.dispose()
+
     @app.post("/v1/tenants/{tenant_id}/imports/{import_id}/commit", tags=["crm"])
     def commit_import(tenant_id: uuid.UUID, import_id: uuid.UUID, payload: ImportCommitIn, request: Request,
                       identity=Depends(require_identity)) -> dict:
@@ -281,6 +431,8 @@ def register_import_routes(
                     raise HTTPException(status_code=409, detail={"code": "import_already_committed"})
                 if payload.expected_version != record["version"]:
                     raise HTTPException(status_code=409, detail={"code": "import_version_conflict"})
+                if record["error_rows"]:
+                    raise HTTPException(status_code=409, detail={"code": "import_rows_require_correction"})
                 rows = connection.execute(
                     text("""SELECT row_number, normalized, consent_proof, client_id
                             FROM import_rows WHERE tenant_id=:tenant AND import_id=:import
@@ -297,7 +449,7 @@ def register_import_routes(
                         {"tenant": str(tenant_id), "id": str(client_id),
                          "name": normalized.get("name"), "preferred": normalized.get("preferred_name"),
                          "locale": normalized.get("locale", "en-CA"),
-                         "lifecycle": normalized.get("lifecycle", "active")})
+                         "lifecycle": normalized.get("lifecycle", "lead")})
                     for kind in ("email", "phone"):
                         if value := normalized.get(kind):
                             try:
@@ -311,9 +463,9 @@ def register_import_routes(
                                         VALUES (:tenant,:id,:client,:kind,:normalized,:display,'import',true)"""),
                                 {"tenant": str(tenant_id), "id": str(uuid.uuid4()), "client": str(client_id),
                                  "kind": kind, "normalized": normalized_value, "display": value})
-                    # Marketing eligibility is granted from the recorded proof alone. The
-                    # row is marked committed either way; ineligibility is not an error.
-                    eligible = bool(row["consent_proof"])
+                    # An imported proof reference is provenance, not a consent action.
+                    # Eligibility is enabled only through the explicit audited endpoint.
+                    eligible = False
                     connection.execute(
                         text("""UPDATE import_rows SET status='committed', client_id=:client,
                                 marketing_eligible=:eligible WHERE tenant_id=:tenant AND import_id=:import

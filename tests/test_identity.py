@@ -94,17 +94,27 @@ def test_staff_and_company_oidc_callbacks_create_separate_revocable_sessions(mon
     monkeypatch.setenv("STAFF_OIDC_AUTHORIZATION_ENDPOINT", "https://staff-login.example.invalid/authorize")
     monkeypatch.setenv("STAFF_OIDC_TOKEN_ENDPOINT", "https://staff-login.example.invalid/token")
     monkeypatch.setenv("STAFF_OIDC_JWKS_URL", "https://staff.example.invalid/jwks")
+    monkeypatch.setenv("STAFF_OIDC_PASSWORD_RESET_URL", "https://staff-login.example.invalid/forgot-password")
     monkeypatch.setenv("COMPANY_OIDC_ISSUER", "https://company.example.invalid")
     monkeypatch.setenv("COMPANY_OIDC_CLIENT_ID", "company-client")
     monkeypatch.setenv("COMPANY_OIDC_AUTHORIZATION_ENDPOINT", "https://company-login.example.invalid/authorize")
     monkeypatch.setenv("COMPANY_OIDC_TOKEN_ENDPOINT", "https://company-login.example.invalid/token")
     monkeypatch.setenv("COMPANY_OIDC_JWKS_URL", "https://company.example.invalid/jwks")
+    monkeypatch.setenv("COMPANY_OIDC_PASSWORD_RESET_URL", "https://company-login.example.invalid/forgot-password")
     app = create_app(engine_factory=lambda: create_engine(database_url, pool_pre_ping=True))
     client = TestClient(app, follow_redirects=False)
 
     try:
         start = client.get("/v1/auth/staff/start")
         assert start.status_code == 302
+        staff_recovery = client.get("/v1/auth/staff/password-reset")
+        assert staff_recovery.status_code == 302
+        assert staff_recovery.headers["location"] == "https://staff-login.example.invalid/forgot-password"
+        monkeypatch.setenv("STAFF_OIDC_PASSWORD_RESET_URL", "http://unsafe.example.invalid/reset")
+        assert client.get("/v1/auth/staff/password-reset").status_code == 503
+        monkeypatch.delenv("STAFF_OIDC_PASSWORD_RESET_URL")
+        assert client.get("/v1/auth/staff/password-reset").status_code == 503
+        monkeypatch.setenv("STAFF_OIDC_PASSWORD_RESET_URL", "https://staff-login.example.invalid/forgot-password")
         flow_cookie = client.cookies.get("salon_staff_oidc_flow")
         flow = _unpack_flow(flow_cookie, "staff")
         start_query = parse_qs(urlparse(start.headers["location"]).query)
@@ -123,6 +133,9 @@ def test_staff_and_company_oidc_callbacks_create_separate_revocable_sessions(mon
         company_client = TestClient(app, follow_redirects=False)
         issued.update(surface="company", amr=["pwd"])
         start_company = company_client.get("/v1/auth/company/start")
+        company_recovery = company_client.get("/v1/auth/company/password-reset")
+        assert company_recovery.status_code == 302
+        assert company_recovery.headers["location"] == "https://company-login.example.invalid/forgot-password"
         company_flow = _unpack_flow(company_client.cookies.get("salon_company_oidc_flow"), "company")
         issued["nonce"] = company_flow["nonce"]
         rejected = company_client.get("/v1/auth/company/callback", params={"code": "synthetic-code", "state": company_flow["state"]})

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import uuid
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,8 @@ from sqlalchemy.exc import DBAPIError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from modules.identity.main import AuthenticatedIdentity, create_app, require_identity
+from test_booking_holds import _bookable, _first_slot
+from test_clients import _client, _salon, _teardown
 
 
 def test_audit_rows_are_safe_tenant_scoped_immutable_and_request_correlated():
@@ -101,3 +104,68 @@ def test_audit_failure_rolls_back_the_business_mutation():
                                       {"issuer": identity.issuer, "subject": identity.subject}).scalar_one() == 0
     finally:
         engine.dispose()
+
+
+def test_public_hold_confirmation_is_audited_and_free_text_stays_out_of_audit():
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        pytest.skip("set DATABASE_URL to run PostgreSQL audit integration")
+    issuer = "https://identity.example.invalid/audit-public-hold"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    marker = "SYNTHETIC_PRIVATE_AUDIT_MARKER"
+    try:
+        base, slug, service, staff, client_id = _bookable(client, database_url, tenant)
+        created_staff = client.post(f"{base}/staff", json={"display_name": marker})
+        assert created_staff.status_code == 201, created_staff.text
+
+        day = date.today() + timedelta(days=1)
+        starts_at = _first_slot(client, slug, service, day)
+        hold = client.post(f"/v1/public/salons/{slug}/holds", json={
+            "service_id": service, "staff_id": staff, "starts_at": starts_at,
+            "idempotency_key": "audit-hold-" + uuid.uuid4().hex,
+        })
+        assert hold.status_code == 201, hold.text
+
+        request_id = str(uuid.uuid4())
+        confirmed = client.post(
+            f"/v1/public/salons/{slug}/holds/{hold.json()['hold_id']}/confirm",
+            json={"owner_token": hold.json()["owner_token"],
+                  "client_name": "Synthetic Audit Booker", "email": "audit@example.invalid",
+                  "policy_accepted": True, "policy_version": 1,
+                  "idempotency_key": "audit-confirm-" + uuid.uuid4().hex},
+            headers={"X-Request-ID": request_id},
+        )
+        assert confirmed.status_code == 200, confirmed.text
+        appointment_id = confirmed.json()["appointment_id"]
+        assert confirmed.headers["X-Request-ID"] == request_id
+
+        cancelled = client.post(
+            f"{base}/appointments/{appointment_id}/cancel",
+            json={"expected_version": 1, "reason": marker,
+                  "idempotency_key": "audit-cancel-" + uuid.uuid4().hex},
+        )
+        assert cancelled.status_code == 200, cancelled.text
+
+        events = client.get(f"{base}/audit")
+        assert events.status_code == 200, events.text
+        rows = events.json()["items"]
+        confirmation = next(row for row in rows
+                            if row["action"] == "appointment.created"
+                            and row["resource_id"] == appointment_id)
+        cancellation = next(row for row in rows
+                            if row["action"] == "appointment.cancelled"
+                            and row["resource_id"] == appointment_id)
+        staff_event = next(row for row in rows
+                           if row["action"] == "staff.created"
+                           and row["resource_id"] == created_staff.json()["id"])
+
+        assert confirmation["actor_issuer"] == "public"
+        assert confirmation["actor_subject"] == "public_booking"
+        assert confirmation["request_id"] == request_id
+        assert confirmation["reason"] == "appointment created"
+        assert cancellation["reason"] == "appointment cancelled"
+        assert staff_event["reason"] == "staff profile created"
+        assert marker not in str(rows)
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)

@@ -22,7 +22,9 @@ Origin: extracted from the `salon` workspace monorepo at `cabbad2`
 
 ```bash
 python -m venv .venv
-.venv/Scripts/python -m pip install -e ".[test]"
+.venv/Scripts/python -m pip install --constraint constraints.txt -e ".[test]"
+.venv/Scripts/python -m pip check
+.venv/Scripts/python scripts/check_dependency_lock.py
 docker compose up -d
 set "DATABASE_URL=postgresql+psycopg://salon_app:local-dev-only@127.0.0.1:5433/salon"
 .venv/Scripts/python -m pytest -q tests
@@ -35,3 +37,7 @@ set "DATABASE_URL=postgresql+psycopg://salon_app:local-dev-only@127.0.0.1:5433/s
 - Mutations are idempotent; outbox rows are the integration seam for the worker.
 - Facts are labelled: recorded salon receipts ≠ booked value ≠ SaaS revenue.
 - No contact or message content in telemetry; synthetic fixtures only.
+
+## Reproducible dependencies
+
+constraints.txt pins the complete tested Python runtime/test graph. Docker wheel resolution and CI use it; unused test packages are excluded from the runtime image. The installed-package checker rejects unlisted distributions or version drift, and pip check verifies declared compatibility. Use a project-only virtual environment. To change dependencies, update the constraints deliberately, verify compatibility, then rebuild and inspect Docker; do not bypass the checker. Python and Node base manifests are digest-pinned; reviewed security updates require refreshing those digests and repeating checks. Installer pip and build-system setuptools remain separately pinned. Exact version constraints and image digests do not constitute an OS or application security audit.

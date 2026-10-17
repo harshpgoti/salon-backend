@@ -1,6 +1,6 @@
 # TASK-054 / FR-081 — PostgreSQL 17 module (SKELETON ONLY — never applied).
 #
-# DQ-003: no cloud spend or provisioning until G-INFRA-APPROVAL passes.
+# D-016: owner selected ca-central-1; no cloud spend or provisioning until G-INFRA-APPROVAL passes.
 # This module declares intent only; no `terraform apply` has run and no
 # resource exists. See .loop-engineer/DEPLOYMENT_PLAN.md "Resource ledger".
 #
@@ -12,15 +12,15 @@
 # receives only per-table GRANTs declared in each migration. Do NOT rely on
 # security groups or subnet placement as a tenancy boundary.
 #
-# COST-PLAN COMMENT BLOCK (DQ-003 — no ceiling set, no spend approved):
+# COST-PLAN COMMENT BLOCK (owner accepts open-ended spend in principle; no apply is approved yet):
 #   - Engine: PostgreSQL 17 on Amazon RDS, Multi-AZ (commercial topology).
 #   - Persistent cost drivers to quote before G-INFRA-APPROVAL: Multi-AZ DB
 #     instance hours + storage, PITR backup retention (target 35 days),
 #     ALB + NAT/egress, ECS Fargate tasks (web/API/worker x2 AZ), SQS/DLQ,
 #     S3 + KMS, CloudWatch logs/traces, Secrets Manager, SES/SMS/WhatsApp
 #     provider volume, support tier. Quote at 5/50/250/1000 salons.
-#   - Alerts at 70/90/100% of the owner-set monthly ceiling (ceiling TBD by
-#     owner — this skeleton sets no ceiling and approves no spend).
+#   - Alerts at 70/90/100% of the reviewed monthly estimate. No fixed cap is
+#     set; the alerts inform and do not block or authorize changes.
 #   - Per-tenant message budgets reserve cost before send (backend budgets
 #     module); over-ceiling sends fail visibly instead of spending.
 
@@ -30,7 +30,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "5.69.0"
+      version = "6.68.0"
     }
   }
 }
@@ -43,7 +43,7 @@ variable "environment" {
 }
 
 variable "region" {
-  description = "Proposed AWS region (ca-central-1 pending owner decision, DQ-003)."
+  description = "Owner-selected AWS region; currently ca-central-1 (D-016)."
   type        = string
   default     = "ca-central-1"
 }
@@ -74,25 +74,25 @@ variable "production_sends_off" {
 
 # SKELETON: resource declared for plan-shape review only. NOT APPLIED.
 resource "aws_db_instance" "salon_postgres17" {
-  identifier             = "salon-${var.environment}-postgres17"
-  engine                 = "postgres"
-  engine_version         = "17"
-  instance_class         = var.instance_class
-  allocated_storage      = var.allocated_storage_gb
-  storage_encrypted      = true
-  multi_az               = true
-  publicly_accessible    = false
+  identifier              = "salon-${var.environment}-postgres17"
+  engine                  = "postgres"
+  engine_version          = "17"
+  instance_class          = var.instance_class
+  allocated_storage       = var.allocated_storage_gb
+  storage_encrypted       = true
+  multi_az                = true
+  publicly_accessible     = false
   backup_retention_period = var.backup_retention_days
-  deletion_protection    = true
+  deletion_protection     = true
   # Credentials are NEVER in files: injected via Secrets Manager at deploy.
   # username = <from secrets> / password = <from secrets> — placeholders only.
   skip_final_snapshot = false
 
   tags = {
-    Environment          = var.environment
-    Product              = "salon-operations-cloud"
-    ProductionSendsOff   = tostring(var.production_sends_off)
-    ManagedBy            = "terraform-skeleton-unapplied"
+    Environment        = var.environment
+    Product            = "salon-operations-cloud"
+    ProductionSendsOff = tostring(var.production_sends_off)
+    ManagedBy          = "terraform-skeleton-unapplied"
   }
 }
 

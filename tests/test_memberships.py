@@ -687,7 +687,8 @@ def test_deactivation_withdraws_pending_access_aimed_at_that_person(salon):
     withdrawn = [event for event in audit if event["action"] == "ownership.transfer_withdrawn"]
     assert len(withdrawn) == 1, [event["resource_id"] for event in withdrawn]
     assert withdrawn[0]["resource_id"] == transfer_id
-    assert "no longer with the salon" in withdrawn[0]["reason"]
+    assert withdrawn[0]["reason"] == "business change recorded"
+    assert "no longer with the salon" not in withdrawn[0]["reason"]
     deactivated = next(event for event in audit if event["action"] == "membership.deactivated")
     assert "withdrawn_pending_access" in deactivated["changed_fields"]
 
@@ -845,4 +846,4 @@ def test_role_patch_reports_stored_locations_and_rejects_blank_reason(salon):
     assert owner.request("DELETE", f"/v1/tenants/{tenant_id}/memberships/{member_id}",
                          json={"reason": "moved to another salon"}).status_code == 204
     audit = owner.get(f"/v1/tenants/{tenant_id}/audit").json()["items"]
-    assert next(e for e in audit if e["action"] == "membership.deactivated")["reason"] == "moved to another salon"
+    assert next(e for e in audit if e["action"] == "membership.deactivated")["reason"] == "membership deactivated by owner"

@@ -24,8 +24,14 @@ message was recorded — the unsubscribe/STOP race — moves that message to
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+import hashlib
+import os
+import secrets
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote, urlsplit
 
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 
 __all__ = [
@@ -34,6 +40,9 @@ __all__ = [
     "normalize_contact_value",
     "record_consent",
     "record_suppression",
+    "issue_email_unsubscribe_url",
+    "lock_contact_channel",
+    "register_consent_routes",
 ]
 
 CHANNELS = ("email", "sms", "whatsapp")
@@ -55,6 +64,12 @@ class SuppressionModuleError(Exception):
     """Base exception for suppression operations."""
 
 
+class PublicUnsubscribeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=32, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+
 def normalize_contact_value(value: str) -> str:
     """Display-level normalization for suppression keys.
 
@@ -63,6 +78,16 @@ def normalize_contact_value(value: str) -> str:
     same function is applied on record and on check, so both sides agree.
     """
     return value.strip().lower()
+
+
+def lock_contact_channel(connection, *, tenant_id: str, contact_value: str, channel: str) -> None:
+    """Serialize grants, opt-outs and provider authorization for one destination."""
+    value = normalize_contact_value(contact_value)
+    lock_key = f"{tenant_id}:{channel}:{value}"
+    connection.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": lock_key},
+    )
 
 
 def record_consent(
@@ -95,16 +120,40 @@ def record_consent(
         raise ConsentModuleError(
             f"source {source!r} cannot grant marketing consent; "
             "booking and import never opt a client in silently (AC-1)")
+    contact = connection.execute(
+        text("""SELECT kind, lower(btrim(normalized_value)) AS contact_value
+                FROM client_contacts
+                WHERE tenant_id=:tenant AND client_id=:client AND id=:contact
+                FOR SHARE"""),
+        {"tenant": tenant_id, "client": client_id, "contact": contact_id},
+    ).mappings().one_or_none()
+    expected_kind = "email" if channel == "email" else "phone"
+    if contact is None or contact["kind"] != expected_kind:
+        raise ConsentModuleError("contact does not belong to this client and channel")
+    lock_contact_channel(connection, tenant_id=tenant_id,
+                         contact_value=contact["contact_value"], channel=channel)
+    event_sequence = connection.execute(
+        text("""SELECT COALESCE(MAX(event_sequence), 0) + 1 FROM consents
+                WHERE tenant_id=:tenant AND client_id=:client AND contact_id=:contact
+                  AND channel=:channel AND purpose=:purpose"""),
+        {"tenant": tenant_id, "client": client_id, "contact": contact_id,
+         "channel": channel, "purpose": purpose},
+    ).scalar_one()
     row = connection.execute(
         text("""INSERT INTO consents
-                (tenant_id, id, client_id, contact_id, channel, purpose,
+                (tenant_id, id, client_id, contact_id, contact_value_snapshot, channel, purpose,
+                 event_sequence,
                  source, wording_version, status, proof_reference,
-                 expires_at, lawful_basis_review)
-                VALUES (:tenant, :id, :client, :contact, :channel, :purpose,
-                        :source, :wording, :status, :proof, :expires, :review)
+                 expires_at, lawful_basis_review, revoked_at)
+                VALUES (:tenant, :id, :client, :contact, :contact_value, :channel, :purpose,
+                        :event_sequence,
+                        :source, :wording, :status, :proof, :expires, :review,
+                        CASE WHEN :status='revoked' THEN now() ELSE NULL END)
                 RETURNING id, status, granted_at"""),
         {"tenant": tenant_id, "id": str(uuid.uuid4()), "client": client_id,
-         "contact": contact_id, "channel": channel, "purpose": purpose,
+         "contact": contact_id, "contact_value": contact["contact_value"],
+         "channel": channel, "purpose": purpose,
+         "event_sequence": event_sequence,
          "source": source, "wording": wording_version, "status": status,
          "proof": proof_reference,
          "expires": expires_at.isoformat() if expires_at else None,
@@ -136,6 +185,8 @@ def record_suppression(
     if reason not in SUPPRESSION_REASONS:
         raise SuppressionModuleError(f"unknown reason {reason!r}")
     value = normalize_contact_value(contact_value)
+    lock_contact_channel(connection, tenant_id=tenant_id,
+                         contact_value=value, channel=channel)
     row = connection.execute(
         text("""INSERT INTO suppressions
                 (tenant_id, id, client_id, contact_value, channel, reason, source)
@@ -154,6 +205,8 @@ def record_suppression(
 def check_suppressed(connection, *, tenant_id: str, contact_value: str, channel: str) -> bool:
     """Return True when this contact value may not be sent on this channel."""
     value = normalize_contact_value(contact_value)
+    lock_contact_channel(connection, tenant_id=tenant_id,
+                         contact_value=value, channel=channel)
     found = connection.execute(
         text("""SELECT 1 FROM suppressions
                 WHERE tenant_id=:tenant AND contact_value=:value AND channel=:channel"""),
@@ -164,6 +217,7 @@ def check_suppressed(connection, *, tenant_id: str, contact_value: str, channel:
 
 def check_consented(
     connection, *, tenant_id: str, client_id: str, channel: str, purpose: str,
+    contact_id: str | None = None, contact_value: str | None = None,
     now: datetime | None = None,
 ) -> bool:
     """Return True when a send of this purpose is currently authorized.
@@ -176,13 +230,37 @@ def check_consented(
     """
     if purpose not in CONSENT_GATED_PURPOSES:
         return True
+    expected_kind = "email" if channel == "email" else "phone"
+    if contact_value is None:
+        current_contact = connection.execute(
+            text("""SELECT id::text AS id, normalized_value
+                    FROM client_contacts
+                    WHERE tenant_id=:tenant AND client_id=:client AND kind=:kind
+                    ORDER BY is_primary DESC, created_at LIMIT 1"""),
+            {"tenant": tenant_id, "client": client_id, "kind": expected_kind},
+        ).mappings().one_or_none()
+        if current_contact is None:
+            return False
+        contact_id = contact_id or current_contact["id"]
+        contact_value = current_contact["normalized_value"]
+    value = normalize_contact_value(contact_value)
+    lock_contact_channel(connection, tenant_id=tenant_id,
+                         contact_value=value, channel=channel)
     row = connection.execute(
-        text("""SELECT status, expires_at FROM consents
-                WHERE tenant_id=:tenant AND client_id=:client
-                  AND channel=:channel AND purpose=:purpose
-                ORDER BY granted_at DESC, ctid DESC LIMIT 1"""),
-        {"tenant": tenant_id, "client": client_id,
-         "channel": channel, "purpose": MARKETING_PURPOSE},
+        text("""SELECT c.status, c.expires_at FROM consents c
+                JOIN client_contacts cc
+                  ON cc.tenant_id=c.tenant_id AND cc.client_id=c.client_id
+                 AND cc.id=c.contact_id AND cc.kind=:kind
+                WHERE c.tenant_id=:tenant AND c.client_id=:client
+                  AND c.channel=:channel AND c.purpose=:purpose
+                  AND (CAST(:contact_id AS uuid) IS NULL
+                       OR c.contact_id=CAST(:contact_id AS uuid))
+                  AND lower(btrim(cc.normalized_value))=:contact_value
+                  AND c.contact_value_snapshot=:contact_value
+                ORDER BY c.event_sequence DESC LIMIT 1"""),
+        {"tenant": tenant_id, "client": client_id, "channel": channel,
+         "purpose": MARKETING_PURPOSE, "contact_id": contact_id,
+         "contact_value": value, "kind": expected_kind},
     ).mappings().one_or_none()
     if row is None or row["status"] != "granted":
         return False
@@ -194,3 +272,55 @@ def check_consented(
         if expires <= moment:
             return False
     return True
+
+
+def issue_email_unsubscribe_url(
+    connection, *, tenant_id: str, client_id: str, contact_value: str,
+    base_url: str | None = None, now: datetime | None = None,
+) -> str:
+    """Create a one-year email opt-out capability; persist only its SHA-256 hash."""
+    base = (base_url if base_url is not None else os.getenv("WEB_BASE_URL", "")).strip().rstrip("/")
+    parsed = urlsplit(base)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+        raise ConsentModuleError("a public WEB_BASE_URL is required for email delivery")
+    value = normalize_contact_value(contact_value)
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+    moment = now or datetime.now(timezone.utc)
+    connection.execute(text("""DELETE FROM email_unsubscribe_capabilities
+        WHERE ctid IN (SELECT ctid FROM email_unsubscribe_capabilities
+                       WHERE tenant_id=:tenant AND expires_at<=:now
+                       ORDER BY expires_at LIMIT 100)"""),
+        {"tenant": tenant_id, "now": moment})
+    connection.execute(text("""INSERT INTO email_unsubscribe_capabilities
+        (tenant_id, token_hash, client_id, contact_value, channel, expires_at)
+        VALUES (:tenant, :hash, :client, :value, 'email', :expires)"""),
+        {"tenant": tenant_id, "hash": token_hash, "client": client_id,
+         "value": value, "expires": moment + timedelta(days=365)})
+    # Keep the bearer secret out of HTTP request/referrer logs; the page reads
+    # the fragment and POSTs it once the client chooses to unsubscribe.
+    return f"{base}/unsubscribe#token={quote(token, safe='')}"
+
+
+def register_consent_routes(app: FastAPI) -> None:
+    """Register the public, identity-free email unsubscribe capability endpoint."""
+
+    @app.post("/v1/public/communications/unsubscribe", status_code=204, tags=["communications"])
+    def public_unsubscribe(payload: PublicUnsubscribeRequest) -> Response:
+        token_hash = hashlib.sha256(payload.token.encode("ascii")).hexdigest()
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                applied = connection.execute(
+                    text("SELECT public.apply_email_unsubscribe(:token_hash)"),
+                    {"token_hash": token_hash},
+                ).scalar_one()
+            if not applied:
+                raise HTTPException(status_code=404,
+                                    detail={"code": "unsubscribe_link_invalid_or_expired"})
+            return Response(status_code=204, headers={
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+            })
+        finally:
+            engine.dispose()

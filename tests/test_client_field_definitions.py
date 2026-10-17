@@ -1,6 +1,8 @@
 """Tests for client field definitions and values (TASK-011, FR-017)."""
 
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 import pytest
 import uuid
 from test_clients import _salon, _client, _teardown
@@ -72,8 +74,8 @@ def test_field_definition_crud_and_validation(database_url):
             "key": "bad_enum", "label": "Bad Enum", "type": "enum",
             "validation": {}, "purpose": "test", "sensitivity": "standard"
         })
-        # Should succeed at definition level; validation happens at value write
-        assert resp.status_code == 201
+        # Enum definitions without a usable schema are rejected before values can be written.
+        assert resp.status_code == 422
     finally:
         _teardown(engine, [tenant["tenant_id"]], "https://identity.example.invalid/fdef-1")
 
@@ -145,9 +147,15 @@ def test_field_value_validation_and_sensitivity(database_url):
         # Update field value
         val_id = next(i["id"] for i in items if i["key"] == "public_text")
         resp = client.patch(f"{base}/clients/{client_id}/field-values/{val_id}",
-                            json={"value_text": "Updated"})
+                            json={"value_text": "Updated", "expected_version": next(i["version"] for i in items if i["id"] == val_id)})
         assert resp.status_code == 200
         assert resp.json()["value_text"] == "Updated"
+
+        incompatible_schema = client.patch(f"{base}/field-definitions/{def_ids['private_number']}", json={
+            "validation": {"min": 0, "max": 10}, "expected_version": 1,
+        })
+        assert incompatible_schema.status_code == 409
+        assert incompatible_schema.json()["detail"]["code"] == "field_definition_in_use"
     finally:
         _teardown(engine, [tenant["tenant_id"]], "https://identity.example.invalid/fval-1")
 
@@ -174,6 +182,17 @@ def test_field_value_entity_mismatch(database_url):
         })
         assert resp.status_code == 422
         assert resp.json()["detail"]["code"] == "entity_id_mismatch"
+
+        value = client.post(f"{base}/clients/{client_id_b}/field-values", json={
+            "definition_id": def_id, "entity_type": "client", "entity_id": client_id_b, "value_text": "belongs to B",
+        })
+        assert value.status_code == 201, value.text
+        cross_client_patch = client.patch(f"{base}/clients/{client_id_a}/field-values/{value.json()['id']}", json={
+            "value_text": "tampered", "expected_version": 1,
+        })
+        assert cross_client_patch.status_code == 404
+        stored = client.get(f"{base}/clients/{client_id_b}/field-values").json()["items"]
+        assert stored[0]["value_text"] == "belongs to B"
     finally:
         _teardown(engine, [tenant["tenant_id"]], "https://identity.example.invalid/fval-2")
 
@@ -205,3 +224,86 @@ def test_list_endpoints_return_pagination_envelope(database_url):
         assert client.get(f"{base}/field-definitions?offset=-1").status_code == 422
     finally:
         _teardown(engine, [tenant["tenant_id"]], "https://identity.example.invalid/fpage-1")
+
+
+def test_custom_definition_schema_and_sensitive_authorization(database_url):
+    """AC-2: malformed validation schemas and unauthorized restricted fields fail closed."""
+    from fastapi.testclient import TestClient
+    from modules.identity.main import AuthenticatedIdentity, create_app, require_identity
+
+    issuer = "https://identity.example.invalid/fdef-policy"
+    engine, owner, tenant = _salon(database_url, issuer)
+    owner_client = _client(database_url, owner)
+    manager = AuthenticatedIdentity(issuer, str(uuid.uuid4()))
+    base = f"/v1/tenants/{tenant['tenant_id']}"
+    try:
+        invalid = owner_client.post(f"{base}/field-definitions", json={
+            "key": "invalid_number", "label": "Invalid", "type": "number",
+            "validation": {"min": "not a number"}, "purpose": "synthetic test",
+        })
+        assert invalid.status_code == 422, invalid.text
+
+        with engine.begin() as connection:
+            connection.execute(text("SELECT set_config('app.tenant_id', :tenant, true)"),
+                               {"tenant": tenant["tenant_id"]})
+            user_id = connection.execute(
+                text("INSERT INTO identity_users (issuer,subject) VALUES (:issuer,:subject) RETURNING id"),
+                {"issuer": issuer, "subject": manager.subject}).scalar_one()
+            connection.execute(text("INSERT INTO memberships (tenant_id,user_id,role) VALUES (:tenant,:user,'manager')"),
+                               {"tenant": tenant["tenant_id"], "user": str(user_id)})
+            connection.execute(text("INSERT INTO membership_locations (tenant_id,user_id,location_id) VALUES (:tenant,:user,:location)"),
+                               {"tenant": tenant["tenant_id"], "user": str(user_id), "location": tenant["location_id"]})
+        manager_app = create_app(engine_factory=lambda: create_engine(database_url, pool_pre_ping=True))
+        manager_app.dependency_overrides[require_identity] = lambda: manager
+        manager_client = TestClient(manager_app)
+        restricted = manager_client.post(f"{base}/field-definitions", json={
+            "key": "restricted_formula", "label": "Restricted", "type": "text",
+            "validation": {}, "purpose": "synthetic test", "sensitivity": "restricted",
+        })
+        assert restricted.status_code == 403, restricted.text
+        private = manager_client.post(f"{base}/field-definitions", json={
+            "key": "private_formula", "label": "Private", "type": "text",
+            "validation": {"max_length": 80}, "purpose": "synthetic test", "sensitivity": "private",
+        })
+        assert private.status_code == 201, private.text
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_field_creation_serializes_with_schema_update(database_url):
+    """A value validates against the definition version it writes under."""
+    engine, owner, tenant = _salon(database_url, "https://identity.example.invalid/fdef-race")
+    client = _client(database_url, owner)
+    base = f"/v1/tenants/{tenant['tenant_id']}"
+    try:
+        definition = client.post(f"{base}/field-definitions", json={
+            "key": "bounded_number", "label": "Bounded", "type": "number",
+            "validation": {"min": 0, "max": 100}, "purpose": "synthetic race test",
+        })
+        assert definition.status_code == 201, definition.text
+        client_row = client.post(f"{base}/clients", json={"name": "Schema Race"})
+        assert client_row.status_code == 201
+        client_id = client_row.json()["id"]
+
+        with engine.connect() as connection:
+            transaction = connection.begin()
+            connection.execute(text("SELECT set_config('app.tenant_id', :tenant, true)"),
+                               {"tenant": tenant["tenant_id"]})
+            connection.execute(text("SELECT id FROM client_field_definitions WHERE tenant_id=:tenant AND id=:id FOR UPDATE"),
+                               {"tenant": tenant["tenant_id"], "id": definition.json()["id"]})
+            connection.execute(text("""UPDATE client_field_definitions SET validation=jsonb_build_object('min',0,'max',10)
+                                      WHERE tenant_id=:tenant AND id=:id"""),
+                               {"tenant": tenant["tenant_id"], "id": definition.json()["id"]})
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pending = executor.submit(client.post, f"{base}/clients/{client_id}/field-values", json={
+                    "definition_id": definition.json()["id"], "entity_id": client_id, "value_number": 42,
+                })
+                time.sleep(0.25)
+                blocked_by_schema_lock = not pending.done()
+                transaction.commit()
+                response = pending.result(timeout=10)
+        assert blocked_by_schema_lock, "field value creation must wait for a concurrent schema update"
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"]["code"] == "field_value_above_max"
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], "https://identity.example.invalid/fdef-race")

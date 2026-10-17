@@ -24,12 +24,15 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+
+from salon_platform.local_time import clock_minutes, local_instant as _local_instant
+from modules.catalogue.scheduling_policy import plan_processing_phases, required_resource_units
 
 # Proposed booking policy defaults (FR-027/FR-029). They are stored per tenant policy later;
 # until a policy editor exists these are the documented defaults, not invented behaviour.
@@ -43,16 +46,6 @@ class AvailabilityQuery(BaseModel):
     date_from: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     date_to: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     staff_id: uuid.UUID | None = None
-
-
-def _local_instant(day: date, minutes: int, zone: ZoneInfo) -> datetime | None:
-    """Localize a wall-clock minute-of-day, returning None across a DST gap."""
-    hour, minute = divmod(minutes, 60)
-    naive = datetime.combine(day, time(hour=hour, minute=minute))
-    try:
-        return naive.replace(tzinfo=zone, fold=0)
-    except (ValueError, OverflowError):
-        return None
 
 
 def resolve_public_location(connection, booking_slug: str) -> dict:
@@ -91,18 +84,34 @@ def register_availability_routes(
     def compute_slots(connection, tenant_id: str, location, service, staff_id, day_from, day_to):
         zone = ZoneInfo(location["timezone"])
         now = datetime.now(tz=zone)
-        earliest = now + timedelta(minutes=DEFAULT_MIN_NOTICE_MINUTES)
-        latest = now + timedelta(days=DEFAULT_HORIZON_DAYS)
+        earliest = now.astimezone(timezone.utc) + timedelta(minutes=DEFAULT_MIN_NOTICE_MINUTES)
+        latest = (now + timedelta(days=DEFAULT_HORIZON_DAYS)).astimezone(timezone.utc)
+
+        # A required resource is conjunctive (all quantity-one requirements are needed).
+        # Misconfigured or inactive resources fail closed and are never named publicly.
+        if service["requires_resource"]:
+            resource_state = connection.execute(
+                text("""SELECT count(*) AS required_count,
+                               count(*) FILTER (WHERE r.active) AS active_count
+                        FROM service_resource_requirements q
+                        LEFT JOIN bookable_resources r
+                          ON r.tenant_id=q.tenant_id AND r.id=q.resource_id
+                         AND r.location_id=q.location_id
+                        WHERE q.tenant_id=:tenant AND q.service_id=:service
+                          AND q.location_id=:location"""),
+                {"tenant": tenant_id, "service": service["id"],
+                 "location": location["id"]}).mappings().one()
+            if resource_state["required_count"] == 0 or resource_state["active_count"] != resource_state["required_count"]:
+                return []
 
         # Staff who may perform this service at this location.
         candidates = connection.execute(
-            text("""SELECT s.id::text AS id, s.display_name FROM staff_profiles s
+            text("""SELECT s.id::text AS id, s.display_name, s.deactivated_on FROM staff_profiles s
                     JOIN staff_service_qualifications q
                       ON q.tenant_id=s.tenant_id AND q.staff_id=s.id AND q.service_id=:service
                     JOIN staff_locations sl
                       ON sl.tenant_id=s.tenant_id AND sl.staff_id=s.id AND sl.location_id=:location
                     WHERE s.tenant_id=:tenant AND s.is_bookable
-                      AND (s.deactivated_on IS NULL OR s.deactivated_on > CURRENT_DATE)
                       AND (CAST(:staff AS uuid) IS NULL OR s.id = CAST(:staff AS uuid))
                     ORDER BY s.display_name"""),
             {"tenant": tenant_id, "service": service["id"], "location": location["id"],
@@ -112,15 +121,15 @@ def register_availability_routes(
 
         weekly = connection.execute(
             text("""SELECT weekday, to_char(opens_at,'HH24:MI') AS opens_at,
-                           to_char(closes_at,'HH24:MI') AS closes_at
+                           to_char(closes_at,'HH24:MI') AS closes_at, effective_from, effective_to
                     FROM location_hours WHERE tenant_id=:tenant AND location_id=:location
-                      AND superseded_at IS NULL"""),
-            {"tenant": tenant_id, "location": location["id"]}).mappings().all()
-        hours_by_day: dict[int, list[tuple[int, int]]] = {}
+                      AND superseded_at IS NULL AND effective_from<=:to_date
+                      AND (effective_to IS NULL OR effective_to>=:from_date)"""),
+            {"tenant": tenant_id, "location": location["id"],
+             "from_date": day_from, "to_date": day_to}).mappings().all()
+        hours_by_day: dict[int, list[dict]] = {}
         for row in weekly:
-            opens = _minutes(row["opens_at"])
-            closes = _minutes(row["closes_at"])
-            hours_by_day.setdefault(row["weekday"], []).append((opens, closes))
+            hours_by_day.setdefault(row["weekday"], []).append(dict(row))
 
         exceptions = {}
         for row in connection.execute(
@@ -136,9 +145,11 @@ def register_availability_routes(
         duration = service["duration_minutes"]
         pre = service["pre_buffer_minutes"]
         post = service["post_buffer_minutes"]
-        total = duration + pre + post
-
+        has_processing_phases = connection.execute(
+            text("SELECT EXISTS (SELECT 1 FROM service_processing_phases WHERE tenant_id=:tenant AND service_id=:service)"),
+            {"tenant": tenant_id, "service": service["id"]}).scalar_one()
         slots = []
+        seen = set()
         day = day_from
         while day <= day_to:
             # A published closure or custom-hours exception overrides the weekly pattern.
@@ -149,17 +160,63 @@ def register_availability_routes(
                     continue
                 windows = [(_minutes(exception["opens_at"]), _minutes(exception["closes_at"]))]
             else:
-                windows = hours_by_day.get(day.weekday(), [])
+                windows = [(_minutes(row["opens_at"]), _minutes(row["closes_at"]))
+                           for row in hours_by_day.get(day.weekday(), [])
+                           if row["effective_from"] <= day
+                           and (row["effective_to"] is None or row["effective_to"] >= day)]
+
+            if has_processing_phases:
+                for window_start, window_end in windows:
+                    last_start = window_end - duration - post
+                    for service_start in range(window_start + pre, last_start + 1, SLOT_STEP_MINUTES):
+                        starts_at = _local_instant(day, service_start, zone)
+                        if starts_at is None:
+                            continue
+                        start_utc = starts_at.astimezone(timezone.utc)
+                        end_utc = start_utc + timedelta(minutes=duration)
+                        occupied_from, occupied_to = start_utc - timedelta(minutes=pre), end_utc + timedelta(minutes=post)
+                        if occupied_from < earliest or start_utc > latest or end_utc.astimezone(zone).date() != day:
+                            continue
+                        for preferred in candidates:
+                            if preferred["deactivated_on"] is not None and preferred["deactivated_on"] <= day:
+                                continue
+                            try:
+                                plan_processing_phases(
+                                    connection, tenant_id=tenant_id, service_id=service["id"],
+                                    location_id=location["id"], starts_at=start_utc,
+                                    preferred_staff_id=preferred["id"], service_duration=duration,
+                                    pre_buffer_minutes=pre, post_buffer_minutes=post)
+                                required_resource_units(
+                                    connection, tenant_id=tenant_id, service_id=service["id"],
+                                    location_id=location["id"],
+                                    service_requires_resource=bool(service["requires_resource"]),
+                                    occupied_from=occupied_from, occupied_to=occupied_to)
+                            except HTTPException:
+                                continue
+                            key = (preferred["id"], start_utc)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            slots.append({"starts_at": starts_at.isoformat(), "ends_at": end_utc.astimezone(zone).isoformat(),
+                                "staff_id": preferred["id"], "staff_name": preferred["display_name"],
+                                "local_date": day.isoformat(),
+                                "local_time": f"{service_start // 60:02d}:{service_start % 60:02d}",
+                                "timezone": location["timezone"]})
+                day += timedelta(days=1)
+                continue
 
             for staff in candidates:
+                if staff["deactivated_on"] is not None and staff["deactivated_on"] <= day:
+                    continue
                 shifts = connection.execute(
                     text("""SELECT to_char(starts_at,'HH24:MI') AS starts_at,
                                    to_char(ends_at,'HH24:MI') AS ends_at, breaks, effective_from, effective_to
                             FROM staff_shifts WHERE tenant_id=:tenant AND staff_id=:staff
+                              AND location_id=:location
                               AND weekday=:weekday
                               AND effective_from <= :day
                               AND (effective_to IS NULL OR effective_to >= :day)"""),
-                    {"tenant": tenant_id, "staff": staff["id"], "weekday": day.weekday(),
+                    {"tenant": tenant_id, "staff": staff["id"], "location": location["id"], "weekday": day.weekday(),
                      "day": day}).mappings().all()
                 on_leave = connection.execute(
                     text("""SELECT 1 FROM staff_leave WHERE tenant_id=:tenant AND staff_id=:staff
@@ -172,23 +229,45 @@ def register_availability_routes(
                     for shift in shifts:
                         shift_start = max(window_start, _minutes(shift["starts_at"]))
                         shift_end = min(window_end, _minutes(shift["ends_at"]))
-                        occupied = [(_minutes(b["start"]), _minutes(b["end"]))
-                                    for b in (shift["breaks"] or [])]
-                        for minute in range(shift_start, shift_end - total + 1, SLOT_STEP_MINUTES):
-                            # The whole busy block, buffers included, must fit the shift and
-                            # must not cross a break.
-                            block_start, block_end = minute, minute + total
-                            service_start, service_end = minute + pre, minute + pre + duration
-                            if any(block_start < b_end and b_start < block_end for b_start, b_end in occupied):
-                                continue
+                        opens = _local_instant(day, shift_start, zone)
+                        closes = _local_instant(day, shift_end, zone)
+                        if opens is None or closes is None:
+                            continue
+                        opens, closes = opens.astimezone(timezone.utc), closes.astimezone(timezone.utc)
+                        # A boundary in a DST gap cannot describe a safe working interval.
+                        occupied = []
+                        invalid_break = False
+                        for interval in shift["breaks"] or []:
+                            try:
+                                begins = _local_instant(day, clock_minutes(interval["start"]), zone)
+                                ends = _local_instant(
+                                    day, clock_minutes(interval["end"], allow_end_of_day=True), zone)
+                            except ValueError:
+                                begins = ends = None
+                            if begins is None or ends is None:
+                                invalid_break = True
+                                break
+                            occupied.append((begins.astimezone(timezone.utc), ends.astimezone(timezone.utc)))
+                        if invalid_break:
+                            continue
+                        for service_start in range(shift_start + pre, shift_end, SLOT_STEP_MINUTES):
                             starts_at = _local_instant(day, service_start, zone)
-                            ends_at = _local_instant(day, service_end, zone)
-                            occupies_from = _local_instant(day, block_start, zone)
-                            occupies_to = _local_instant(day, block_end, zone)
-                            if None in (starts_at, ends_at, occupies_from, occupies_to):
+                            if starts_at is None:
                                 continue
-                            if starts_at < earliest or starts_at > latest:
+                            start_utc = starts_at.astimezone(timezone.utc)
+                            end_utc = start_utc + timedelta(minutes=duration)
+                            occupies_from = start_utc - timedelta(minutes=pre)
+                            occupies_to = end_utc + timedelta(minutes=post)
+                            if occupies_from < opens or occupies_to > closes:
                                 continue
+                            if any(occupies_from < end and begin < occupies_to for begin, end in occupied):
+                                continue
+                            if start_utc < earliest or start_utc > latest:
+                                continue
+                            key = (staff["id"], start_utc)
+                            if key in seen:
+                                continue
+                            ends_at = end_utc.astimezone(zone)
                             clash = connection.execute(
                                 text("""SELECT 1 FROM reservations
                                         WHERE tenant_id=:tenant AND state='active' AND staff_id=:staff
@@ -198,6 +277,15 @@ def register_availability_routes(
                             ).scalar_one_or_none()
                             if clash is not None:
                                 continue
+                            try:
+                                required_resource_units(
+                                    connection, tenant_id=tenant_id, service_id=service["id"],
+                                    location_id=location["id"],
+                                    service_requires_resource=bool(service["requires_resource"]),
+                                    occupied_from=occupies_from, occupied_to=occupies_to)
+                            except HTTPException:
+                                continue
+                            seen.add(key)
                             slots.append({
                                 "starts_at": starts_at.isoformat(),
                                 "ends_at": ends_at.isoformat(),
@@ -211,8 +299,7 @@ def register_availability_routes(
         return slots
 
     def _minutes(value: str) -> int:
-        hours, minutes = value.split(":")
-        return int(hours) * 60 + int(minutes)
+        return clock_minutes(value, allow_end_of_day=True)
 
     @app.get("/v1/public/salons/{booking_slug}/availability", tags=["booking"])
     def public_availability(booking_slug: str, service_id: uuid.UUID, date_from: str, date_to: str,
@@ -235,9 +322,9 @@ def register_availability_routes(
                                    {"t": location["tenant_id"]})
                 service = connection.execute(
                     text("""SELECT id::text AS id, name, duration_minutes, pre_buffer_minutes,
-                                   post_buffer_minutes, price_minor, currency
+                                   post_buffer_minutes, price_minor, currency, requires_resource
                             FROM services WHERE tenant_id=:tenant AND id=:id
-                              AND archived_at IS NULL AND NOT requires_resource"""),
+                              AND archived_at IS NULL"""),
                     {"tenant": location["tenant_id"], "id": str(service_id)}).mappings().one_or_none()
                 if service is None:
                     # FR-028: a generic externally-visible error, never an internal reason.
@@ -280,10 +367,28 @@ def register_availability_routes(
                             ORDER BY exception_date"""),
                     {"tenant": location["tenant_id"], "location": location["id"]}).mappings().all()
                 services = connection.execute(
-                    text("""SELECT id::text AS id, name, duration_minutes, price_minor, currency
-                            FROM services WHERE tenant_id=:tenant AND archived_at IS NULL
-                              AND NOT requires_resource ORDER BY name"""),
-                    {"tenant": location["tenant_id"]}).mappings().all()
+                            text("""SELECT s.id::text AS id, s.name, s.duration_minutes,
+                                         s.price_minor, s.currency
+                                    FROM services s
+                                   WHERE s.tenant_id=:tenant AND s.archived_at IS NULL
+                                     AND (NOT s.requires_resource OR (
+                                          (SELECT count(*) FROM service_resource_requirements q
+                                            JOIN bookable_resources r
+                                              ON r.tenant_id=q.tenant_id AND r.id=q.resource_id
+                                             AND r.location_id=q.location_id AND r.active
+                                           WHERE q.tenant_id=s.tenant_id AND q.service_id=s.id
+                                             AND q.location_id=:location) > 0
+                                          AND (SELECT count(*) FROM service_resource_requirements q
+                                                JOIN bookable_resources r
+                                                  ON r.tenant_id=q.tenant_id AND r.id=q.resource_id
+                                                 AND r.location_id=q.location_id AND r.active
+                                               WHERE q.tenant_id=s.tenant_id AND q.service_id=s.id
+                                                 AND q.location_id=:location)
+                                              = (SELECT count(*) FROM service_resource_requirements q
+                                                  WHERE q.tenant_id=s.tenant_id AND q.service_id=s.id
+                                                    AND q.location_id=:location)))
+                                   ORDER BY s.name"""),
+                    {"tenant": location["tenant_id"], "location": location["id"]}).mappings().all()
             return {"salon": location["display_name"], "timezone": location["timezone"],
                     "weekly_hours": [dict(r) for r in weekly],
                     "upcoming_exceptions": [{**dict(r),

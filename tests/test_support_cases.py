@@ -7,6 +7,7 @@ AC-2: Grant scope/expiry/revoke enforced and every use tenant-visible audited.
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -69,11 +70,19 @@ def test_support_ac1_case_masks_and_grant_flows(database_url):
     staff = _client(database_url, owner)
     tid = tenant["tenant_id"]
     try:
+        request_id = uuid.uuid4()
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            job_id = conn.execute(
+                text("""INSERT INTO tenant_jobs (tenant_id, kind, state)
+                        VALUES (:tenant, 'support_fixture', 'failed') RETURNING id"""),
+                {"tenant": tid}).scalar_one()
         admin = _bootstrap(database_url)
         _invite(admin, "support-1", "support")
         support = _company_client(database_url, "support-1")
         opened = support.post("/v1/company/cases", json={
             "tenant_id": tid, "title": "Booking stuck", "severity": "high",
+            "request_id": str(request_id), "job_id": str(job_id),
             "trace_id": "trace-abc-123",
             "notes": "Client ana@example.com called from +14165550000, ref 987654."})
         assert opened.status_code == 201, opened.text
@@ -88,10 +97,18 @@ def test_support_ac1_case_masks_and_grant_flows(database_url):
         assert len(listed) == 1
         assert listed[0]["tenant_name"] == "Synthetic CRM Salon"
         assert "internal_notes" not in listed[0]
+        assert listed[0]["request_id"] == str(request_id)
+        assert listed[0]["job_id"] == str(job_id)
+        assert listed[0]["trace_id"] == "trace-abc-123"
+        assert listed[0]["grants"] == []
         requested = support.post(f"/v1/company/cases/{case_id}/grants", json={
             "scope": "diagnostic", "justification": "Reproduce the stuck booking."})
         assert requested.status_code == 201, requested.text
         grant_id = requested.json()["id"]
+        listed = support.get("/v1/company/cases").json()["items"]
+        grant = listed[0]["grants"][0]
+        assert {grant["id"], grant["scope"], grant["status"], grant["uses"]} == {
+            grant_id, "diagnostic", "requested", 0}
         mine = staff.get(f"/v1/tenants/{tid}/support-access").json()
         assert [g["status"] for g in mine["grants"]] == ["requested"]
         assert mine["uses"] == []
@@ -106,6 +123,8 @@ def test_support_ac1_case_masks_and_grant_flows(database_url):
         mine = staff.get(f"/v1/tenants/{tid}/support-access").json()
         assert len(mine["uses"]) == 1
         assert mine["uses"][0]["action"] == "diagnostics_read"
+        listed = support.get("/v1/company/cases").json()["items"]
+        assert listed[0]["grants"][0]["uses"] == 1
     finally:
         _teardown(engine, [tid], issuer)
         _cleanup_company(database_url)
@@ -183,4 +202,32 @@ def test_support_ac2_roles_and_closed_cases(database_url):
                             json={"status": "open"}).status_code == 422
     finally:
         _teardown(engine, [tid], issuer)
+        _cleanup_company(database_url)
+
+
+def test_support_case_rejects_cross_tenant_job_reference(database_url):
+    """A company case may correlate only to a job in its selected salon."""
+    first_issuer = "https://identity.example.invalid/sup-job-a"
+    second_issuer = "https://identity.example.invalid/sup-job-b"
+    first_engine, owner, first_tenant = _salon(database_url, first_issuer)
+    second_engine, _, second_tenant = _salon(database_url, second_issuer)
+    first_id, second_id = first_tenant["tenant_id"], second_tenant["tenant_id"]
+    try:
+        with first_engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": first_id})
+            job_id = conn.execute(
+                text("""INSERT INTO tenant_jobs (tenant_id, kind, state)
+                        VALUES (:tenant, 'support_fixture', 'failed') RETURNING id"""),
+                {"tenant": first_id}).scalar_one()
+        admin = _bootstrap(database_url)
+        _invite(admin, "support-job", "support")
+        support = _company_client(database_url, "support-job")
+        opened = support.post("/v1/company/cases", json={
+            "tenant_id": second_id, "title": "Cross-salon reference",
+            "job_id": str(job_id)})
+        assert opened.status_code == 422, opened.text
+        assert opened.json()["detail"]["code"] == "support_reference_unknown"
+    finally:
+        _teardown(first_engine, [first_id], first_issuer)
+        _teardown(second_engine, [second_id], second_issuer)
         _cleanup_company(database_url)

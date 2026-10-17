@@ -9,6 +9,7 @@ receptionist without manage denied, and cross-tenant isolation.
 import os
 import uuid
 from datetime import date, timedelta, datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text
@@ -63,6 +64,78 @@ def test_manual_booking_appears_in_the_calendar_list(database_url):
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
 
+def test_calendar_date_filter_uses_the_saved_salon_timezone(database_url):
+    """FR-030: a late local booking belongs to its salon's date, not the next UTC date."""
+    issuer = "https://identity.example.invalid/cal-local-date"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    try:
+        base, _slug, service, staff, client_id = _bookable(client, database_url, tenant)
+        day = _next_weekday_slot()
+        hours = client.put(f"{base}/locations/{tenant['location_id']}/hours", json={
+            "intervals": [{"weekday": weekday, "opens_at": "09:00", "closes_at": "17:00"}
+                          if weekday != day.weekday() else
+                          {"weekday": weekday, "opens_at": "17:00", "closes_at": "23:59"}
+                          for weekday in range(6)]})
+        assert hours.status_code == 200, hours.text
+        shift = client.post(f"{base}/staff/{staff}/shifts", json={
+            "location_id": tenant["location_id"], "weekday": day.weekday(),
+            "starts_at": "17:00", "ends_at": "23:59"})
+        assert shift.status_code == 201, shift.text
+        local_start = datetime.combine(day, datetime.min.time().replace(hour=22),
+                                       ZoneInfo("America/Toronto"))
+        created = _book(client, base, service, staff, client_id, local_start.isoformat(),
+                        source="walk_in")
+        assert created.status_code == 201, created.text
+
+        listing = client.get(f"{base}/appointments", params={
+            "location_id": tenant["location_id"], "staff_id": staff,
+            "date_from": day.isoformat(), "date_to": day.isoformat(),
+            "source": "walk_in", "status": "confirmed"})
+        assert listing.status_code == 200, listing.text
+        assert listing.json()["total"] == 1
+        assert listing.json()["items"][0]["id"] == created.json()["appointment_id"]
+        reversed_range = client.get(f"{base}/appointments", params={
+            "date_from": (day + timedelta(days=1)).isoformat(), "date_to": day.isoformat()})
+        assert reversed_range.status_code == 422
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_assigned_receptionist_can_create_and_read_calendar_bookings(database_url):
+    """AC-1: a receptionist's create/list permissions work only in assigned locations."""
+    issuer = "https://identity.example.invalid/cal-receptionist"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    receptionist = __import__("test_clients").AuthenticatedIdentity(issuer, uuid.uuid4().hex)
+    try:
+        base, _slug, service, staff, client_id = _bookable(client, database_url, tenant)
+        with engine.begin() as connection:
+            connection.execute(text("SELECT set_config('app.tenant_id', :tenant, true)"),
+                               {"tenant": tenant["tenant_id"]})
+            user_id = connection.execute(text("""INSERT INTO identity_users (issuer,subject)
+                VALUES (:issuer,:subject) RETURNING id"""),
+                {"issuer": receptionist.issuer, "subject": receptionist.subject}).scalar_one()
+            connection.execute(text("INSERT INTO memberships (tenant_id,user_id,role) VALUES (:tenant,:user,'receptionist')"),
+                               {"tenant": tenant["tenant_id"], "user": str(user_id)})
+            connection.execute(text("INSERT INTO membership_locations (tenant_id,user_id,location_id) VALUES (:tenant,:user,:location)"),
+                               {"tenant": tenant["tenant_id"], "user": str(user_id),
+                                "location": tenant["location_id"]})
+        receptionist_client = _client(database_url, receptionist)
+        day = _next_weekday_slot()
+        created = _book(receptionist_client, base, service, staff, client_id,
+                        f"{day.isoformat()}T14:00:00+00:00", source="walk_in")
+        assert created.status_code == 201, created.text
+        listing = receptionist_client.get(f"{base}/appointments", params={
+            "location_id": tenant["location_id"], "source": "walk_in"})
+        assert listing.status_code == 200, listing.text
+        assert [item["id"] for item in listing.json()["items"]] == [created.json()["appointment_id"]]
+        denied = receptionist_client.get(f"{base}/appointments", params={"location_id": str(uuid.uuid4())})
+        assert denied.status_code in (403, 404)
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
 def test_walk_in_booking_is_recorded(database_url):
     """AC-1: a walk-in books with source walk_in and shows in the source filter."""
     issuer = "https://identity.example.invalid/cal-2"
@@ -103,6 +176,106 @@ def test_double_booking_one_slot_is_refused_and_first_preserved(database_url):
         at_slot = [i for i in listing.json()["items"] if i["starts_at"].startswith(starts[:16])]
         assert len(at_slot) == 1
         assert at_slot[0]["id"] == first.json()["appointment_id"]
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_manual_booking_reserves_required_resource_against_public_hold(database_url):
+    """TASK-020 AC-1: manual and public commits share resource exclusivity."""
+    issuer = "https://identity.example.invalid/cal-resource-exclusive"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    try:
+        base, slug, service, staff, client_id = _bookable(client, database_url, tenant)
+        location = tenant["location_id"]
+        room = client.post(f"{base}/resources", json={
+            "location_id": location, "name": "Exclusive booking room", "kind": "room"})
+        assert room.status_code == 201, room.text
+        assert client.put(f"{base}/services/{service}/resources", json={
+            "location_id": location, "expected_version": 1,
+            "resource_ids": [room.json()["id"]]}).status_code == 200
+
+        second_staff = client.post(f"{base}/staff", json={"display_name": "Mia"}).json()["id"]
+        assert client.put(f"{base}/staff/{second_staff}/locations", json={
+            "location_ids": [location]}).status_code == 200
+        assert client.put(f"{base}/staff/{second_staff}/qualifications", json={
+            "service_ids": [service]}).status_code == 200
+        day = _next_weekday_slot()
+        assert client.post(f"{base}/staff/{second_staff}/shifts", json={
+            "location_id": location, "weekday": day.weekday(),
+            "starts_at": "09:00", "ends_at": "17:00"}).status_code == 201
+        starts = f"{day.isoformat()}T14:00:00+00:00"
+
+        manual = _book(client, base, service, staff, client_id, starts)
+        assert manual.status_code == 201, manual.text
+        public = client.post(f"/v1/public/salons/{slug}/holds", json={
+            "service_id": service, "staff_id": second_staff, "starts_at": starts,
+            "idempotency_key": "manual-resource-race-" + uuid.uuid4().hex})
+        assert public.status_code == 409, public.text
+        assert public.json()["detail"]["code"] == "slot_unavailable"
+
+        with engine.begin() as connection:
+            connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                               {"t": tenant["tenant_id"]})
+            reserved = connection.execute(text("""SELECT resource_id::text FROM reservations
+                    WHERE tenant_id=:tenant AND appointment_id=:appointment AND state='active'
+                      AND resource_id IS NOT NULL"""),
+                                         {"tenant": tenant["tenant_id"],
+                                          "appointment": manual.json()["appointment_id"]}).scalars().all()
+        assert reserved == [room.json()["id"]]
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_reschedule_resource_conflict_rolls_back_original_booking(database_url):
+    """TASK-020 AC-2: resource collision keeps appointment and all reservations in place."""
+    issuer = "https://identity.example.invalid/cal-resource-rollback"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    try:
+        base, slug, service, staff, client_id = _bookable(client, database_url, tenant)
+        location = tenant["location_id"]
+        room = client.post(f"{base}/resources", json={
+            "location_id": location, "name": "Reschedule test room", "kind": "room"})
+        assert room.status_code == 201, room.text
+        assert client.put(f"{base}/services/{service}/resources", json={
+            "location_id": location, "expected_version": 1,
+            "resource_ids": [room.json()["id"]]}).status_code == 200
+
+        second_staff = client.post(f"{base}/staff", json={"display_name": "Owen"}).json()["id"]
+        assert client.put(f"{base}/staff/{second_staff}/locations", json={
+            "location_ids": [location]}).status_code == 200
+        assert client.put(f"{base}/staff/{second_staff}/qualifications", json={
+            "service_ids": [service]}).status_code == 200
+        day = _next_weekday_slot()
+        assert client.post(f"{base}/staff/{second_staff}/shifts", json={
+            "location_id": location, "weekday": day.weekday(),
+            "starts_at": "09:00", "ends_at": "17:00"}).status_code == 201
+        original_start = f"{day.isoformat()}T15:00:00+00:00"
+        taken_start = f"{day.isoformat()}T18:00:00+00:00"
+        original = _book(client, base, service, staff, client_id, original_start)
+        occupied = _book(client, base, service, second_staff, client_id, taken_start)
+        assert original.status_code == occupied.status_code == 201
+
+        moved = client.post(f"{base}/appointments/{original.json()['appointment_id']}/reschedule",
+                            json={"starts_at": taken_start, "expected_version": 1,
+                                  "idempotency_key": "resource-move-" + uuid.uuid4().hex})
+        assert moved.status_code == 409, moved.text
+        listing = client.get(f"{base}/appointments", params={
+            "date_from": day.isoformat(), "date_to": day.isoformat()})
+        restored = next(row for row in listing.json()["items"]
+                        if row["id"] == original.json()["appointment_id"])
+        assert restored["starts_at"].startswith(original_start[:16])
+        with engine.begin() as connection:
+            connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                               {"t": tenant["tenant_id"]})
+            active = connection.execute(text("""SELECT lower(occupied_range), resource_id::text
+                    FROM reservations WHERE tenant_id=:tenant AND appointment_id=:appointment
+                      AND state='active' AND resource_id IS NOT NULL"""),
+                                        {"tenant": tenant["tenant_id"],
+                                         "appointment": original.json()["appointment_id"]}).one()
+        assert active.resource_id == room.json()["id"]
+        assert active[0].isoformat().startswith(original_start[:16])
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -206,8 +379,17 @@ def test_cancel_releases_the_slot_and_is_idempotent(database_url):
         appt_id = created.json()["appointment_id"]
         version = 1
 
+        missing_reason = client.post(f"{base}/appointments/{appt_id}/cancel",
+                                     json={"expected_version": version, "idempotency_key": "x-" + uuid.uuid4().hex})
+        assert missing_reason.status_code == 422, missing_reason.text
+        assert missing_reason.json()["detail"]["code"] == "appointment_reason_required"
+        blank_reason = client.post(f"{base}/appointments/{appt_id}/cancel",
+                                   json={"expected_version": version, "reason": "   ", "idempotency_key": "x-" + uuid.uuid4().hex})
+        assert blank_reason.status_code == 422, blank_reason.text
+
         cancel = client.post(f"{base}/appointments/{appt_id}/cancel",
-                             json={"expected_version": version, "idempotency_key": "x-" + uuid.uuid4().hex})
+                             json={"expected_version": version, "reason": "Client requested cancellation",
+                                   "idempotency_key": "x-" + uuid.uuid4().hex})
         assert cancel.status_code == 200, cancel.text
         assert cancel.json()["status"] == "cancelled"
         # Repeating the cancel is harmless: 200 replayed, no error.

@@ -89,6 +89,14 @@ def test_wa_ac1_onboarding_lifecycle_over_http(database_url):
         assert len(listed) == 1
         assert listed[0]["quality_rating"] == "green"
         assert listed[0]["messaging_limit"] == 1000
+        templates = client.post(f"/v1/tenants/{tenant['tenant_id']}/whatsapp-templates", json={
+            "name": "booking_notice", "category": "utility", "locale": "en_CA",
+            "body": "Hello {{1}}"}).json()
+        assert templates["status"] == "draft"
+        assert client.get(f"/v1/tenants/{tenant['tenant_id']}/whatsapp-templates").json()["items"][0]["locale"] == "en_CA"
+        assert client.get(f"/v1/tenants/{tenant['tenant_id']}/whatsapp-communications").json() == {"items": []}
+        assert client.post(f"{base}/{sender_id}/decide",
+                           json={"messaging_limit": 0}).status_code == 422
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -148,13 +156,19 @@ def test_wa_ac1_approved_template_sends_outside_window(database_url):
                          {"t": tenant["tenant_id"]})
             summary = dispatch_due_communications(
                 connection=conn, tenant_id=tenant["tenant_id"], adapter=adapter)
-        assert summary["dispatched"] == 1
-        assert adapter.records[0]["sender"] == sender["phone_number"]
+        wa_record = next(record for record in adapter.records if record["channel"] == "whatsapp")
+        assert summary["dispatched"] >= 1
+        assert wa_record["sender"] == sender["phone_number"]
+        assert wa_record["template"] == template["name"]
+        assert wa_record["template_category"] == "utility"
+        assert wa_record["template_locale"] == "en"
         with engine.connect() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
             cost = conn.execute(
-                text("SELECT cost_minor FROM message_costs WHERE tenant_id=:t"),
+                text("SELECT mc.cost_minor FROM message_costs mc JOIN communications c"
+                     " ON c.tenant_id=mc.tenant_id AND c.id=mc.communication_id"
+                     " WHERE mc.tenant_id=:t AND c.channel='whatsapp'"),
                 {"t": tenant["tenant_id"]}).scalar_one()
         assert cost == 1
     finally:
@@ -188,16 +202,19 @@ def test_wa_ac2_unapproved_sender_and_template_stay_unsent(database_url):
                          {"t": tenant["tenant_id"]})
             summary = dispatch_due_communications(
                 connection=conn, tenant_id=tenant["tenant_id"], adapter=adapter)
-        assert summary["failed"] == 1 and summary["dispatched"] == 0
-        assert adapter.records == []
+        assert summary["failed"] == 1
+        assert not any(record["channel"] == "whatsapp" for record in adapter.records)
         with engine.connect() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
             state = conn.execute(
-                text("SELECT state, skip_reason FROM communications WHERE tenant_id=:t"),
+                text("SELECT state, skip_reason FROM communications WHERE tenant_id=:t AND channel='whatsapp'"),
                 {"t": tenant["tenant_id"]}).mappings().one()
         assert state["state"] == "failed"
         assert "no approved WhatsApp sender" in state["skip_reason"]
+        visible = client.get(f"/v1/tenants/{tenant['tenant_id']}/whatsapp-communications")
+        assert visible.status_code == 200
+        assert visible.json()["items"][0]["skip_reason"] == state["skip_reason"]
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -239,9 +256,100 @@ def test_wa_ac2_red_quality_and_draft_template_blocked(database_url):
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
             reason = conn.execute(
-                text("SELECT skip_reason FROM communications WHERE tenant_id=:t"),
+                text("SELECT skip_reason FROM communications WHERE tenant_id=:t AND channel='whatsapp'"),
                 {"t": tenant["tenant_id"]}).scalar_one()
         assert "quality is red" in reason
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_wa_rejects_template_with_wrong_category_for_purpose(database_url):
+    issuer = "https://identity.example.invalid/wa-category"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    try:
+        _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
+        conn = _scoped(engine, tenant["tenant_id"])
+        try:
+            _approved_sender(conn, tenant["tenant_id"], phone="+14165550777")
+            template = _approved_template(conn, tenant["tenant_id"], name="wrong_kind",
+                                          category="marketing")
+            record_booking_communication(
+                connection=conn, tenant_id=tenant["tenant_id"], appointment_id=appt_id,
+                client_id=client_id, contact_value="+14165550101", channel="whatsapp",
+                purpose="appointment_reminder_24h", entity_version=1,
+                template_id=template["id"])
+            conn.commit()
+        finally:
+            conn.close()
+        adapter = RecordingAdapter()
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            result = dispatch_due_communications(connection=conn,
+                                                 tenant_id=tenant["tenant_id"], adapter=adapter)
+        assert result["failed"] == 1
+        assert not any(record["channel"] == "whatsapp" for record in adapter.records)
+        with engine.connect() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            reason = conn.execute(text("SELECT skip_reason FROM communications WHERE tenant_id=:t AND channel='whatsapp'"),
+                                  {"t": tenant["tenant_id"]}).scalar_one()
+        assert "not allowed for utility" in reason
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_wa_enforces_distinct_recipient_limit_over_24_hours(database_url):
+    issuer = "https://identity.example.invalid/wa-limit"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    try:
+        _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
+        conn = _scoped(engine, tenant["tenant_id"])
+        try:
+            _approved_sender(conn, tenant["tenant_id"], phone="+14165550888")
+            # Set the synthetic ISV's limit to one distinct recipient.
+            conn.execute(text("UPDATE whatsapp_senders SET messaging_limit=1 WHERE tenant_id=:t"),
+                         {"t": tenant["tenant_id"]})
+            record_booking_communication(
+                connection=conn, tenant_id=tenant["tenant_id"], appointment_id=appt_id,
+                client_id=client_id, contact_value="+14165550101", channel="whatsapp",
+                purpose="appointment_reminder_24h", entity_version=1,
+                template_id=_approved_template(conn, tenant["tenant_id"])["id"])
+            conn.commit()
+        finally:
+            conn.close()
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            first = dispatch_due_communications(connection=conn, tenant_id=tenant["tenant_id"],
+                                                 adapter=RecordingAdapter())
+        assert first["dispatched"] >= 1, first
+        conn = _scoped(engine, tenant["tenant_id"])
+        try:
+            record_booking_communication(
+                connection=conn, tenant_id=tenant["tenant_id"], appointment_id=appt_id,
+                client_id=client_id, contact_value="+14165550202", channel="whatsapp",
+                purpose="appointment_reminder_2h", entity_version=1,
+                template_id=_approved_template(conn, tenant["tenant_id"], name="limit_second")["id"])
+            conn.commit()
+        finally:
+            conn.close()
+        adapter = RecordingAdapter()
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            second = dispatch_due_communications(connection=conn, tenant_id=tenant["tenant_id"],
+                                                  adapter=adapter)
+        assert second["failed"] == 1
+        assert not any(record["channel"] == "whatsapp" for record in adapter.records)
+        with engine.connect() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            reason = conn.execute(text("SELECT skip_reason FROM communications WHERE tenant_id=:t AND channel='whatsapp' AND contact_value='+14165550202'"),
+                                  {"t": tenant["tenant_id"]}).scalar_one()
+        assert "24h messaging limit" in reason
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -278,7 +386,7 @@ def test_wa_ac1_free_reply_inside_open_window(database_url):
                          {"t": tenant["tenant_id"]})
             summary = dispatch_due_communications(
                 connection=conn, tenant_id=tenant["tenant_id"], adapter=adapter)
-        assert summary["dispatched"] == 1
+        assert any(record["channel"] == "whatsapp" for record in adapter.records)
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -326,8 +434,9 @@ def test_wa_ac2_stop_suppresses_whatsapp_only(database_url):
                          {"t": tenant["tenant_id"]})
             summary = dispatch_due_communications(
                 connection=conn, tenant_id=tenant["tenant_id"], adapter=adapter)
-        assert summary["suppressed"] == 1 and summary["dispatched"] == 1
-        assert adapter.records[0]["channel"] == "sms"
+        assert summary["suppressed"] == 1
+        assert any(record["channel"] == "sms" for record in adapter.records)
+        assert not any(record["channel"] == "whatsapp" for record in adapter.records)
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -373,7 +482,7 @@ def test_wa_ac1_marketing_template_needs_consent(database_url):
         # version (stale versions never dispatch).
         resched = client.post(
             f"/v1/tenants/{tenant['tenant_id']}/appointments/{appt_id}/reschedule", json={
-                "starts_at": (starts + timedelta(days=1)).isoformat(),
+                    "starts_at": (starts + timedelta(hours=1)).isoformat(),
                 "expected_version": 1, "idempotency_key": "wa-resched-0001"})
         assert resched.status_code == 200, resched.text
         conn = _scoped(engine, tenant["tenant_id"])
@@ -395,8 +504,14 @@ def test_wa_ac1_marketing_template_needs_consent(database_url):
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
+            conn.execute(text("""INSERT INTO tenant_entitlements
+                    (tenant_id, plan_code, status, max_locations, max_staff,
+                     included_sms_segments, included_emails, marketing_allowed)
+                    VALUES (:t, 'synthetic', 'active', 1, 5, 100, 100, true)
+                    ON CONFLICT (tenant_id) DO UPDATE
+                    SET marketing_allowed=true"""), {"t": tenant["tenant_id"]})
             allowed = dispatch_due_communications(
                 connection=conn, tenant_id=tenant["tenant_id"], adapter=adapter)
-        assert allowed["dispatched"] == 1
+        assert any(record["channel"] == "whatsapp" for record in adapter.records)
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)

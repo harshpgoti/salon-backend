@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import uuid
 import json
+import math
 from typing import Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -224,6 +225,11 @@ def _validate_field_value(definition: dict, payload: FieldValueIn) -> dict:
     """Validate a field value against its definition. Returns dict with typed value column."""
     ftype = definition["type"]
     validation = definition.get("validation", {})
+    provided = [name for name in ("value_text", "value_number", "value_date", "value_boolean")
+                if getattr(payload, name) is not None]
+    expected = "value_text" if ftype == "enum" else f"value_{ftype}"
+    if provided != [expected]:
+        raise HTTPException(status_code=422, detail={"code": "field_value_type_mismatch"})
     if ftype == "text":
         if payload.value_text is None:
             raise HTTPException(status_code=422, detail={"code": "field_value_required", "field": "value_text"})
@@ -235,6 +241,8 @@ def _validate_field_value(definition: dict, payload: FieldValueIn) -> dict:
         if payload.value_number is None:
             raise HTTPException(status_code=422, detail={"code": "field_value_required", "field": "value_number"})
         v = payload.value_number
+        if not math.isfinite(v):
+            raise HTTPException(status_code=422, detail={"code": "field_value_not_finite"})
         if "min" in validation and v < validation["min"]:
             raise HTTPException(status_code=422, detail={"code": "field_value_below_min", "min": validation["min"]})
         if "max" in validation and v > validation["max"]:
@@ -263,6 +271,77 @@ def _validate_field_value(definition: dict, payload: FieldValueIn) -> dict:
         return {"value_text": payload.value_text}
     else:
         raise HTTPException(status_code=422, detail={"code": "unknown_field_type", "type": ftype})
+
+
+def _validate_definition_schema(field_type: str, validation: dict) -> None:
+    valid = isinstance(validation, dict)
+    if field_type == "text":
+        valid = valid and set(validation) <= {"max_length"} and (
+            "max_length" not in validation or
+            type(validation["max_length"]) is int and 1 <= validation["max_length"] <= 8000
+        )
+    elif field_type == "number":
+        valid = valid and set(validation) <= {"min", "max"} and all(
+            type(value) is int or (type(value) is float and math.isfinite(value))
+            for value in validation.values())
+        valid = valid and not ("min" in validation and "max" in validation and validation["min"] > validation["max"])
+    elif field_type == "enum":
+        values = validation.get("values") if valid and set(validation) == {"values"} else None
+        valid = isinstance(values, list) and 1 <= len(values) <= 100 and all(
+            isinstance(item, str) and item.strip() and len(item) <= 120 for item in values
+        ) and len(set(values)) == len(values)
+    elif field_type in ("date", "boolean"):
+        valid = valid and not validation
+    if not valid:
+        raise HTTPException(status_code=422, detail={"code": "invalid_field_validation"})
+
+
+def _require_field_sensitivity(role: str, sensitivity: str) -> None:
+    if sensitivity == "private" and role not in ("owner", "manager"):
+        raise HTTPException(status_code=403, detail={"code": "sensitive_field_forbidden"})
+    if sensitivity == "restricted" and role != "owner":
+        raise HTTPException(status_code=403, detail={"code": "restricted_field_forbidden"})
+
+
+def _validate_preference_value(preference_type: str, value: dict) -> None:
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=422, detail={"code": "invalid_preference_value"})
+    schemas = {
+        "colour_formula": {"formula", "developer", "processing_time"},
+        "stylist_preference": {"stylist_name", "avoid", "notes"},
+        "product": {"brand", "products", "notes"},
+        "rebooking_interval": {"days", "service"},
+        "communication_preference": {"channels"},
+    }
+    fields = schemas.get(preference_type)
+    if fields is None:
+        raise HTTPException(status_code=422, detail={"code": "sensitive_preference_type_disabled"})
+    valid = isinstance(value, dict) and set(value) <= fields
+    if preference_type == "colour_formula":
+        valid = valid and isinstance(value.get("formula"), str) and value["formula"].strip() and len(value["formula"]) <= 240
+        valid = valid and ("developer" not in value or (isinstance(value["developer"], str) and len(value["developer"]) <= 80))
+        valid = valid and ("processing_time" not in value or (type(value["processing_time"]) is int and 1 <= value["processing_time"] <= 240))
+    elif preference_type in ("stylist_preference", "product"):
+        text_keys = {"stylist_name", "brand", "notes"} & value.keys()
+        list_keys = {"avoid", "products"} & value.keys()
+        required_key = "stylist_name" if preference_type == "stylist_preference" else "brand"
+        alternate_key = "avoid" if preference_type == "stylist_preference" else "products"
+        valid = valid and (required_key in value or alternate_key in value)
+        valid = valid and all(isinstance(value[key], str) and value[key].strip() and len(value[key]) <= 240
+                              for key in text_keys)
+        valid = valid and all(isinstance(value[key], list) and len(value[key]) <= 50 and
+                              all(isinstance(item, str) and item.strip() and len(item) <= 120 for item in value[key])
+                              for key in list_keys)
+    elif preference_type == "rebooking_interval":
+        valid = valid and type(value.get("days")) is int and 1 <= value["days"] <= 365
+        valid = valid and ("service" not in value or (isinstance(value["service"], str) and len(value["service"]) <= 120))
+    elif preference_type == "communication_preference":
+        channels = value.get("channels")
+        valid = valid and isinstance(channels, list) and 1 <= len(channels) <= 3
+        valid = valid and all(isinstance(channel, str) for channel in channels)
+        valid = valid and set(channels) <= {"email", "sms", "whatsapp"} and len(set(channels)) == len(channels)
+    if not valid:
+        raise HTTPException(status_code=422, detail={"code": "invalid_preference_value"})
 
 
 def _serialize_field_value(row: dict) -> dict:
@@ -369,13 +448,24 @@ def register_client_routes(
     insert_audit: Callable,
     project_fields: Callable[..., dict],
 ) -> None:
-    def client_or_404(connection, tenant_id: uuid.UUID, client_id: uuid.UUID):
+    def client_or_404(connection, tenant_id: uuid.UUID, client_id: uuid.UUID,
+                       role: str = "owner", assigned_locations: list[uuid.UUID] | None = None):
+        scope = ""
+        params = {"tenant": str(tenant_id), "client": str(client_id)}
+        if role != "owner":
+            locations = [str(value) for value in (assigned_locations or [])]
+            if not locations:
+                raise HTTPException(status_code=404, detail={"code": "client_not_found"})
+            scope = """ AND (preferred_location_id=ANY(:locations) OR EXISTS (
+                SELECT 1 FROM appointments a WHERE a.tenant_id=clients.tenant_id
+                  AND a.client_id=clients.id AND a.location_id=ANY(:locations)))"""
+            params["locations"] = locations
         row = connection.execute(
             text("""SELECT id::text AS id, name, preferred_name, locale, lifecycle,
                            preferred_location_id::text AS preferred_location_id, source,
                            version, created_at
-                    FROM clients WHERE tenant_id=:tenant AND id=:client AND deleted_at IS NULL"""),
-            {"tenant": str(tenant_id), "client": str(client_id)},
+                    FROM clients WHERE tenant_id=:tenant AND id=:client AND deleted_at IS NULL""" + scope),
+            params,
         ).mappings().one_or_none()
         if row is None:
             raise HTTPException(status_code=404, detail={"code": "client_not_found"})
@@ -393,8 +483,9 @@ def register_client_routes(
                  "verified_at": row["verified_at"].isoformat() if row["verified_at"] else None}
                 for row in rows]
 
-    def read_client(connection, tenant_id: uuid.UUID, client_id: uuid.UUID, role: str) -> dict:
-        row = client_or_404(connection, tenant_id, client_id)
+    def read_client(connection, tenant_id: uuid.UUID, client_id: uuid.UUID, role: str,
+                    assigned_locations: list[uuid.UUID] | None = None) -> dict:
+        row = client_or_404(connection, tenant_id, client_id, role, assigned_locations)
         # The field policy governs descriptive profile data. The resource's own identity
         # and version are structural - a caller must be able to address and version-check
         # the record it was just handed - so they are never projected away.
@@ -445,8 +536,9 @@ def register_client_routes(
             raise HTTPException(status_code=422, detail={"code": "invalid_source"})
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.read")
+                visible_location_ids = {str(value) for value in assigned}
                 may_see_contacts = "contact_summary" in project_fields(role, {"contact_summary": None})
                 pat = f"%{q.replace('%', '\\%').replace('_', '\\_')}%" if q else None
                 params = {
@@ -484,9 +576,17 @@ def register_client_routes(
                 if lifecycle is not None:
                     where_parts.append("lifecycle = :lifecycle")
                 if location_id is not None:
-                    where_parts.append("preferred_location_id = :location")
+                    where_parts.append("""(preferred_location_id = :location OR EXISTS (
+                        SELECT 1 FROM appointments a WHERE a.tenant_id=clients.tenant_id
+                          AND a.client_id=clients.id AND a.location_id=:location
+                    ))""")
                 if source is not None:
                     where_parts.append("source = :source")
+                if role != "owner":
+                    params["assigned"] = [str(value) for value in assigned]
+                    where_parts.append("""(preferred_location_id=ANY(:assigned) OR EXISTS (
+                        SELECT 1 FROM appointments a WHERE a.tenant_id=clients.tenant_id
+                          AND a.client_id=clients.id AND a.location_id=ANY(:assigned)))""")
                 where_sql = " AND ".join(where_parts) if where_parts else "TRUE"
                 items = connection.execute(
                     text(f"{base_sql} AND {where_sql} ORDER BY created_at DESC, id LIMIT :limit OFFSET :offset"),
@@ -508,9 +608,11 @@ def register_client_routes(
                         "version": row["version"],
                         "created_at": row["created_at"].isoformat(),
                         "source": row["source"],
-                        "preferred_location_id": row["preferred_location_id"],
                         **profile,
                     })
+                    if role == "owner" or (row["preferred_location_id"] is not None and
+                                            str(row["preferred_location_id"]) in visible_location_ids):
+                        results[-1]["preferred_location_id"] = row["preferred_location_id"]
             return {"items": results, "total": total, "limit": limit, "offset": offset}
         finally:
             engine.dispose()
@@ -527,41 +629,104 @@ def register_client_routes(
             raise HTTPException(status_code=422, detail={"code": "invalid_offset"})
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.read")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
+                assigned_ids = [str(value) for value in assigned]
+                parameters = {"tenant": str(tenant_id), "client": str(client_id),
+                              "assigned": assigned_ids, "limit": limit, "offset": offset,
+                              "show_private_notes": role in ("owner", "manager")}
+                timeline_sql = """
+                    WITH timeline AS (
+                        SELECT e.occurred_at, e.id AS sort_id, e.action,
+                               e.resource_type AS source_type, e.resource_id AS source_id,
+                               e.actor_issuer, e.actor_subject, e.reason,
+                               e.changed_fields,
+                               jsonb_build_object() AS details
+                        FROM tenant_audit_events e
+                        WHERE e.tenant_id=:tenant AND (
+                            (e.resource_type='client' AND e.resource_id=:client) OR
+                            (e.resource_type='client_contact' AND e.resource_id IN (
+                                SELECT id FROM client_contacts WHERE tenant_id=:tenant AND client_id=:client
+                            ))
+                        ) AND (:owner OR EXISTS (
+                            SELECT 1 FROM clients c WHERE c.tenant_id=:tenant AND c.id=:client
+                              AND c.preferred_location_id=ANY(:assigned)
+                        ))
+                        UNION ALL
+                        SELECT t.occurred_at, t.id, 'appointment.status_changed', 'appointment',
+                               t.appointment_id, t.actor_issuer, t.actor_subject, NULL::text,
+                               ARRAY[]::text[], jsonb_build_object('from_status', t.from_status,
+                                                                   'to_status', t.to_status)
+                        FROM appointment_transitions t
+                        JOIN appointments a ON a.tenant_id=t.tenant_id AND a.id=t.appointment_id
+                        WHERE t.tenant_id=:tenant AND a.client_id=:client
+                          AND (:owner OR a.location_id=ANY(:assigned))
+                        UNION ALL
+                        SELECT v.completed_at, v.id, 'visit.completed', 'visit', v.id,
+                               NULL::text, v.staff_id::text, NULL::text, ARRAY[]::text[],
+                               jsonb_build_object('services', COALESCE((
+                                   SELECT jsonb_agg(vs.service_name ORDER BY vs.sequence)
+                                   FROM visit_services vs WHERE vs.tenant_id=v.tenant_id AND vs.visit_id=v.id
+                               ), '[]'::jsonb))
+                        FROM visits v
+                        WHERE v.tenant_id=:tenant AND v.client_id=:client
+                          AND (:owner OR v.location_id=ANY(:assigned))
+                        UNION ALL
+                        SELECT n.created_at, n.id, 'visit_note.created', 'visit_note', n.id,
+                               n.author_issuer, n.author_subject, NULL::text, ARRAY[]::text[],
+                               jsonb_build_object('class', n.class, 'visibility', n.visibility, 'body', n.body)
+                        FROM visit_notes n
+                        WHERE n.tenant_id=:tenant AND n.client_id=:client
+                          AND (n.visibility <> 'private' OR :show_private_notes)
+                          AND (:owner OR (
+                              (n.appointment_id IS NULL AND EXISTS (
+                                  SELECT 1 FROM clients c WHERE c.tenant_id=:tenant AND c.id=:client
+                                    AND c.preferred_location_id=ANY(:assigned)
+                              )) OR n.appointment_id IN (
+                                  SELECT a.id FROM appointments a WHERE a.tenant_id=:tenant
+                                    AND a.client_id=:client AND a.location_id=ANY(:assigned)
+                              )
+                          ))
+                        UNION ALL
+                        SELECT r.posted_at, r.id, 'receipt.recorded', 'salon_receipt', r.id,
+                               NULL::text, NULL::text, NULL::text, ARRAY[]::text[],
+                               jsonb_build_object('kind', r.kind, 'amount_minor', r.amount_minor,
+                                                  'currency', r.currency, 'method', r.method)
+                        FROM salon_receipt_entries r
+                        WHERE r.tenant_id=:tenant AND r.client_id=:client
+                          AND (:owner OR r.appointment_id IN (
+                              SELECT a.id FROM appointments a WHERE a.tenant_id=:tenant
+                                AND a.client_id=:client AND a.location_id=ANY(:assigned)
+                          ) OR EXISTS (SELECT 1 FROM clients c WHERE c.tenant_id=:tenant
+                                       AND c.id=:client AND c.preferred_location_id=ANY(:assigned)))
+                        UNION ALL
+                        SELECT c.created_at, c.id, 'communication.' || c.state, 'communication', c.id,
+                               NULL::text, NULL::text, NULL::text, ARRAY[]::text[],
+                               jsonb_build_object('channel', c.channel, 'purpose', c.purpose,
+                                                  'state', c.state, 'scheduled_at', c.scheduled_at,
+                                                  'dispatched_at', c.dispatched_at)
+                        FROM communications c
+                        WHERE c.tenant_id=:tenant AND c.client_id=:client
+                          AND (:owner OR c.source_id IN (
+                              SELECT a.id FROM appointments a WHERE a.tenant_id=:tenant
+                                AND a.client_id=:client AND a.location_id=ANY(:assigned)
+                          ) OR EXISTS (SELECT 1 FROM clients cl WHERE cl.tenant_id=:tenant
+                                       AND cl.id=:client AND cl.preferred_location_id=ANY(:assigned)))
+                    )
+                """
                 items = connection.execute(
-                    text("""
-                        WITH contact_ids AS (
-                            SELECT id FROM client_contacts WHERE tenant_id=:tenant AND client_id=:client
-                        )
-                        SELECT occurred_at, action,
-                               resource_type AS source_type, resource_id::text AS source_id,
-                               actor_issuer, actor_subject, reason, changed_fields
-                        FROM tenant_audit_events
-                        WHERE tenant_id=:tenant
-                          AND (
-                            (resource_type='client' AND resource_id=:client)
-                            OR (resource_type='client_contact' AND resource_id IN (SELECT id FROM contact_ids))
-                          )
-                        ORDER BY occurred_at DESC, id DESC
+                    text(timeline_sql + """
+                        SELECT occurred_at, action, source_type, source_id::text AS source_id,
+                               actor_issuer, actor_subject, reason, changed_fields, details
+                        FROM timeline ORDER BY occurred_at DESC, sort_id DESC
                         LIMIT :limit OFFSET :offset
                     """),
-                    {"tenant": str(tenant_id), "client": str(client_id), "limit": limit, "offset": offset}
+                    {**parameters, "owner": role == "owner"}
                 ).mappings().all()
                 total = connection.execute(
-                    text("""
-                        WITH contact_ids AS (
-                            SELECT id FROM client_contacts WHERE tenant_id=:tenant AND client_id=:client
-                        )
-                        SELECT count(*) FROM tenant_audit_events
-                        WHERE tenant_id=:tenant
-                          AND (
-                            (resource_type='client' AND resource_id=:client)
-                            OR (resource_type='client_contact' AND resource_id IN (SELECT id FROM contact_ids))
-                          )
-                    """),
-                    {"tenant": str(tenant_id), "client": str(client_id)}
+                    text(timeline_sql + "SELECT count(*) FROM timeline"),
+                    {**parameters, "owner": role == "owner"}
                 ).scalar_one()
                 results = [{
                     "occurred_at": row["occurred_at"].isoformat(),
@@ -570,6 +735,7 @@ def register_client_routes(
                     "actor": {"issuer": row["actor_issuer"], "subject": row["actor_subject"]},
                     "reason": row["reason"],
                     "changed_fields": list(row["changed_fields"]),
+                    "details": row["details"],
                 } for row in items]
             return {"items": results, "total": total, "limit": limit, "offset": offset}
         finally:
@@ -582,13 +748,22 @@ def register_client_routes(
         client_id = uuid.uuid4()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
                 prepared = [_validated_contact(item) for item in payload.contacts]
-                if payload.preferred_location_id is not None:
+                preferred_location_id = payload.preferred_location_id
+                if role != "owner":
+                    if preferred_location_id is None:
+                        if len(assigned) == 1:
+                            preferred_location_id = assigned[0]
+                        else:
+                            raise HTTPException(status_code=422, detail={"code": "client_location_required"})
+                    if preferred_location_id not in assigned:
+                        raise HTTPException(status_code=404, detail={"code": "location_not_found"})
+                if preferred_location_id is not None:
                     owned = connection.execute(
                         text("SELECT 1 FROM locations WHERE tenant_id=:tenant AND id=:location"),
-                        {"tenant": str(tenant_id), "location": str(payload.preferred_location_id)}).scalar_one_or_none()
+                        {"tenant": str(tenant_id), "location": str(preferred_location_id)}).scalar_one_or_none()
                     if owned is None:
                         raise HTTPException(status_code=404, detail={"code": "location_not_found"})
                 connection.execute(
@@ -599,7 +774,7 @@ def register_client_routes(
                     {"tenant": str(tenant_id), "id": str(client_id), "name": payload.name,
                      "preferred": payload.preferred_name, "locale": payload.locale,
                      "lifecycle": payload.lifecycle,
-                     "location": str(payload.preferred_location_id) if payload.preferred_location_id else None,
+                     "location": str(preferred_location_id) if preferred_location_id else None,
                      "source": payload.source})
                 duplicates = 0
                 # Exactly one contact is primary: the first the caller marked, or the
@@ -625,9 +800,9 @@ def register_client_routes(
                              request_id=request.state.request_id,
                              changed_fields=(["name", "locale", "source", "lifecycle"]
                                              + (["preferred_name"] if payload.preferred_name else [])
-                                             + (["preferred_location_id"] if payload.preferred_location_id else [])
+                                             + (["preferred_location_id"] if preferred_location_id else [])
                                              + (["contacts"] if payload.contacts else [])))
-                body = read_client(connection, tenant_id, client_id, role)
+                body = read_client(connection, tenant_id, client_id, role, assigned)
             return JSONResponse(status_code=201,
                                 content={**body, "duplicate_candidates": duplicates},
                                 headers={"X-Request-ID": str(request.state.request_id)})
@@ -639,9 +814,9 @@ def register_client_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.read")
-                return read_client(connection, tenant_id, client_id, role)
+                return read_client(connection, tenant_id, client_id, role, assigned)
         finally:
             engine.dispose()
 
@@ -669,11 +844,18 @@ def register_client_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
+                if role != "owner" and "preferred_location_id" in changes:
+                    if changes["preferred_location_id"] is None or uuid.UUID(str(changes["preferred_location_id"])) not in assigned:
+                        raise HTTPException(status_code=404, detail={"code": "location_not_found"})
                 current = connection.execute(
-                    text("SELECT version FROM clients WHERE tenant_id=:tenant AND id=:client AND deleted_at IS NULL FOR UPDATE"),
-                    {"tenant": str(tenant_id), "client": str(client_id)}).scalar_one_or_none()
+                    text("SELECT version FROM clients WHERE tenant_id=:tenant AND id=:client AND deleted_at IS NULL "
+                         + ("" if role == "owner" else "AND (preferred_location_id=ANY(:assigned) OR EXISTS "
+                            "(SELECT 1 FROM appointments a WHERE a.tenant_id=clients.tenant_id AND a.client_id=clients.id "
+                            "AND a.location_id=ANY(:assigned))) ") + "FOR UPDATE"),
+                    {"tenant": str(tenant_id), "client": str(client_id),
+                     **({"assigned": [str(value) for value in assigned]} if role != "owner" else {})}).scalar_one_or_none()
                 if current is None:
                     raise HTTPException(status_code=404, detail={"code": "client_not_found"})
                 # Optimistic concurrency (api-contracts.md:13).
@@ -699,7 +881,7 @@ def register_client_routes(
                              reason="client profile updated",
                              request_id=request.state.request_id,
                              changed_fields=sorted(set(changes) | set(cleared)))
-                body = read_client(connection, tenant_id, client_id, role)
+                body = read_client(connection, tenant_id, client_id, role, assigned)
             return {**body, "version": updated["version"]}
         finally:
             engine.dispose()
@@ -710,9 +892,9 @@ def register_client_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
                 normalized, display = _validated_contact(payload)
                 contact_id = uuid.uuid4()
                 connection.execute(
@@ -733,7 +915,7 @@ def register_client_routes(
                              reason=f"{payload.kind} contact added",
                              request_id=request.state.request_id,
                              changed_fields=["contact_kind", "contact_source"])
-                body = read_client(connection, tenant_id, client_id, role)
+                body = read_client(connection, tenant_id, client_id, role, assigned)
             return JSONResponse(status_code=201,
                                 content={**body, "duplicate_candidates": duplicates},
                                 headers={"X-Request-ID": str(request.state.request_id)})
@@ -747,9 +929,9 @@ def register_client_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
                 current = connection.execute(
                     text("SELECT verification FROM client_contacts WHERE tenant_id=:tenant AND client_id=:client AND id=:contact FOR UPDATE"),
                     {"tenant": str(tenant_id), "client": str(client_id), "contact": str(contact_id)}).scalar_one_or_none()
@@ -774,7 +956,7 @@ def register_client_routes(
                              reason=f"contact verification set to {payload.verification}",
                              request_id=request.state.request_id,
                              changed_fields=["contact_verification", "contact_deliverability"])
-                return read_client(connection, tenant_id, client_id, role)
+                return read_client(connection, tenant_id, client_id, role, assigned)
         finally:
             engine.dispose()
 
@@ -786,8 +968,10 @@ def register_client_routes(
         def_id = uuid.uuid4()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
+                _validate_definition_schema(payload.type, payload.validation)
+                _require_field_sensitivity(role, payload.sensitivity)
                 connection.execute(
                     text("""INSERT INTO client_field_definitions
                             (tenant_id, id, entity_type, key, label, type, validation, purpose, sensitivity)
@@ -821,7 +1005,7 @@ def register_client_routes(
             raise HTTPException(status_code=422, detail={"code": "invalid_offset"})
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.read")
                 where = "tenant_id=:tenant"
                 params = {"tenant": str(tenant_id)}
@@ -846,18 +1030,29 @@ def register_client_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
                 current = connection.execute(
                     text("SELECT * FROM client_field_definitions WHERE tenant_id=:tenant AND id=:id FOR UPDATE"),
                     {"tenant": str(tenant_id), "id": str(def_id)}).mappings().one_or_none()
                 if current is None:
                     raise HTTPException(status_code=404, detail={"code": "field_definition_not_found"})
+                if payload.expected_version is None:
+                    raise HTTPException(status_code=428, detail={"code": "expected_version_required"})
                 if payload.expected_version is not None and payload.expected_version != current["version"]:
                     raise HTTPException(status_code=409, detail={"code": "field_definition_version_conflict"})
                 changes = payload.model_dump(exclude_unset=True, exclude={"expected_version"})
                 if not changes:
                     raise HTTPException(status_code=422, detail={"code": "field_definition_change_required"})
+                next_sensitivity = changes.get("sensitivity", current["sensitivity"])
+                _require_field_sensitivity(role, next_sensitivity)
+                if "validation" in changes:
+                    _validate_definition_schema(current["type"], changes["validation"])
+                    value_count = connection.execute(
+                        text("SELECT count(*) FROM client_field_values WHERE tenant_id=:tenant AND definition_id=:id"),
+                        {"tenant": str(tenant_id), "id": str(def_id)}).scalar_one()
+                    if value_count:
+                        raise HTTPException(status_code=409, detail={"code": "field_definition_in_use"})
                 merged = {**changes, **{k: None for k, v in changes.items() if v is None}}
                 assignments = ", ".join(f"{k}=:{k}" for k in merged)
                 params = {"tenant": str(tenant_id), "id": str(def_id), **merged}
@@ -881,11 +1076,11 @@ def register_client_routes(
         val_id = uuid.uuid4()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
                 definition = connection.execute(
-                    text("SELECT * FROM client_field_definitions WHERE tenant_id=:tenant AND id=:id"),
+                    text("SELECT * FROM client_field_definitions WHERE tenant_id=:tenant AND id=:id FOR SHARE"),
                     {"tenant": str(tenant_id), "id": str(payload.definition_id)}).mappings().one_or_none()
                 if definition is None:
                     raise HTTPException(status_code=404, detail={"code": "field_definition_not_found"})
@@ -926,9 +1121,9 @@ def register_client_routes(
             raise HTTPException(status_code=422, detail={"code": "invalid_offset"})
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.read")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
                 rows = connection.execute(
                     text("""SELECT v.*, d.key, d.type, d.sensitivity, d.validation
                             FROM client_field_values v
@@ -952,16 +1147,21 @@ def register_client_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
                 current = connection.execute(
                     text("""SELECT v.*, d.type, d.validation FROM client_field_values v
                             JOIN client_field_definitions d ON d.tenant_id=v.tenant_id AND d.id=v.definition_id
-                            WHERE v.tenant_id=:tenant AND v.id=:id FOR UPDATE"""),
-                    {"tenant": str(tenant_id), "id": str(value_id)}).mappings().one_or_none()
+                            WHERE v.tenant_id=:tenant AND v.id=:id AND v.entity_type='client'
+                              AND v.entity_id=:client FOR UPDATE"""),
+                    {"tenant": str(tenant_id), "id": str(value_id), "client": str(client_id)}).mappings().one_or_none()
                 if current is None:
                     raise HTTPException(status_code=404, detail={"code": "field_value_not_found"})
+                if payload.expected_version is None:
+                    raise HTTPException(status_code=428, detail={"code": "expected_version_required"})
+                if payload.expected_version != current["version"]:
+                    raise HTTPException(status_code=409, detail={"code": "field_value_version_conflict"})
                 # URL path provides client_id; no entity_type/entity_id in patch payload
                 validated = _validate_field_value(dict(current), payload)
                 col, val = _build_field_value_update(dict(current), validated)
@@ -985,9 +1185,13 @@ def register_client_routes(
         note_id = uuid.uuid4()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
+                if payload.class_ in ("clinical", "allergy") and payload.visibility != "private":
+                    raise HTTPException(status_code=422, detail={"code": "sensitive_note_must_be_private"})
+                if payload.visibility == "private":
+                    _require_field_sensitivity(role, "private")
                 author_issuer = getattr(identity, 'issuer', 'unknown')
                 author_subject = getattr(identity, 'subject', 'unknown')
                 connection.execute(
@@ -1022,9 +1226,9 @@ def register_client_routes(
             raise HTTPException(status_code=422, detail={"code": "invalid_offset"})
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.read")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
                 # Owner and manager have clients.sensitive.read per ROLE_PERMISSIONS
                 has_sensitive = role in ("owner", "manager")
                 rows = connection.execute(
@@ -1043,9 +1247,9 @@ def register_client_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
                 current = connection.execute(
                     text("SELECT * FROM visit_notes WHERE tenant_id=:tenant AND id=:id FOR UPDATE"),
                     {"tenant": str(tenant_id), "id": str(note_id)}).mappings().one_or_none()
@@ -1053,6 +1257,8 @@ def register_client_routes(
                     raise HTTPException(status_code=404, detail={"code": "visit_note_not_found"})
                 if str(current["client_id"]) != str(client_id):
                     raise HTTPException(status_code=422, detail={"code": "client_id_mismatch"})
+                if payload.expected_version is None:
+                    raise HTTPException(status_code=428, detail={"code": "expected_version_required"})
                 # Optimistic concurrency
                 expected = payload.model_dump(exclude_unset=True).get("expected_version")
                 if expected is not None and expected != current["version"]:
@@ -1060,6 +1266,12 @@ def register_client_routes(
                 changes = payload.model_dump(exclude_unset=True, exclude={"expected_version"})
                 if not changes:
                     raise HTTPException(status_code=422, detail={"code": "visit_note_change_required"})
+                next_class = changes.get("class_", current["class"])
+                next_visibility = changes.get("visibility", current["visibility"])
+                if next_class in ("clinical", "allergy") and next_visibility != "private":
+                    raise HTTPException(status_code=422, detail={"code": "sensitive_note_must_be_private"})
+                if next_visibility == "private":
+                    _require_field_sensitivity(role, "private")
                 merged = {**changes, **{k: None for k, v in changes.items() if v is None}}
                 if "class_" in merged:
                     merged["class"] = merged.pop("class_")
@@ -1085,9 +1297,10 @@ def register_client_routes(
         pref_id = uuid.uuid4()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
+                _validate_preference_value(payload.preference_type, payload.value_json)
                 connection.execute(
                     text("""INSERT INTO client_preferences
                             (tenant_id, id, client_id, preference_type, service_id, staff_id, location_id, value_json, source)
@@ -1121,14 +1334,16 @@ def register_client_routes(
             raise HTTPException(status_code=422, detail={"code": "invalid_offset"})
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.read")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
                 total = connection.execute(
-                    text("SELECT count(*) FROM client_preferences WHERE tenant_id=:tenant AND client_id=:client"),
+                    text("""SELECT count(*) FROM client_preferences WHERE tenant_id=:tenant AND client_id=:client
+                          AND preference_type NOT IN ('product_allergy', 'sensitivity_note')"""),
                     {"tenant": str(tenant_id), "client": str(client_id)}).scalar_one()
                 rows = connection.execute(
                     text("SELECT * FROM client_preferences WHERE tenant_id=:tenant AND client_id=:client "
+                         "AND preference_type NOT IN ('product_allergy', 'sensitivity_note') "
                          "ORDER BY preference_type, updated_at DESC LIMIT :limit OFFSET :offset"),
                     {"tenant": str(tenant_id), "client": str(client_id), "limit": limit, "offset": offset}).mappings().all()
             return {"items": [dict(r) for r in rows], "total": total, "limit": limit, "offset": offset}
@@ -1142,9 +1357,9 @@ def register_client_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "clients.operational.write")
-                client_or_404(connection, tenant_id, client_id)
+                client_or_404(connection, tenant_id, client_id, role, assigned)
                 current = connection.execute(
                     text("SELECT * FROM client_preferences WHERE tenant_id=:tenant AND id=:id FOR UPDATE"),
                     {"tenant": str(tenant_id), "id": str(pref_id)}).mappings().one_or_none()
@@ -1152,11 +1367,16 @@ def register_client_routes(
                     raise HTTPException(status_code=404, detail={"code": "preference_not_found"})
                 if str(current["client_id"]) != str(client_id):
                     raise HTTPException(status_code=422, detail={"code": "client_id_mismatch"})
+                if payload.expected_version is None:
+                    raise HTTPException(status_code=428, detail={"code": "expected_version_required"})
+                if payload.expected_version != current["version"]:
+                    raise HTTPException(status_code=409, detail={"code": "preference_version_conflict"})
                 changes = payload.model_dump(exclude_unset=True, exclude={"expected_version"})
                 if not changes:
                     raise HTTPException(status_code=422, detail={"code": "preference_change_required"})
                 merged = {**changes, **{k: None for k, v in changes.items() if v is None}}
                 if "value_json" in merged:
+                    _validate_preference_value(current["preference_type"], merged["value_json"])
                     merged["value_json"] = json.dumps(merged["value_json"])
                 assignments = ", ".join(f"{k}=:{k}" for k in merged)
                 params = {"tenant": str(tenant_id), "id": str(pref_id), **merged}
@@ -1171,3 +1391,4 @@ def register_client_routes(
             return dict(updated)
         finally:
             engine.dispose()
+

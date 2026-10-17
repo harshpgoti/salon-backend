@@ -43,6 +43,19 @@ def _sender_conn(engine, tenant_id):
     return conn
 
 
+def _isolate_booking_email(engine, tenant_id, appointment_id):
+    """Keep the booking fixture's unrelated email notices out of SMS assertions."""
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                     {"t": tenant_id})
+        conn.execute(text("""UPDATE communications
+            SET state='skipped_stale', skip_reason='isolated SMS test fixture',
+                version=version+1, updated_at=now()
+            WHERE tenant_id=:t AND source_id=:appointment AND channel='email'
+              AND state='recorded'"""),
+                     {"t": tenant_id, "appointment": appointment_id})
+
+
 def test_sms_ac1_register_verify_routes_with_identity(database_url):
     """AC-1: pending -> verified sender routes SMS stamped with its identity."""
     issuer = "https://identity.example.invalid/sms-1"
@@ -50,6 +63,7 @@ def test_sms_ac1_register_verify_routes_with_identity(database_url):
     client = _client(database_url, owner)
     try:
         _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
+        _isolate_booking_email(engine, tenant["tenant_id"], appt_id)
         email = _client_email(engine, tenant["tenant_id"], client_id)
         conn = _sender_conn(engine, tenant["tenant_id"])
         try:
@@ -98,6 +112,54 @@ def test_sms_ac1_register_verify_routes_with_identity(database_url):
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
 
+def test_sms_ac2_cost_uses_versioned_template_segments(database_url):
+    """AC-2: the ledger estimates multiple SMS segments from the selected template."""
+    issuer = "https://identity.example.invalid/sms-segments"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    try:
+        _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
+        _isolate_booking_email(engine, tenant["tenant_id"], appt_id)
+        conn = _sender_conn(engine, tenant["tenant_id"])
+        try:
+            sender = register_sender(conn, tenant_id=tenant["tenant_id"],
+                                     label="Main", sender_identity="+14165550133")
+            verify_sender(conn, tenant_id=tenant["tenant_id"], sender_id=sender["id"],
+                          code=sender["verification_code"])
+            template_id = conn.execute(text("""INSERT INTO message_templates
+                (tenant_id, channel, purpose, locale, version, body, is_active)
+                VALUES (:tenant, 'sms', 'appointment_reminder', 'en-CA', 1, :body, true)
+                RETURNING id::text"""),
+                {"tenant": tenant["tenant_id"], "body": "x" * 321}).scalar_one()
+            row = record_booking_communication(
+                connection=conn, tenant_id=tenant["tenant_id"], appointment_id=appt_id,
+                client_id=client_id, contact_value="+14165550101", channel="sms",
+                purpose="appointment_reminder_24h", entity_version=1,
+                template_id=template_id, template_version=1)
+            assert row is not None
+            conn.commit()
+        finally:
+            conn.close()
+
+        adapter = RecordingAdapter()
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            summary = dispatch_due_communications(
+                connection=conn, tenant_id=tenant["tenant_id"], adapter=adapter)
+        assert summary["dispatched"] == 1
+        assert adapter.records[0]["sender"] == "+14165550133"
+        with engine.connect() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            cost = conn.execute(text("""SELECT segments, cost_minor, currency
+                FROM message_costs WHERE tenant_id=:t AND communication_id=:id"""),
+                {"t": tenant["tenant_id"], "id": row["id"]}).mappings().one()
+        assert cost == {"segments": 3, "cost_minor": 3, "currency": "CAD"}
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
 def test_sms_ac1_sender_identity_never_pooled_across_salons(database_url):
     """AC-1: a number serving one salon cannot register to another."""
     issuer_a = "https://identity.example.invalid/sms-2a"
@@ -131,6 +193,7 @@ def test_sms_ac1_unverified_salon_fails_sms_without_sending(database_url):
     client = _client(database_url, owner)
     try:
         _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
+        _isolate_booking_email(engine, tenant["tenant_id"], appt_id)
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
@@ -154,7 +217,8 @@ def test_sms_ac1_unverified_salon_fails_sms_without_sending(database_url):
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
             state = conn.execute(
-                text("SELECT state, skip_reason FROM communications WHERE tenant_id=:t"),
+                text("""SELECT state, skip_reason FROM communications WHERE tenant_id=:t
+                       AND channel='sms' AND purpose='appointment_reminder_24h'"""),
                 {"t": tenant["tenant_id"]}).mappings().one()
         assert state["state"] == "failed"
         assert "no verified SMS sender" in state["skip_reason"]
@@ -199,6 +263,7 @@ def test_sms_ac2_inbound_stop_suppresses_future_sends(database_url):
     client = _client(database_url, owner)
     try:
         _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
+        _isolate_booking_email(engine, tenant["tenant_id"], appt_id)
         base = f"/v1/tenants/{tenant['tenant_id']}/clients"
         added = client.post(f"{base}/{client_id}/contacts",
                             json={"kind": "phone", "value": "+14165550101", "is_primary": True})

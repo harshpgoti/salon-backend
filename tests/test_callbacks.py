@@ -66,13 +66,17 @@ def _recorded_email(engine, client, tenant):
             appointment_id=appt_id, client_id=client_id,
             contact_value=email, channel="email",
             purpose="booking_confirmation", entity_version=1)
-        assert row is not None
+        if row is None:
+            row = conn.execute(text("""SELECT id::text AS id
+                FROM communications WHERE tenant_id=:t AND source_id=:a
+                  AND purpose='booking_confirmation'"""),
+                {"t": tenant["tenant_id"], "a": appt_id}).mappings().one()
         dispatch_due_communications(
             connection=conn, tenant_id=tenant["tenant_id"],
             adapter=RecordingAdapter())
-        comm_id = conn.execute(
-            text("SELECT id::text AS id FROM communications WHERE tenant_id=:t"),
-            {"t": tenant["tenant_id"]}).scalar_one()
+        comm_id = conn.execute(text("""SELECT id::text FROM communications
+            WHERE tenant_id=:t AND source_id=:a AND purpose='booking_confirmation'"""),
+            {"t": tenant["tenant_id"], "a": appt_id}).scalar_one()
     return comm_id
 
 
@@ -82,7 +86,15 @@ def test_callback_ac1_signed_delivery_advances_state(database_url):
     engine, owner, tenant = _salon(database_url, issuer)
     client = _client(database_url, owner)
     try:
-        comm_id = _recorded_email(engine, client, tenant)
+        _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            comm_id = conn.execute(
+                text("SELECT id::text FROM communications WHERE tenant_id=:t AND source_id=:a AND channel='email' LIMIT 1"),
+                {"t": tenant["tenant_id"], "a": appt_id}).scalar_one()
+            conn.execute(text("UPDATE communications SET state='dispatched' WHERE tenant_id=:t AND id=:id"),
+                         {"t": tenant["tenant_id"], "id": comm_id})
         conn = _scoped(engine, tenant["tenant_id"])
         try:
             _seed_secret(conn, tenant["tenant_id"])
@@ -142,6 +154,42 @@ def test_callback_ac1_bad_signature_and_duplicates(database_url):
                 {"t": tenant["tenant_id"], "id": comm_id}).mappings().one()
             assert again["version"] == version and again["state"] == "delivered"
             conn.commit()
+        finally:
+            conn.close()
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_callback_ac1_channel_mapping_rejects_cross_channel_event(database_url):
+    """A valid account signature cannot map an email event as an SMS event."""
+    issuer = "https://identity.example.invalid/cb-channel-map"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    try:
+        _, _, _, _, appt_id, _ = _booked_appointment(client, tenant)
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            comm_id = conn.execute(text("""SELECT id::text FROM communications
+                WHERE tenant_id=:t AND source_id=:a AND channel='email' LIMIT 1"""),
+                {"t": tenant["tenant_id"], "a": appt_id}).scalar_one()
+            conn.execute(text("UPDATE communications SET state='dispatched' WHERE tenant_id=:t AND id=:id"),
+                         {"t": tenant["tenant_id"], "id": comm_id})
+        conn = _scoped(engine, tenant["tenant_id"])
+        try:
+            _seed_secret(conn, tenant["tenant_id"], channel="sms")
+            body = b"{}"
+            with pytest.raises(CallbackModuleError, match="channel"):
+                ingest_callback(
+                    conn, tenant_id=tenant["tenant_id"], channel="sms",
+                    raw_body=body, signature=sign_callback_body(SECRET, body),
+                    event="delivered", provider_event_id="evt-cross-channel",
+                    communication_id=comm_id)
+            state = conn.execute(
+                text("SELECT state FROM communications WHERE tenant_id=:t AND id=:id"),
+                {"t": tenant["tenant_id"], "id": comm_id}).scalar_one()
+            assert state == "dispatched"
+            conn.rollback()
         finally:
             conn.close()
     finally:
@@ -225,16 +273,19 @@ def test_callback_ac2_retry_backoff_then_worker_send(database_url):
     engine, owner, tenant = _salon(database_url, issuer)
     client = _client(database_url, owner)
     try:
-        _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
-        email = _client_email(engine, tenant["tenant_id"], client_id)
+        _, _, _, _, appt_id, _ = _booked_appointment(client, tenant)
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
-            record_booking_communication(
-                connection=conn, tenant_id=tenant["tenant_id"],
-                appointment_id=appt_id, client_id=client_id,
-                contact_value=email, channel="email",
-                purpose="booking_confirmation", entity_version=1)
+            # Booking creation already wrote its confirmation in the booking
+            # transaction; locate that outbox row rather than creating a duplicate.
+            comm_id = conn.execute(text("""SELECT id::text FROM communications
+                WHERE tenant_id=:t AND source_id=:a AND channel='email'
+                  AND purpose='booking_confirmation' ORDER BY created_at LIMIT 1"""),
+                {"t": tenant["tenant_id"], "a": appt_id}).scalar_one()
+            conn.execute(text("""UPDATE communications SET state='skipped_stale'
+                WHERE tenant_id=:t AND source_id=:a AND id<>:id AND state='recorded'"""),
+                {"t": tenant["tenant_id"], "a": appt_id, "id": comm_id})
             before = dispatch_due_communications(
                 connection=conn, tenant_id=tenant["tenant_id"],
                 adapter=FailingAdapter())
@@ -261,8 +312,8 @@ def test_callback_ac2_retry_backoff_then_worker_send(database_url):
                 text("SELECT state FROM dispatch_attempts WHERE tenant_id=:t ORDER BY attempt"),
                 {"t": tenant["tenant_id"]}).scalars().all()
             comm_state = conn.execute(
-                text("SELECT state FROM communications WHERE tenant_id=:t"),
-                {"t": tenant["tenant_id"]}).scalar_one()
+                text("SELECT state FROM communications WHERE tenant_id=:t AND id=:id"),
+                {"t": tenant["tenant_id"], "id": comm_id}).scalar_one()
         assert states == ["succeeded"]
         assert comm_state == "dispatched"
     finally:
@@ -275,16 +326,19 @@ def test_callback_ac2_exhaustion_dead_letters_and_manual_retry(database_url):
     engine, owner, tenant = _salon(database_url, issuer)
     client = _client(database_url, owner)
     try:
-        _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
-        email = _client_email(engine, tenant["tenant_id"], client_id)
+        _, _, _, _, appt_id, _ = _booked_appointment(client, tenant)
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
-            record_booking_communication(
-                connection=conn, tenant_id=tenant["tenant_id"],
-                appointment_id=appt_id, client_id=client_id,
-                contact_value=email, channel="email",
-                purpose="booking_confirmation", entity_version=1)
+            # Booking creation already wrote its confirmation in the booking
+            # transaction; locate the existing outbox row rather than adding another.
+            comm_id = conn.execute(text("""SELECT id::text FROM communications
+                WHERE tenant_id=:t AND source_id=:a AND channel='email'
+                  AND purpose='booking_confirmation' ORDER BY created_at LIMIT 1"""),
+                {"t": tenant["tenant_id"], "a": appt_id}).scalar_one()
+            conn.execute(text("""UPDATE communications SET state='skipped_stale'
+                WHERE tenant_id=:t AND source_id=:a AND id<>:id AND state='recorded'"""),
+                {"t": tenant["tenant_id"], "a": appt_id, "id": comm_id})
             dispatch_due_communications(
                 connection=conn, tenant_id=tenant["tenant_id"],
                 adapter=FailingAdapter())
@@ -301,8 +355,8 @@ def test_callback_ac2_exhaustion_dead_letters_and_manual_retry(database_url):
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
             comm = conn.execute(
-                text("SELECT id::text AS id, state FROM communications WHERE tenant_id=:t"),
-                {"t": tenant["tenant_id"]}).mappings().one()
+                text("SELECT id::text AS id, state FROM communications WHERE tenant_id=:t AND id=:id"),
+                {"t": tenant["tenant_id"], "id": comm_id}).mappings().one()
             letters = conn.execute(
                 text("""SELECT reason, attempts, resolved_at FROM dead_letters
                         WHERE tenant_id=:t"""),
@@ -327,24 +381,22 @@ def test_callback_ac2_crash_reclaim_never_double_sends(database_url):
     engine, owner, tenant = _salon(database_url, issuer)
     client = _client(database_url, owner)
     try:
-        _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
-        email = _client_email(engine, tenant["tenant_id"], client_id)
+        _, _, _, _, appt_id, _ = _booked_appointment(client, tenant)
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
-            record_booking_communication(
-                connection=conn, tenant_id=tenant["tenant_id"],
-                appointment_id=appt_id, client_id=client_id,
-                contact_value=email, channel="email",
-                purpose="booking_confirmation", entity_version=1)
+            comm_id = conn.execute(text("""SELECT id::text FROM communications
+                WHERE tenant_id=:t AND source_id=:a AND channel='email'
+                  AND purpose='booking_confirmation' ORDER BY created_at LIMIT 1"""),
+                {"t": tenant["tenant_id"], "a": appt_id}).scalar_one()
+            conn.execute(text("""UPDATE communications SET state='skipped_stale'
+                WHERE tenant_id=:t AND source_id=:a AND id<>:id AND state='recorded'"""),
+                {"t": tenant["tenant_id"], "a": appt_id, "id": comm_id})
             dispatch_due_communications(
                 connection=conn, tenant_id=tenant["tenant_id"],
                 adapter=FailingAdapter())
             queued = queue_retry(connection=conn, tenant_id=tenant["tenant_id"],
-                                 communication_id=conn.execute(
-                                     text("SELECT id::text FROM communications WHERE tenant_id=:t"),
-                                     {"t": tenant["tenant_id"]}).scalar_one(),
-                                 error="boom")
+                                 communication_id=comm_id, error="boom")
             assert queued["attempt"] == 2
         future = datetime.now(timezone.utc) + timedelta(hours=1)
         with engine.begin() as first:
@@ -364,6 +416,132 @@ def test_callback_ac2_crash_reclaim_never_double_sends(database_url):
                 {"t": tenant["tenant_id"]})
             assert reclaim_stale_sending(connection=first,
                                          tenant_id=tenant["tenant_id"]) == 1
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_callback_ac2_ambiguous_acceptance_reuses_provider_idempotency_key(database_url):
+    """A lost response followed by retry resolves the first provider receipt."""
+    issuer = "https://identity.example.invalid/cb-ambiguous"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+
+    provider_receipts = {}  # external provider idempotency store survives worker restart
+    adapter_keys = []
+    acceptances = {"count": 0}
+
+    class AcceptThenTimeoutAdapter:
+        def send(self, *, channel, recipient, template, sender=None,
+                 unsubscribe_url=None, idempotency_key=None):
+            adapter_keys.append(idempotency_key)
+            if idempotency_key not in provider_receipts:
+                acceptances["count"] += 1
+                receipt = {"status": "accepted", "id": "provider-receipt-1"}
+                provider_receipts[idempotency_key] = receipt
+                raise TimeoutError("provider accepted, response was lost")
+            return provider_receipts[idempotency_key]
+
+    try:
+        _, _, _, _, appt_id, _ = _booked_appointment(client, tenant)
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            comm_id = conn.execute(text("""SELECT id::text FROM communications
+                WHERE tenant_id=:t AND source_id=:a AND channel='email'
+                  AND purpose='booking_confirmation' ORDER BY created_at LIMIT 1"""),
+                {"t": tenant["tenant_id"], "a": appt_id}).scalar_one()
+            conn.execute(text("""UPDATE communications SET state='skipped_stale'
+                WHERE tenant_id=:t AND source_id=:a AND id<>:id AND state='recorded'"""),
+                {"t": tenant["tenant_id"], "a": appt_id, "id": comm_id})
+
+        adapter = AcceptThenTimeoutAdapter()
+        # A fresh adapter instance represents a worker process restart; only
+        # the provider's idempotency store survives it.
+        adapter_after_restart = AcceptThenTimeoutAdapter()
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            first = dispatch_due_communications(
+                connection=conn, tenant_id=tenant["tenant_id"], adapter=adapter)
+        assert first["retry_scheduled"] == 1
+        assert len(adapter_keys) == 1, (first, adapter_keys)
+
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            second = dispatch_claimed_retries(
+                connection=conn, tenant_id=tenant["tenant_id"], adapter=adapter_after_restart,
+                now=datetime.now(timezone.utc) + timedelta(minutes=10))
+        assert second["dispatched"] == 1
+        assert acceptances["count"] == 1
+        assert (len(adapter_keys) == 2 and adapter_keys[0] is not None
+                and adapter_keys[0] == adapter_keys[1])
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_callback_ac2_signed_acceptance_cancels_ambiguous_retry(database_url):
+    """A signed accepted callback reconciles timeout and prevents its queued resend."""
+    issuer = "https://identity.example.invalid/cb-accepted-reconcile"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+
+    class AcceptThenTimeoutAdapter:
+        def __init__(self):
+            self.calls = 0
+
+        def send(self, *, channel, recipient, template, sender=None,
+                 unsubscribe_url=None, idempotency_key=None):
+            self.calls += 1
+            raise TimeoutError("provider accepted, response was lost")
+
+    try:
+        _, _, _, _, appt_id, _ = _booked_appointment(client, tenant)
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            comm_id = conn.execute(text("""SELECT id::text FROM communications
+                WHERE tenant_id=:t AND source_id=:a AND channel='email'
+                  AND purpose='booking_confirmation' ORDER BY created_at LIMIT 1"""),
+                {"t": tenant["tenant_id"], "a": appt_id}).scalar_one()
+            conn.execute(text("""UPDATE communications SET state='skipped_stale'
+                WHERE tenant_id=:t AND source_id=:a AND id<>:id AND state='recorded'"""),
+                {"t": tenant["tenant_id"], "a": appt_id, "id": comm_id})
+
+        adapter = AcceptThenTimeoutAdapter()
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            first = dispatch_due_communications(
+                connection=conn, tenant_id=tenant["tenant_id"], adapter=adapter)
+        assert first["retry_scheduled"] == 1 and adapter.calls == 1
+
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            _seed_secret(conn, tenant["tenant_id"], channel="email")
+            body = b"{}"
+            reconciled = ingest_callback(
+                conn, tenant_id=tenant["tenant_id"], channel="email",
+                raw_body=body, signature=sign_callback_body(SECRET, body),
+                event="accepted", provider_event_id="evt-accepted-after-timeout",
+                communication_id=comm_id)
+            assert reconciled["state"] == "dispatched"
+
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            second = dispatch_claimed_retries(
+                connection=conn, tenant_id=tenant["tenant_id"], adapter=adapter,
+                now=datetime.now(timezone.utc) + timedelta(minutes=10))
+        assert second["dispatched"] == 0 and adapter.calls == 1
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            attempt_states = conn.execute(
+                text("SELECT state FROM dispatch_attempts WHERE tenant_id=:t"),
+                {"t": tenant["tenant_id"]}).scalars().all()
+        assert attempt_states == ["superseded"]
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 

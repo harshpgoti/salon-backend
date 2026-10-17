@@ -69,27 +69,28 @@ def _as_json(value):
     return list(value)
 
 
-def _grant_valid(connection, *, grant_id: str, tenant_id: str) -> dict | None:
-    """Return the grant iff it authorizes a diagnostic read right now.
+def _grant_valid(connection, *, grant_id: str, tenant_id: str, identity) -> dict | None:
+    """Authorize the requesting employee's diagnostic read of a working case.
 
-    Read-only by design: an expired grant reports None, and the caller flips
-    it to expired in a separate transaction — flipping inside the reading
-    transaction would roll back together with the 403.
+    Callers first lock the active employee via company_scope(lock=True).
+    Share locks keep grant revocation and case closure ordered after this read.
+    Invalid/expired grants are not locked; a denial does not alter other grants.
     """
     row = connection.execute(
-        text("""SELECT id::text AS id, case_id::text AS case_id, scope, status,
-                       expires_at FROM support_access_grants
-                WHERE id=:id AND tenant_id=:tenant"""),
-        {"id": grant_id, "tenant": tenant_id}).mappings().one_or_none()
-    if row is None or row["status"] != "approved":
+        text("""SELECT g.id::text AS id, g.case_id::text AS case_id,
+                       g.scope, g.status, g.expires_at
+                FROM support_access_grants g
+                JOIN support_cases c ON c.id=g.case_id AND c.tenant_id=g.tenant_id
+                WHERE g.id=:id AND g.tenant_id=:tenant
+                  AND g.status='approved' AND g.scope='diagnostic'
+                  AND g.requested_by_issuer=:issuer AND g.requested_by_subject=:subject
+                  AND g.expires_at IS NOT NULL AND g.expires_at > clock_timestamp()
+                  AND c.status IN ('open', 'triaged', 'assigned')
+                FOR SHARE OF g, c"""),
+        {"id": grant_id, "tenant": tenant_id,
+         "issuer": identity.issuer, "subject": identity.subject}).mappings().one_or_none()
+    if row is None or row["expires_at"] <= datetime.now(timezone.utc):
         return None
-    now = datetime.now(timezone.utc)
-    expires = row["expires_at"]
-    if expires is not None:
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
-        if expires <= now:
-            return None
     return dict(row)
 
 
@@ -98,7 +99,7 @@ def _mark_expired(connection, *, grant_id: str) -> None:
     connection.execute(
         text("""UPDATE support_access_grants SET status='expired',
                        version=version+1, updated_at=now()
-                WHERE id=:id AND status='approved'"""),
+                WHERE id=:id AND status='approved' AND expires_at <= clock_timestamp()"""),
         {"id": grant_id})
 
 
@@ -106,7 +107,9 @@ class CaseIn(BaseModel):
     tenant_id: uuid.UUID
     title: str = Field(min_length=1, max_length=160)
     severity: str = Field(default="medium", pattern="^(low|medium|high|urgent)$")
+    request_id: uuid.UUID | None = None
     appointment_id: uuid.UUID | None = None
+    job_id: uuid.UUID | None = None
     communication_id: uuid.UUID | None = None
     trace_id: str | None = Field(default=None, max_length=120)
     notes: str | None = Field(default=None, max_length=4000)
@@ -145,17 +148,37 @@ def register_support_routes(
                     {"t": str(payload.tenant_id)}).scalar_one_or_none()
                 if name is None:
                     raise HTTPException(status_code=404, detail={"code": "tenant_not_found"})
+                if payload.appointment_id or payload.communication_id or payload.job_id:
+                    connection.execute(
+                        text("SELECT set_config('app.tenant_id', :t, true)"),
+                        {"t": str(payload.tenant_id)})
+                    for table, value in (
+                        ("appointments", payload.appointment_id),
+                        ("communications", payload.communication_id),
+                        ("tenant_jobs", payload.job_id),
+                    ):
+                        if value is not None:
+                            found = connection.execute(
+                                text(f"SELECT 1 FROM {table} WHERE tenant_id=:tenant AND id=:id"),
+                                {"tenant": str(payload.tenant_id), "id": str(value)},
+                            ).scalar_one_or_none()
+                            if found is None:
+                                raise HTTPException(status_code=422, detail={
+                                    "code": "support_reference_unknown",
+                                    "message": "correlation reference is not available for this salon"})
                 row = connection.execute(
                     text("""INSERT INTO support_cases
-                            (tenant_id, title, severity, appointment_id,
-                             communication_id, trace_id, internal_notes,
+                            (tenant_id, title, severity, request_id, appointment_id,
+                             job_id, communication_id, trace_id, internal_notes,
                              opened_by_issuer, opened_by_subject)
-                            VALUES (:tenant, :title, :severity, :appt, :comm,
-                                    :trace, :notes, :issuer, :subject)
+                            VALUES (:tenant, :title, :severity, :request_id, :appt,
+                                    :job_id, :comm, :trace, :notes, :issuer, :subject)
                             RETURNING id::text AS id, status"""),
                     {"tenant": str(payload.tenant_id), "title": payload.title.strip(),
+                     "request_id": str(payload.request_id) if payload.request_id else None,
                      "severity": payload.severity, "appt": str(payload.appointment_id)
                      if payload.appointment_id else None,
+                     "job_id": str(payload.job_id) if payload.job_id else None,
                      "comm": str(payload.communication_id) if payload.communication_id else None,
                      "trace": payload.trace_id,
                      "notes": redact_note(payload.notes or ""),
@@ -182,6 +205,33 @@ def register_support_routes(
                     text("SELECT company_case_list()")).scalar_one()) or []
                 if status != "all":
                     items = [i for i in items if i["status"] == status]
+                if items:
+                    case_ids = [uuid.UUID(i["id"]) for i in items]
+                    grant_rows = connection.execute(
+                        text("""SELECT g.id::text AS id, g.case_id::text AS case_id,
+                                       g.scope,
+                                       CASE WHEN g.status='approved'
+                                                  AND g.expires_at <= clock_timestamp()
+                                            THEN 'expired' ELSE g.status END AS status,
+                                       g.justification, g.requested_by_subject,
+                                       g.created_at, g.approved_at, g.expires_at,
+                                       (SELECT count(*) FROM support_grant_uses u
+                                         WHERE u.grant_id=g.id) AS uses
+                                FROM support_access_grants g
+                                WHERE g.case_id = ANY(CAST(:ids AS uuid[]))
+                                ORDER BY g.created_at DESC"""),
+                        {"ids": case_ids}).mappings().all()
+                    by_case: dict[str, list[dict]] = {}
+                    for grant in grant_rows:
+                        grant = dict(grant)
+                        grant["created_at"] = grant["created_at"].isoformat()
+                        grant["approved_at"] = (grant["approved_at"].isoformat()
+                                                if grant["approved_at"] else None)
+                        grant["expires_at"] = (grant["expires_at"].isoformat()
+                                               if grant["expires_at"] else None)
+                        by_case.setdefault(grant["case_id"], []).append(grant)
+                    for item in items:
+                        item["grants"] = by_case.get(item["id"], [])
             for item in items:
                 item.pop("internal_notes", None)
             return {"items": items}
@@ -233,7 +283,7 @@ def register_support_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role = company_scope(connection, identity)
+                role = company_scope(connection, identity, lock=True)
                 _require_company(role, "company.support.manage")
                 case = connection.execute(
                     text("""SELECT id::text AS id, tenant_id::text AS tenant_id, status
@@ -316,35 +366,31 @@ def register_support_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role = company_scope(connection, identity)
+                role = company_scope(connection, identity, lock=True)
                 _require_company(role, "company.support.manage")
                 grant = _grant_valid(connection, grant_id=str(grant_id),
-                                     tenant_id=str(tenant_id))
-                if grant is None:
-                    expired = connection.execute(
-                        text("""SELECT expires_at FROM support_access_grants
-                                WHERE id=:id AND tenant_id=:tenant AND status='approved'"""),
-                        {"id": str(grant_id),
-                         "tenant": str(tenant_id)}).scalar_one_or_none()
-                    if expired is not None:
-                        # Separate transaction: the 403 below rolls back the
-                        # reading one, which would silently resurrect the grant.
-                        with engine.begin() as outward:
-                            _mark_expired(outward, grant_id=str(grant_id))
-                    raise HTTPException(status_code=403, detail={
-                        "code": "grant_not_authorized",
-                        "message": "no active grant covers this read"})
-                snapshot = _as_json(connection.execute(
-                    text("SELECT company_tenant_diagnostics(:t)"),
-                    {"t": str(tenant_id)}).scalar_one_or_none())
-                if snapshot is None:
-                    raise HTTPException(status_code=404, detail={"code": "tenant_not_found"})
-                connection.execute(
-                    text("""INSERT INTO support_grant_uses
-                            (grant_id, tenant_id, actor_issuer, actor_subject, action)
-                            VALUES (:grant, :tenant, :issuer, :subject, 'diagnostics_read')"""),
-                    {"grant": str(grant_id), "tenant": str(tenant_id),
-                     "issuer": identity.issuer, "subject": identity.subject})
+                                     tenant_id=str(tenant_id), identity=identity)
+                if grant is not None:
+                    snapshot = _as_json(connection.execute(
+                        text("SELECT company_tenant_diagnostics(:t)"),
+                        {"t": str(tenant_id)}).scalar_one_or_none())
+                    if snapshot is None:
+                        raise HTTPException(status_code=404, detail={"code": "tenant_not_found"})
+                    connection.execute(
+                        text("""INSERT INTO support_grant_uses
+                                (grant_id, tenant_id, actor_issuer, actor_subject, action)
+                                VALUES (:grant, :tenant, :issuer, :subject, 'diagnostics_read')"""),
+                        {"grant": str(grant_id), "tenant": str(tenant_id),
+                         "issuer": identity.issuer, "subject": identity.subject})
+            if grant is None:
+                # Release any locks before persisting expiry. A grant may have
+                # expired while waiting for its row lock; upgrading a held share
+                # lock in another connection would deadlock against this read.
+                with engine.begin() as outward:
+                    _mark_expired(outward, grant_id=str(grant_id))
+                raise HTTPException(status_code=403, detail={
+                    "code": "grant_not_authorized",
+                    "message": "no active grant covers this read"})
             return {"grant_id": str(grant_id), "snapshot": snapshot}
         finally:
             engine.dispose()

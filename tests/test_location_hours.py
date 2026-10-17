@@ -1,8 +1,11 @@
 """Tests for weekly hours and dated exceptions (TASK-017, FR-022/FR-024)."""
 
 import os
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
+from sqlalchemy import text
 from test_clients import _salon, _client, _teardown
 
 
@@ -66,6 +69,95 @@ def test_invalid_and_overlapping_hours_are_rejected(database_url):
             "intervals": [{"weekday": 0, "opens_at": "09:00", "closes_at": "17:00"}]})
         assert bad_date.status_code == 422
         assert bad_date.json()["detail"]["code"] == "date_out_of_range"
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_weekly_hours_reject_nonexistent_spring_transition_time(database_url):
+    """AC-2: recurring local clocks cannot target a DST gap in the location zone."""
+    issuer = "https://identity.example.invalid/hours-weekly-dst-gap"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    base = f"/v1/tenants/{tenant['tenant_id']}"
+    location = tenant["location_id"]
+    try:
+        rejected = client.put(f"{base}/locations/{location}/hours", json={
+            "effective_from": "2027-01-01",
+            "intervals": [{"weekday": 6, "opens_at": "02:30", "closes_at": "04:00"}],
+        })
+        assert rejected.status_code == 422, rejected.text
+        assert rejected.json()["detail"]["code"] == "nonexistent_local_time"
+        assert client.get(f"{base}/locations/{location}/hours").json()["items"] == []
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_future_weekly_hours_keep_prior_period_and_publish_effective_dates(database_url):
+    """AC-1/AC-2: weekly versions apply only inside their local effective period."""
+    issuer = "https://identity.example.invalid/hours-effective-dates"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    base = f"/v1/tenants/{tenant['tenant_id']}"
+    location = tenant["location_id"]
+    try:
+        today = date.today()
+        change_on = today + timedelta(days=21)
+        prior_day = change_on - timedelta(days=7)
+        initial = client.put(f"{base}/locations/{location}/hours", json={
+            "effective_from": today.isoformat(),
+            "intervals": [{"weekday": day, "opens_at": "09:00", "closes_at": "17:00"} for day in range(7)],
+        })
+        assert initial.status_code == 200, initial.text
+        service = client.post(f"{base}/services", json={
+            "name": "Effective hours cut", "duration_minutes": 30, "price_minor": 4000}).json()["id"]
+        staff = client.post(f"{base}/staff", json={"display_name": "Effective hours stylist"}).json()["id"]
+        assert client.put(f"{base}/staff/{staff}/locations", json={"location_ids": [location]}).status_code == 200
+        assert client.put(f"{base}/staff/{staff}/qualifications", json={"service_ids": [service]}).status_code == 200
+        shift = client.post(f"{base}/staff/{staff}/shifts", json={
+            "location_id": location, "weekday": change_on.weekday(), "starts_at": "09:00", "ends_at": "17:00"})
+        assert shift.status_code == 201, shift.text
+        upcoming = client.put(f"{base}/locations/{location}/hours", json={
+            "effective_from": change_on.isoformat(),
+            "intervals": [{"weekday": change_on.weekday(), "opens_at": "11:00", "closes_at": "15:00"}],
+        })
+        assert upcoming.status_code == 200, upcoming.text
+
+        timeline = client.get(f"{base}/locations/{location}/hours").json()["items"]
+        periods = [row for row in timeline if row["weekday"] == change_on.weekday()]
+        assert {(row["effective_from"], row["effective_to"], row["opens_at"]) for row in periods} == {
+            (today.isoformat(), (change_on - timedelta(days=1)).isoformat(), "09:00"),
+            (change_on.isoformat(), None, "11:00"),
+        }
+
+        with engine.begin() as connection:
+            connection.execute(text("SELECT set_config('app.tenant_id', :tenant, true)"), {"tenant": tenant["tenant_id"]})
+            slug = connection.execute(text("SELECT booking_slug FROM locations WHERE tenant_id=:tenant AND id=:location"),
+                                      {"tenant": tenant["tenant_id"], "location": location}).scalar_one()
+        zone = ZoneInfo("America/Toronto")
+        before = client.get(f"/v1/public/salons/{slug}/availability", params={
+            "service_id": service, "date_from": prior_day.isoformat(), "date_to": prior_day.isoformat(),
+        })
+        after = client.get(f"/v1/public/salons/{slug}/availability", params={
+            "service_id": service, "date_from": change_on.isoformat(), "date_to": change_on.isoformat(),
+        })
+        assert before.status_code == 200 and before.json()["slots"], before.text
+        assert after.status_code == 200 and after.json()["slots"], after.text
+        before_times = {datetime.fromisoformat(row["starts_at"]).astimezone(zone).strftime("%H:%M")
+                        for row in before.json()["slots"]}
+        after_times = {datetime.fromisoformat(row["starts_at"]).astimezone(zone).strftime("%H:%M")
+                       for row in after.json()["slots"]}
+        assert {"09:00", "16:30"}.issubset(before_times)
+        assert "09:00" not in after_times and {"11:00", "14:30"}.issubset(after_times)
+
+        public = client.get(f"/v1/public/salons/{slug}/hours")
+        assert public.status_code == 200, public.text
+        public_body = public.json()
+        assert public_body["timezone"] == "America/Toronto"
+        public_periods = [row for row in public_body["weekly"] if row["weekday"] == change_on.weekday()]
+        assert [(row["effective_from"], row["opens_at"]) for row in public_periods] == [
+            (today.isoformat(), "09:00"), (change_on.isoformat(), "11:00"),
+        ]
+        assert "tenant_id" not in public_body and "location_id" not in public_body
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -138,6 +230,10 @@ def test_unpublished_exception_is_hidden_from_public_hours(database_url):
     base = f"/v1/tenants/{tenant['tenant_id']}"
     loc = tenant["location_id"]
     try:
+        with engine.begin() as connection:
+            connection.execute(text("SELECT set_config('app.tenant_id', :tenant, true)"), {"tenant": tenant["tenant_id"]})
+            slug = connection.execute(text("SELECT booking_slug FROM locations WHERE tenant_id=:tenant AND id=:location"),
+                                      {"tenant": tenant["tenant_id"], "location": loc}).scalar_one()
         client.put(f"{base}/locations/{loc}/hours", json={"intervals": [
             {"weekday": 0, "opens_at": "09:00", "closes_at": "17:00"}]})
         exc = client.post(f"{base}/locations/{loc}/exceptions",
@@ -145,16 +241,22 @@ def test_unpublished_exception_is_hidden_from_public_hours(database_url):
 
         public = client.get(f"{base}/locations/{loc}/public-hours").json()
         assert public["weekly"] and public["exceptions"] == []
+        anonymous = client.get(f"/v1/public/salons/{slug}/hours")
+        assert anonymous.status_code == 200 and anonymous.json()["exceptions"] == []
 
         published = client.post(f"{base}/locations/{loc}/exceptions/{exc['id']}/publish", json={"published": True})
         assert published.status_code == 200 and published.json()["published_at"]
 
         public = client.get(f"{base}/locations/{loc}/public-hours").json()
         assert len(public["exceptions"]) == 1
+        anonymous = client.get(f"/v1/public/salons/{slug}/hours")
+        assert anonymous.status_code == 200 and len(anonymous.json()["exceptions"]) == 1
+        assert "id" not in anonymous.json()["exceptions"][0]
 
         # Retracting removes it again.
         client.post(f"{base}/locations/{loc}/exceptions/{exc['id']}/publish", json={"published": False})
         assert client.get(f"{base}/locations/{loc}/public-hours").json()["exceptions"] == []
+        assert client.get(f"/v1/public/salons/{slug}/hours").json()["exceptions"] == []
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 

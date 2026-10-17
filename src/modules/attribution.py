@@ -2,8 +2,8 @@
 
 Attribution is claimed, never inferred: a booking attributes to a campaign
 send only when it carries that send's token (or the campaign's code is
-recorded by staff), and only inside a fourteen-day window after the send.
-One appointment attributes at most once — the first match wins — so revenue
+recorded by staff), and only inside the seven-day window after accepted dispatch.
+One appointment attributes at most once across offers and rebooking — the first match wins — so revenue
 is never double-counted and no causal lift is ever claimed. Reports describe
 attributed bookings and recorded receipts; the word "lift" appears nowhere.
 """
@@ -26,12 +26,32 @@ __all__ = [
     "register_redemption_routes",
 ]
 
-# Send-to-booking window: older tokens do not attribute.
-ATTRIBUTION_DAYS = 14
+# Canonical send-to-booking window from plan/analytics.md.
+ATTRIBUTION_DAYS = 7
 
 
 class RedemptionModuleError(Exception):
     """Base exception for redemption operations."""
+
+
+def claim_appointment_attribution(connection, *, tenant_id: str,
+                                  appointment_id: str, kind: str,
+                                  campaign_id: str | None = None,
+                                  cycle_id: str | None = None,
+                                  communication_id: str | None = None) -> bool:
+    """Claim the appointment once across campaign and rebooking sources."""
+    row = connection.execute(
+        text("""INSERT INTO appointment_attributions
+                    (tenant_id, appointment_id, kind, campaign_id, cycle_id,
+                     communication_id)
+                VALUES (:tenant, :appointment, :kind, :campaign, :cycle, :communication)
+                ON CONFLICT (tenant_id, appointment_id) DO NOTHING
+                RETURNING appointment_id"""),
+        {"tenant": tenant_id, "appointment": appointment_id, "kind": kind,
+         "campaign": campaign_id, "cycle": cycle_id,
+         "communication": communication_id},
+    ).scalar_one_or_none()
+    return row is not None
 
 
 def attribute_campaign_booking(connection, *, tenant_id: str,
@@ -50,7 +70,7 @@ def attribute_campaign_booking(connection, *, tenant_id: str,
     moment = now or datetime.now(timezone.utc)
     send = connection.execute(
         text("""SELECT s.campaign_id::text AS campaign_id, s.client_id::text AS client_id,
-                       s.communication_id::text AS communication_id, c.created_at
+                       s.communication_id::text AS communication_id, c.dispatched_at
                 FROM campaign_sends s
                 JOIN communications c ON c.tenant_id=s.tenant_id
                                       AND c.id=s.communication_id
@@ -59,12 +79,23 @@ def attribute_campaign_booking(connection, *, tenant_id: str,
         {"tenant": tenant_id, "token": attribution_token}).mappings().one_or_none()
     if send is None:
         return None
-    sent_at = send["created_at"]
+    sent_at = send["dispatched_at"]
+    if sent_at is None:
+        return None
     if sent_at.tzinfo is None:
         sent_at = sent_at.replace(tzinfo=timezone.utc)
-    if (moment - sent_at).days > ATTRIBUTION_DAYS:
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    if moment < sent_at or moment > sent_at + timedelta(days=ATTRIBUTION_DAYS):
         return None
+    savepoint = connection.begin_nested()
     try:
+        if not claim_appointment_attribution(
+                connection, tenant_id=tenant_id, appointment_id=appointment_id,
+                kind="campaign", campaign_id=send["campaign_id"],
+                communication_id=send["communication_id"]):
+            savepoint.rollback()
+            return None
         row = connection.execute(
             text("""INSERT INTO offer_redemptions
                     (tenant_id, id, campaign_id, client_id, appointment_id,
@@ -78,9 +109,12 @@ def attribute_campaign_booking(connection, *, tenant_id: str,
              "appt": appointment_id, "comm": send["communication_id"]},
         ).mappings().one_or_none()
     except IntegrityError:
+        savepoint.rollback()
         return None
     if row is None:
+        savepoint.rollback()
         return None
+    savepoint.commit()
     return {"id": row["id"], "campaign_id": send["campaign_id"],
             "appointment_id": appointment_id,
             "communication_id": send["communication_id"]}
@@ -147,6 +181,16 @@ def register_redemption_routes(
                         raise HTTPException(status_code=422, detail={
                             "code": "appointment_mismatch",
                             "message": "appointment does not belong to this client"})
+                savepoint = connection.begin_nested()
+                if (payload.appointment_id is not None
+                        and not claim_appointment_attribution(
+                            connection, tenant_id=str(tenant_id),
+                            appointment_id=str(payload.appointment_id),
+                            kind="campaign", campaign_id=campaign_id)):
+                    savepoint.rollback()
+                    raise HTTPException(status_code=409, detail={
+                        "code": "already_attributed",
+                        "message": "this appointment already attributes once"})
                 try:
                     row = connection.execute(
                         text("""INSERT INTO offer_redemptions
@@ -161,11 +205,14 @@ def register_redemption_routes(
                          "code": payload.code.strip() if payload.code else None},
                     ).mappings().one_or_none()
                 except IntegrityError:
+                    savepoint.rollback()
                     raise HTTPException(status_code=404, detail={"code": "campaign_not_found"})
                 if row is None:
+                    savepoint.rollback()
                     raise HTTPException(status_code=409, detail={
                         "code": "already_attributed",
                         "message": "this appointment already attributes once"})
+                savepoint.commit()
                 insert_audit(connection, tenant_id, identity, action="offer.redeemed",
                              resource_type="offer_redemption", resource_id=row["id"],
                              reason=f"campaign {campaign_id}",
@@ -225,11 +272,21 @@ def register_redemption_routes(
                             WHERE s.tenant_id=:tenant AND s.campaign_id=:campaign"""),
                     {"tenant": str(tenant_id), "campaign": str(campaign_id)}).scalar_one()
                 unsubs = connection.execute(
-                    text("""SELECT count(*) FROM suppressions
-                            WHERE tenant_id=:tenant AND created_at >= :since"""),
-                    {"tenant": str(tenant_id),
-                     "since": (campaign["approved_at"].isoformat()
-                               if campaign["approved_at"] else "2000-01-01")},
+                    text("""SELECT count(DISTINCT u.client_id)
+                            FROM suppressions u
+                            JOIN campaign_sends s ON s.tenant_id=u.tenant_id
+                                                 AND s.client_id=u.client_id
+                            JOIN communications c ON c.tenant_id=s.tenant_id
+                                                   AND c.id=s.communication_id
+                            WHERE s.tenant_id=:tenant AND s.campaign_id=:campaign
+                              AND s.state='sent' AND c.dispatched_at IS NOT NULL
+                              AND u.reason IN ('unsubscribe', 'stop')
+                              AND u.contact_value=c.contact_value
+                              AND u.channel=c.channel
+                              AND u.suppressed_at >= c.dispatched_at
+                              AND u.suppressed_at <= c.dispatched_at + CAST(:window AS interval)"""),
+                    {"tenant": str(tenant_id), "campaign": str(campaign_id),
+                     "window": f"{ATTRIBUTION_DAYS} days"},
                 ).scalar_one()
             out = dict(campaign)
             out["approved_at"] = out["approved_at"].isoformat() if out["approved_at"] else None

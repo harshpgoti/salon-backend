@@ -128,17 +128,20 @@ def ingest_callback(
     comm_trace = None
     if communication_id is not None:
         found = connection.execute(
-            text("""SELECT id::text AS id, state, provider_ref, trace_id::text AS trace_id
+            text("""SELECT id::text AS id, state, provider_ref, channel,
+                           trace_id::text AS trace_id
                     FROM communications
                     WHERE tenant_id=:tenant AND id=:id"""),
             {"tenant": tenant_id, "id": communication_id}).mappings().one_or_none()
         if found is not None:
             comm_id = found["id"]
             current_state, current_ref = found["state"], found["provider_ref"]
+            current_channel = found["channel"]
             comm_trace = found["trace_id"]
     if comm_id is None and provider_ref is not None:
         found = connection.execute(
-            text("""SELECT id::text AS id, state, provider_ref, trace_id::text AS trace_id
+            text("""SELECT id::text AS id, state, provider_ref, channel,
+                           trace_id::text AS trace_id
                     FROM communications
                     WHERE tenant_id=:tenant AND provider_ref=:ref
                     ORDER BY created_at DESC LIMIT 1"""),
@@ -146,7 +149,10 @@ def ingest_callback(
         if found is not None:
             comm_id = found["id"]
             current_state, current_ref = found["state"], found["provider_ref"]
+            current_channel = found["channel"]
             comm_trace = found["trace_id"]
+    if comm_id is not None and current_channel != channel:
+        raise CallbackModuleError("callback channel does not match the mapped provider account")
     if comm_id is None:
         # Unknown acceptance: never invent delivery, never drop the evidence.
         connection.execute(
@@ -176,6 +182,14 @@ def ingest_callback(
         record_trace_event(connection, tenant_id=tenant_id, trace_id=comm_trace,
                            span="provider_callback",
                            detail={"communication_id": comm_id, "event": event})
+
+    # A signed provider fact reconciles an ambiguous local send. Cancel queued
+    # retries before they can claim and resend a message the provider already
+    # accepted/delivered (or definitively failed).
+    connection.execute(
+        text("""UPDATE dispatch_attempts SET state='superseded', updated_at=now()
+                WHERE tenant_id=:tenant AND communication_id=:comm AND state='queued'"""),
+        {"tenant": tenant_id, "comm": comm_id})
 
     # Success evidence moves forward only; a late failure never un-delivers.
     if event == "failed":
@@ -271,9 +285,12 @@ def claim_due_retries(connection, *, tenant_id: str,
     rows = connection.execute(
         text("""UPDATE dispatch_attempts SET state='sending', updated_at=now()
                 WHERE id IN (
-                    SELECT id FROM dispatch_attempts
-                    WHERE tenant_id=:tenant AND state='queued' AND not_before <= :now
-                    ORDER BY not_before LIMIT :limit
+                    SELECT a.id FROM dispatch_attempts a
+                    JOIN communications c
+                      ON c.tenant_id=a.tenant_id AND c.id=a.communication_id
+                    WHERE a.tenant_id=:tenant AND a.state='queued'
+                      AND c.state='retry_scheduled' AND a.not_before <= :now
+                    ORDER BY a.not_before LIMIT :limit
                     FOR UPDATE SKIP LOCKED)
                 RETURNING id::text AS id, communication_id::text AS communication_id,
                           attempt"""),

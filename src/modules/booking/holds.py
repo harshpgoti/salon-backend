@@ -19,18 +19,26 @@ hold is swept by state transition, not by `NOW()` inside an index predicate.
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from modules.company import assert_bookings_allowed
+from modules.crm.main import normalize_email, normalize_phone
+from modules.communications.outbox import record_appointment_email_update
+from modules.catalogue.scheduling_policy import (
+    plan_processing_phases,
+    required_resource_units,
+    validate_staff_slot,
+)
 
 # Proposed hold lifetime (FR-029). Short enough that an abandoned hold frees the slot soon.
 HOLD_MINUTES = 5
@@ -52,16 +60,49 @@ class HoldTokenIn(BaseModel):
 
 
 class ConfirmRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
     owner_token: str = Field(min_length=16, max_length=128)
-    client_id: uuid.UUID
+    client_name: str = Field(min_length=1, max_length=120)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
+    phone: str | None = Field(default=None, min_length=3, max_length=40)
+    country: str = Field(default="CA", pattern="^[A-Za-z]{2}$")
+    policy_accepted: StrictBool
+    policy_version: int = Field(ge=1)
     idempotency_key: str = Field(min_length=8, max_length=64)
     # Optional booking-time intent to hear marketing. It is echoed back as an intent only;
     # it grants no consent and changes no eligibility (FR-040 / QA-15 - booking never opts
     # a client in). The default is False, so omitting it is the ordinary case.
-    marketing_opt_in: bool = False
+    marketing_opt_in: StrictBool = False
     # Tracked rebooking/offer token from a prompt link (FR-052). Matching
     # closes the attributed cycle; unknown tokens change nothing.
     attribution_token: str | None = Field(default=None, max_length=64)
+
+    @field_validator("client_name", "email", "phone", mode="before")
+    @classmethod
+    def trim_public_contact(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, str) or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError("invalid contact value")
+        return value.strip()
+
+    @field_validator("country")
+    @classmethod
+    def normalize_country(cls, value: str) -> str:
+        return value.upper()
+
+    @model_validator(mode="after")
+    def require_reachable_contact(self):
+        if not self.client_name.strip() or not (self.email or self.phone):
+            raise ValueError("name and at least one contact method are required")
+        return self
+
+
+def management_token_for(owner_token: str, tenant_id: str, appointment_id: str) -> str:
+    """Derive a replay-stable bearer without storing plaintext; the hold token has 192 bits of entropy."""
+    message = f"salon-management-v1:{tenant_id}:{appointment_id}:{owner_token}".encode("utf-8")
+    return hashlib.sha256(message).hexdigest()
 
 
 def register_hold_routes(
@@ -85,7 +126,7 @@ def register_hold_routes(
     def _service_and_staff(connection, tenant_id: str, service_id: uuid.UUID, staff_id: uuid.UUID):
         service = connection.execute(
             text("""SELECT id::text AS id, name, duration_minutes, pre_buffer_minutes,
-                           post_buffer_minutes, price_minor, currency, version
+                           post_buffer_minutes, price_minor, currency, version, requires_resource
                     FROM services WHERE tenant_id=:tenant AND id=:id AND archived_at IS NULL"""),
             {"tenant": tenant_id, "id": str(service_id)}).mappings().one_or_none()
         if service is None:
@@ -111,6 +152,54 @@ def register_hold_routes(
             text("""UPDATE booking_holds SET state='expired'
                     WHERE tenant_id=:tenant AND state='active' AND expires_at <= now()"""),
             {"tenant": tenant_id})
+
+    def _sync_hold_resource_reservations(connection, *, tenant_id: str, hold_id: str,
+                                         resource_units: list[tuple[str, int]], occupied_from: datetime,
+                                         occupied_to: datetime) -> None:
+        """Make the hold's resource reservations match the locked current policy atomically."""
+        current = connection.execute(
+            text("""SELECT resource_id::text, resource_unit FROM reservations
+                    WHERE tenant_id=:tenant AND hold_id=:hold AND resource_id IS NOT NULL"""),
+            {"tenant": tenant_id, "hold": hold_id},
+        ).all()
+        current_units = sorted((row[0], row[1]) for row in current)
+        if current_units != sorted(resource_units):
+            connection.execute(
+                text("""DELETE FROM reservations
+                        WHERE tenant_id=:tenant AND hold_id=:hold AND resource_id IS NOT NULL"""),
+                {"tenant": tenant_id, "hold": hold_id},
+            )
+            for resource_id, unit in resource_units:
+                connection.execute(
+                    text("""INSERT INTO reservations
+                            (tenant_id,id,hold_id,resource_id,resource_unit,occupied_range,state)
+                            VALUES (:tenant,:id,:hold,:resource,:unit,
+                                    tstzrange(:from_ts,:to_ts,'[)'),'active')"""),
+                    {"tenant": tenant_id, "id": str(uuid.uuid4()), "hold": hold_id,
+                     "resource": resource_id, "unit": unit, "from_ts": occupied_from.isoformat(),
+                     "to_ts": occupied_to.isoformat()},
+                )
+        else:
+            connection.execute(
+                text("""UPDATE reservations SET state='active'
+                        WHERE tenant_id=:tenant AND hold_id=:hold AND resource_id IS NOT NULL"""),
+                {"tenant": tenant_id, "hold": hold_id},
+            )
+
+    def _sync_hold_staff_reservations(connection, *, tenant_id: str, hold_id: str,
+                                      staff_id: str, phases: list[dict] | None,
+                                      occupied_from: datetime, occupied_to: datetime) -> None:
+        connection.execute(text("DELETE FROM reservations WHERE tenant_id=:tenant AND hold_id=:hold AND staff_id IS NOT NULL"),
+                           {"tenant": tenant_id, "hold": hold_id})
+        assignments = ([(phase["sequence"], staff, phase["occupied_from"], phase["occupied_to"])
+                        for phase in phases for staff in phase["staff_ids"]]
+                       if phases is not None else [(None, staff_id, occupied_from.isoformat(), occupied_to.isoformat())])
+        for sequence, staff, start, end in assignments:
+            connection.execute(text("""INSERT INTO reservations
+                (tenant_id,id,hold_id,staff_id,phase_sequence,occupied_range,state)
+                VALUES (:tenant,:id,:hold,:staff,:sequence,tstzrange(:starts,:ends,'[)'),'active')"""),
+                {"tenant": tenant_id, "id": str(uuid.uuid4()), "hold": hold_id,
+                 "staff": staff, "sequence": sequence, "starts": start, "ends": end})
 
     @app.post("/v1/public/salons/{booking_slug}/holds", tags=["booking"], status_code=201)
     def create_hold(booking_slug: str, payload: HoldRequest) -> dict:
@@ -150,7 +239,7 @@ def register_hold_routes(
                 existing = connection.execute(
                     text("""SELECT id::text AS id, staff_id::text AS staff_id,
                                    service_id::text AS service_id, starts_at, ends_at, state,
-                                   appointment_id::text AS appointment_id
+                                   appointment_id::text AS appointment_id, processing_phases
                             FROM booking_holds
                             WHERE tenant_id=:tenant AND idempotency_key=:key FOR UPDATE"""),
                     {"tenant": tenant_id, "key": payload.idempotency_key}).mappings().one_or_none()
@@ -165,10 +254,27 @@ def register_hold_routes(
                         return {"hold_id": existing["id"], "replayed": True,
                                 "state": "converted", "appointment_id": existing["appointment_id"],
                                 "expires_in_seconds": 0}
+                    phase_plan = plan_processing_phases(
+                        connection, tenant_id=tenant_id, service_id=str(payload.service_id),
+                        location_id=location["id"], starts_at=starts_at,
+                        preferred_staff_id=str(payload.staff_id), service_duration=duration,
+                        pre_buffer_minutes=pre, post_buffer_minutes=post,
+                        exclude_hold_id=existing["id"])
+                    if phase_plan is None:
+                        validate_staff_slot(connection, tenant_id=tenant_id, staff_id=str(payload.staff_id),
+                                            service_id=str(payload.service_id), location_id=location["id"],
+                                            starts_at=starts_at, duration_minutes=duration,
+                                            pre_buffer_minutes=pre, post_buffer_minutes=post)
                     if existing["state"] == "expired":
                         # Same key retried after expiry: refresh this row as a new hold
                         # attempt on the same slot. The reactivation below carries the
                         # EXCLUDE guard, so a slot taken meanwhile is a 409, never a double.
+                        resource_units = required_resource_units(
+                            connection, tenant_id=tenant_id, service_id=str(payload.service_id),
+                            location_id=str(location["id"]),
+                            service_requires_resource=bool(service["requires_resource"]),
+                            occupied_from=occupied_from, occupied_to=occupied_to,
+                            exclude_hold_id=existing["id"])
                         token = secrets.token_urlsafe(24)
                         connection.execute(
                             text("""UPDATE booking_holds SET owner_token_hash=:hash,
@@ -178,14 +284,27 @@ def register_hold_routes(
                              "expires": datetime.now(tz=dt_timezone.utc) + timedelta(minutes=HOLD_MINUTES),
                              "tenant": tenant_id, "id": existing["id"]})
                         try:
-                            connection.execute(
-                                text("""UPDATE reservations SET state='active'
-                                        WHERE tenant_id=:tenant AND hold_id=:id"""),
-                                {"tenant": tenant_id, "id": existing["id"]})
+                            _sync_hold_staff_reservations(
+                                connection, tenant_id=tenant_id, hold_id=existing["id"],
+                                staff_id=str(payload.staff_id), phases=phase_plan,
+                                occupied_from=occupied_from, occupied_to=occupied_to)
+                            connection.execute(text("""UPDATE booking_holds SET processing_phases=CAST(:phases AS jsonb)
+                                WHERE tenant_id=:tenant AND id=:id"""),
+                                {"phases": json.dumps(phase_plan or []), "tenant": tenant_id, "id": existing["id"]})
+                            _sync_hold_resource_reservations(
+                                connection, tenant_id=tenant_id, hold_id=existing["id"],
+                                resource_units=resource_units, occupied_from=occupied_from,
+                                occupied_to=occupied_to)
                         except IntegrityError:
                             raise HTTPException(status_code=409, detail={"code": "slot_unavailable"})
                         return {"hold_id": existing["id"], "owner_token": token, "replayed": True,
                                 "expires_in_seconds": HOLD_MINUTES * 60}
+                    resource_units = required_resource_units(
+                        connection, tenant_id=tenant_id, service_id=str(payload.service_id),
+                        location_id=str(location["id"]),
+                        service_requires_resource=bool(service["requires_resource"]),
+                        occupied_from=occupied_from, occupied_to=occupied_to,
+                        exclude_hold_id=existing["id"])
                     token = secrets.token_urlsafe(24)
                     connection.execute(
                         text("""UPDATE booking_holds SET owner_token_hash=:hash, expires_at=:expires,
@@ -193,12 +312,38 @@ def register_hold_routes(
                         {"hash": hash_token(token),
                          "expires": datetime.now(tz=dt_timezone.utc) + timedelta(minutes=HOLD_MINUTES),
                          "tenant": tenant_id, "id": existing["id"]})
-                    connection.execute(
-                        text("""UPDATE reservations SET state='active' WHERE tenant_id=:tenant AND hold_id=:id"""),
-                        {"tenant": tenant_id, "id": existing["id"]})
+                    try:
+                        _sync_hold_staff_reservations(
+                            connection, tenant_id=tenant_id, hold_id=existing["id"],
+                            staff_id=str(payload.staff_id), phases=phase_plan,
+                            occupied_from=occupied_from, occupied_to=occupied_to)
+                        connection.execute(text("""UPDATE booking_holds SET processing_phases=CAST(:phases AS jsonb)
+                            WHERE tenant_id=:tenant AND id=:id"""),
+                            {"phases": json.dumps(phase_plan or []), "tenant": tenant_id, "id": existing["id"]})
+                        _sync_hold_resource_reservations(
+                            connection, tenant_id=tenant_id, hold_id=existing["id"],
+                            resource_units=resource_units, occupied_from=occupied_from,
+                            occupied_to=occupied_to)
+                    except IntegrityError:
+                        raise HTTPException(status_code=409, detail={"code": "slot_unavailable"})
                     return {"hold_id": existing["id"], "owner_token": token, "replayed": True,
                             "expires_in_seconds": HOLD_MINUTES * 60}
 
+                phase_plan = plan_processing_phases(
+                    connection, tenant_id=tenant_id, service_id=str(payload.service_id),
+                    location_id=location["id"], starts_at=starts_at,
+                    preferred_staff_id=str(payload.staff_id), service_duration=duration,
+                    pre_buffer_minutes=pre, post_buffer_minutes=post)
+                if phase_plan is None:
+                    validate_staff_slot(connection, tenant_id=tenant_id, staff_id=str(payload.staff_id),
+                                        service_id=str(payload.service_id), location_id=location["id"],
+                                        starts_at=starts_at, duration_minutes=duration,
+                                        pre_buffer_minutes=pre, post_buffer_minutes=post)
+                resource_units = required_resource_units(
+                    connection, tenant_id=tenant_id, service_id=str(payload.service_id),
+                    location_id=str(location["id"]),
+                    service_requires_resource=bool(service["requires_resource"]),
+                    occupied_from=occupied_from, occupied_to=occupied_to)
                 hold_id = uuid.uuid4()
                 token = secrets.token_urlsafe(24)
                 expires_at = datetime.now(tz=dt_timezone.utc) + timedelta(minutes=HOLD_MINUTES)
@@ -208,23 +353,24 @@ def register_hold_routes(
                 connection.execute(
                     text("""INSERT INTO booking_holds
                             (tenant_id,id,location_id,staff_id,service_id,starts_at,ends_at,occupied_range,
-                             local_timezone,owner_token_hash,idempotency_key,expires_at)
+                             local_timezone,owner_token_hash,idempotency_key,expires_at,processing_phases)
                             VALUES (:tenant,:id,:location,:staff,:service,:starts,:ends,
-                                    tstzrange(:occ_from,:occ_to,'[)'),:tz,:hash,:key,:expires)"""),
+                                    tstzrange(:occ_from,:occ_to,'[)'),:tz,:hash,:key,:expires,CAST(:phases AS jsonb))"""),
                     {"tenant": tenant_id, "id": str(hold_id), "location": location["id"],
                      "staff": str(payload.staff_id), "service": str(payload.service_id),
                      "starts": service_start.isoformat(), "ends": service_end.isoformat(),
                      "occ_from": occupied_from.isoformat(), "occ_to": occupied_to.isoformat(),
                      "tz": location["timezone"], "hash": hash_token(token),
-                     "key": payload.idempotency_key, "expires": expires_at.isoformat()})
+                     "key": payload.idempotency_key, "expires": expires_at.isoformat(),
+                     "phases": json.dumps(phase_plan or [])})
                 try:
-                    connection.execute(
-                        text("""INSERT INTO reservations
-                                (tenant_id,id,hold_id,staff_id,occupied_range,state)
-                                VALUES (:tenant,:id,:hold,:staff,tstzrange(:occ_from,:occ_to,'[)'),'active')"""),
-                        {"tenant": tenant_id, "id": str(uuid.uuid4()), "hold": str(hold_id),
-                         "staff": str(payload.staff_id),
-                         "occ_from": occupied_from.isoformat(), "occ_to": occupied_to.isoformat()})
+                    _sync_hold_staff_reservations(
+                        connection, tenant_id=tenant_id, hold_id=str(hold_id),
+                        staff_id=str(payload.staff_id), phases=phase_plan,
+                        occupied_from=occupied_from, occupied_to=occupied_to)
+                    _sync_hold_resource_reservations(
+                        connection, tenant_id=tenant_id, hold_id=str(hold_id),
+                        resource_units=resource_units, occupied_from=occupied_from, occupied_to=occupied_to)
                 except IntegrityError:
                     # The EXCLUDE constraint rejected the range: someone else holds it.
                     # This is the one-winner guarantee, surfaced as a named conflict.
@@ -280,15 +426,50 @@ def register_hold_routes(
                     # a lookup rather than an inference.
                     if hold["appointment_id"] is None:
                         raise HTTPException(status_code=409, detail={"code": "hold_not_confirmable"})
-                    return {"appointment_id": str(hold["appointment_id"]), "replayed": True}
+                    token = management_token_for(payload.owner_token, tenant_id,
+                                                str(hold["appointment_id"]))
+                    return {"appointment_id": str(hold["appointment_id"]),
+                            "management_token": token, "replayed": True,
+                            "marketing_opt_in_recorded": False}
                 if hold["state"] != "active":
                     raise HTTPException(status_code=409, detail={"code": "hold_expired"})
 
-                client_owned = connection.execute(
-                    text("SELECT 1 FROM clients WHERE tenant_id=:tenant AND id=:id AND deleted_at IS NULL"),
-                    {"tenant": tenant_id, "id": str(payload.client_id)}).scalar_one_or_none()
-                if client_owned is None:
-                    raise HTTPException(status_code=404, detail={"code": "client_not_found"})
+                policy = connection.execute(
+                    text("SELECT settings, booking_policy_version FROM tenants WHERE id=:tenant FOR SHARE"),
+                    {"tenant": tenant_id}).mappings().one_or_none()
+                if policy is None:
+                    raise HTTPException(status_code=404, detail={"code": "salon_not_found"})
+                if not payload.policy_accepted:
+                    raise HTTPException(status_code=422, detail={"code": "booking_policy_required"})
+                if payload.policy_version != policy["booking_policy_version"]:
+                    raise HTTPException(status_code=409, detail={"code": "booking_policy_changed"})
+
+                try:
+                    email = normalize_email(payload.email) if payload.email else None
+                    phone = normalize_phone(payload.phone, payload.country) if payload.phone else None
+                except ValueError as exc:
+                    raise HTTPException(status_code=422,
+                                        detail={"code": "contact_not_normalizable"}) from exc
+                client_id = uuid.uuid4()
+                connection.execute(
+                    text("""INSERT INTO clients (tenant_id,id,name,locale,lifecycle,
+                            preferred_location_id,source)
+                            VALUES (:tenant,:id,:name,'en-CA','active',:location,'public_booking')"""),
+                    {"tenant": tenant_id, "id": str(client_id), "name": payload.client_name,
+                     "location": str(hold["location_id"])})
+                contacts = [("email", email, payload.email), ("phone", phone, payload.phone)]
+                for index, (kind, normalized, display) in enumerate(contacts):
+                    if normalized is None:
+                        continue
+                    connection.execute(
+                        text("""INSERT INTO client_contacts
+                                (tenant_id,id,client_id,kind,normalized_value,display_value,
+                                 country,is_primary,source)
+                                VALUES (:tenant,:id,:client,:kind,:normalized,:display,
+                                        :country,:primary,'public_booking')"""),
+                        {"tenant": tenant_id, "id": str(uuid.uuid4()), "client": str(client_id),
+                         "kind": kind, "normalized": normalized, "display": display,
+                         "country": payload.country, "primary": index == 0 or email is None})
 
                 service = connection.execute(
                     text("""SELECT * FROM services
@@ -298,6 +479,50 @@ def register_hold_routes(
                     # Archived or removed after the hold was placed: the snapshot stays on
                     # the hold, but no new appointment may confirm against it.
                     raise HTTPException(status_code=409, detail={"code": "service_no_longer_offered"})
+                processing_phases = hold.get("processing_phases") or []
+                current_phases = connection.execute(text("""SELECT sequence,duration_minutes,mode,staff_count
+                    FROM service_processing_phases WHERE tenant_id=:tenant AND service_id=:service
+                    ORDER BY sequence"""),
+                    {"tenant": tenant_id, "service": str(hold["service_id"])}).mappings().all()
+                held_policy = [(phase["sequence"], phase["duration_minutes"], phase["mode"], phase["staff_count"])
+                               for phase in processing_phases]
+                configured_policy = [(phase["sequence"], phase["duration_minutes"], phase["mode"], phase["staff_count"])
+                                     for phase in current_phases]
+                if held_policy != configured_policy:
+                    raise HTTPException(status_code=409, detail={"code": "service_policy_changed"})
+                if processing_phases:
+                    for phase in processing_phases:
+                        phase_start = datetime.fromisoformat(phase["starts_at"])
+                        phase_end = datetime.fromisoformat(phase["ends_at"])
+                        occupied_start = datetime.fromisoformat(phase["occupied_from"])
+                        occupied_end = datetime.fromisoformat(phase["occupied_to"])
+                        for staff in phase["staff_ids"]:
+                            validate_staff_slot(
+                                connection, tenant_id=tenant_id, staff_id=staff,
+                                service_id=str(hold["service_id"]), location_id=location["id"],
+                                starts_at=phase_start, duration_minutes=phase["duration_minutes"],
+                                pre_buffer_minutes=int((phase_start-occupied_start).total_seconds()/60),
+                                post_buffer_minutes=int((occupied_end-phase_end).total_seconds()/60))
+                else:
+                    validate_staff_slot(connection, tenant_id=tenant_id, staff_id=str(hold["staff_id"]),
+                                        service_id=str(hold["service_id"]), location_id=location["id"],
+                                        starts_at=hold["starts_at"], duration_minutes=service["duration_minutes"],
+                                        pre_buffer_minutes=service["pre_buffer_minutes"],
+                                        post_buffer_minutes=service["post_buffer_minutes"])
+                resource_units = required_resource_units(
+                    connection, tenant_id=tenant_id, service_id=str(hold["service_id"]),
+                    location_id=str(hold["location_id"]),
+                    service_requires_resource=bool(service["requires_resource"]),
+                    occupied_from=hold["occupied_range"].lower,
+                    occupied_to=hold["occupied_range"].upper,
+                    exclude_hold_id=str(hold_id))
+                try:
+                    _sync_hold_resource_reservations(
+                        connection, tenant_id=tenant_id, hold_id=str(hold_id),
+                        resource_units=resource_units, occupied_from=hold["occupied_range"].lower,
+                        occupied_to=hold["occupied_range"].upper)
+                except IntegrityError:
+                    raise HTTPException(status_code=409, detail={"code": "slot_unavailable"})
                 clash = connection.execute(
                     text("""SELECT 1 FROM reservations
                             WHERE tenant_id=:tenant AND staff_id=:staff AND state='active'
@@ -305,15 +530,17 @@ def register_hold_routes(
                               AND occupied_range && tstzrange(:occ_from,:occ_to,'[)')"""),
                     {"tenant": tenant_id, "staff": str(hold["staff_id"]), "hold": str(hold_id),
                      "occ_from": hold["occupied_range"].lower.isoformat(),
-                     "occ_to": hold["occupied_range"].upper.isoformat()}).scalar_one_or_none()
+                     "occ_to": hold["occupied_range"].upper.isoformat()}).scalar_one_or_none() if not processing_phases else None
                 if clash is not None:
                     # Another owner took the range after the hold was placed (e.g. a staff
                     # booking): the hold loses, loudly, rather than double-booking.
                     raise HTTPException(status_code=409, detail={"code": "slot_unavailable"})
                 appointment_id = uuid.uuid4()
-                # The client's own link to manage this booking (FR-033): a random token whose
-                # hash is stored, scoped to this one appointment and expiring at its end.
-                management_token = secrets.token_urlsafe(24)
+                # The client's own link to manage this booking (FR-033): an opaque bearer
+                # derived from the unguessable hold owner token, scoped to this appointment,
+                # with only its hash stored and expiry at the appointment end.
+                management_token = management_token_for(payload.owner_token, tenant_id,
+                                                        str(appointment_id))
                 connection.execute(
                     text("""INSERT INTO appointments
                             (tenant_id,id,location_id,client_id,staff_id,starts_at,ends_at,local_timezone,
@@ -321,14 +548,15 @@ def register_hold_routes(
                              management_token_expires_at,attribution_token)
                             VALUES (:tenant,:id,:location,:client,:staff,:starts,:ends,:tz,
                                     'confirmed','public_booking',
-                                    tstzrange(:occ_from,:occ_to,'[)'),1,:mgmt_hash,:mgmt_expires,
+                                    tstzrange(:occ_from,:occ_to,'[)'),:policy_version,:mgmt_hash,:mgmt_expires,
                                     :attribution)"""),
                     {"tenant": tenant_id, "id": str(appointment_id), "location": location["id"],
-                     "client": str(payload.client_id), "staff": str(hold["staff_id"]),
+                     "client": str(client_id), "staff": str(hold["staff_id"]),
                      "starts": hold["starts_at"].isoformat(), "ends": hold["ends_at"].isoformat(),
                      "tz": location["timezone"],
                      "occ_from": hold["occupied_range"].lower.isoformat(),
                      "occ_to": hold["occupied_range"].upper.isoformat(),
+                     "policy_version": policy["booking_policy_version"],
                      "mgmt_hash": hash_token(management_token),
                      "mgmt_expires": hold["ends_at"].isoformat(),
                      "attribution": payload.attribution_token})
@@ -336,16 +564,17 @@ def register_hold_routes(
                     text("""INSERT INTO appointment_services
                             (tenant_id,id,appointment_id,sequence,service_id,service_version,service_name,
                              staff_id,price_minor,currency,duration_minutes,pre_buffer_minutes,
-                             post_buffer_minutes,starts_at,ends_at)
+                             post_buffer_minutes,starts_at,ends_at,processing_phases)
                             VALUES (:tenant,:id,:appointment,1,:service,:version,:name,:staff,:price,
-                                    :currency,:duration,:pre,:post,:starts,:ends)"""),
+                                    :currency,:duration,:pre,:post,:starts,:ends,CAST(:phases AS jsonb))"""),
                     {"tenant": tenant_id, "id": str(uuid.uuid4()), "appointment": str(appointment_id),
                      "service": str(hold["service_id"]), "version": service["version"],
                      "name": service["name"], "staff": str(hold["staff_id"]),
                      "price": service["price_minor"], "currency": service["currency"],
                      "duration": service["duration_minutes"], "pre": service["pre_buffer_minutes"],
                      "post": service["post_buffer_minutes"],
-                     "starts": hold["starts_at"].isoformat(), "ends": hold["ends_at"].isoformat()})
+                     "starts": hold["starts_at"].isoformat(), "ends": hold["ends_at"].isoformat(),
+                     "phases": json.dumps(processing_phases)})
                 # Move the reservation from the hold onto the appointment in one step, so
                 # the range is never unguarded between the two.
                 connection.execute(
@@ -362,6 +591,14 @@ def register_hold_routes(
                             VALUES (:tenant,:id,:appointment,NULL,'confirmed','public','public_booking',
                                     'confirmed from hold')"""),
                     {"tenant": tenant_id, "id": str(uuid.uuid4()), "appointment": str(appointment_id)})
+                insert_audit(connection, tenant_id, None, action="appointment.created",
+                             resource_type="appointment", resource_id=appointment_id,
+                             reason="public booking confirmed from hold",
+                             request_id=request.state.request_id,
+                             changed_fields=["status", "starts_at", "policy_version"])
+                record_appointment_email_update(
+                    connection, tenant_id=tenant_id, appointment_id=str(appointment_id),
+                    purpose="booking_confirmation", trace_id=request.state.trace_id)
                 # FR-052: a tracked prompt link closes its cycle atomically here.
                 from modules.retention import attribute_booking
                 attribute_booking(connection, tenant_id=tenant_id,
@@ -379,7 +616,9 @@ def register_hold_routes(
             engine.dispose()
 
     @app.get("/v1/public/salons/{booking_slug}/manage/{appointment_id}", tags=["booking"])
-    def manage_booking(booking_slug: str, appointment_id: uuid.UUID, token: str) -> dict:
+    def manage_booking(booking_slug: str, appointment_id: uuid.UUID,
+                       response: Response,
+                       authorization: str | None = Header(default=None)) -> dict:
         """The client's own scoped view of one booking (FR-033).
 
         The token names exactly one appointment in one tenant and expires at that
@@ -389,15 +628,20 @@ def register_hold_routes(
         only to the holder of the real token.
         """
         engine = app.state.engine_factory()
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
         try:
             with engine.begin() as connection:
                 location = resolve_public_location(connection, booking_slug)
                 tenant_id = location["tenant_id"]
+                token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
                 row = connection.execute(
-                    text("""SELECT a.id::text AS id, a.status, a.starts_at, a.ends_at,
-                                   a.local_timezone, a.management_token_expires_at,
+                    text("""SELECT a.id::text AS id,a.status,a.version,a.policy_version,
+                                   a.starts_at,a.ends_at,a.local_timezone,a.management_token_expires_at,
+                                   t.booking_policy_version AS current_policy_version,t.settings,
                                    s.service_name, st.display_name AS staff_name
                             FROM appointments a
+                            JOIN tenants t ON t.id=a.tenant_id
                             JOIN appointment_services s ON s.tenant_id=a.tenant_id AND s.appointment_id=a.id
                             JOIN staff_profiles st ON st.tenant_id=a.tenant_id AND st.id=a.staff_id
                             WHERE a.tenant_id=:tenant AND a.id=:appt
@@ -408,11 +652,21 @@ def register_hold_routes(
                     raise HTTPException(status_code=404, detail={"code": "appointment_not_found"})
                 if row["management_token_expires_at"] <= datetime.now(tz=dt_timezone.utc):
                     raise HTTPException(status_code=409, detail={"code": "management_link_expired"})
+            can_manage = (row["status"] in ("pending_approval", "confirmed")
+                          and row["starts_at"] > datetime.now(tz=dt_timezone.utc))
+            blocked_reason = None
+            if can_manage and (row["policy_version"] != row["current_policy_version"]):
+                can_manage, blocked_reason = False, "booking_policy_changed"
+            if can_manage and str((row["settings"] or {}).get("cancellation_policy") or "").strip():
+                can_manage, blocked_reason = False, "public_management_requires_salon"
+            if not can_manage and blocked_reason is None:
+                blocked_reason = "appointment_not_modifiable"
             # Only this booking's own safe fields leave the endpoint (FR-028).
             return {"salon": location["display_name"], "timezone": row["local_timezone"],
                     "service": row["service_name"], "staff": row["staff_name"],
                     "status": row["status"],
                     "starts_at": row["starts_at"].isoformat(),
-                    "ends_at": row["ends_at"].isoformat()}
+                    "ends_at": row["ends_at"].isoformat(), "version": row["version"],
+                    "can_manage": can_manage, "manage_blocked_reason": blocked_reason}
         finally:
             engine.dispose()

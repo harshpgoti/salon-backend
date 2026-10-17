@@ -1,4 +1,4 @@
-"""Tests for request tracing and sanitized telemetry (TASK-053, FR-077/FR-078).
+﻿"""Tests for request tracing and sanitized telemetry (TASK-053, FR-077/FR-078).
 
 AC-1: Request-to-worker/provider-callback correlation available to case diagnostics.
 AC-2: PII/tokens/bodies blocked; no secret or customer URL in telemetry.
@@ -18,7 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from modules.communications.callbacks import ingest_callback, sign_callback_body
 from modules.communications.outbox import (
     dispatch_due_communications,
-    record_booking_communication,
 )
 from modules.identity.main import (
     AuthenticatedIdentity,
@@ -32,10 +31,11 @@ from modules.trace import (
     trace_timeline,
 )
 from test_clients import _salon, _client, _teardown
-from test_communications import RecordingAdapter, _booked_appointment, _client_email
+from test_communications import RecordingAdapter, _booked_appointment
 
 COMPANY = "https://company.example.invalid/trace"
 SECRET = "test-trace-secret-0123456789abcdef01"
+os.environ.setdefault("WEB_BASE_URL", "http://127.0.0.1:3000")
 
 
 @pytest.fixture
@@ -66,22 +66,22 @@ def test_trace_ac1_journey_correlates_to_case_diagnostics(database_url):
     client = _client(database_url, owner)
     tid = tenant["tenant_id"]
     try:
-        _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
-        email = _client_email(engine, tid, client_id)
-        trace_id = str(uuid.uuid4())
+        _, _, _, client_id, appt_id, _, trace_id = _booked_appointment(
+            client, tenant, include_trace=True)
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
-            row = record_booking_communication(
-                connection=conn, tenant_id=tid, appointment_id=appt_id,
-                client_id=client_id, contact_value=email, channel="email",
-                purpose="booking_confirmation", entity_version=1, trace_id=trace_id)
-            assert row is not None
+            row = conn.execute(text("""SELECT id::text AS id, trace_id::text AS trace_id
+                FROM communications WHERE tenant_id=:t AND source_id=:appointment
+                  AND purpose='booking_confirmation'"""),
+                {"t": tid, "appointment": appt_id}).mappings().one()
+            assert row["trace_id"] == trace_id
             conn.execute(
                 text("""INSERT INTO provider_webhook_secrets (tenant_id, channel, secret)
                         VALUES (:t, 'email', :s) ON CONFLICT DO NOTHING"""),
                 {"t": tid, "s": SECRET})
-            dispatch_due_communications(connection=conn, tenant_id=tid,
-                                        adapter=RecordingAdapter())
+            summary = dispatch_due_communications(connection=conn, tenant_id=tid,
+                                                  adapter=RecordingAdapter())
+            assert summary["dispatched"] == 1
             body = b"{}"
             ingest_callback(conn, tenant_id=tid, channel="email", raw_body=body,
                             signature=sign_callback_body(SECRET, body),
@@ -90,9 +90,13 @@ def test_trace_ac1_journey_correlates_to_case_diagnostics(database_url):
         conn = _scoped(engine, tid)
         try:
             spans = trace_timeline(conn, tenant_id=tid, trace_id=trace_id)
-            assert [s["span"] for s in spans] == ["outbox_record", "worker_send",
-                                                  "provider_callback"]
-            assert all(s["detail"].get("communication_id") == str(row["id"]) for s in spans)
+            assert sum(s["span"] == "outbox_record" for s in spans) == 3
+            assert any(s["span"] == "outbox_record"
+                       and s["detail"].get("purpose") == "booking_confirmation" for s in spans)
+            assert any(s["span"] == "worker_send"
+                       and s["detail"].get("communication_id") == str(row["id"]) for s in spans)
+            assert any(s["span"] == "provider_callback"
+                       and s["detail"].get("communication_id") == str(row["id"]) for s in spans)
         finally:
             conn.close()
         # Case diagnostics leg: support case + approved grant unlock the read.
@@ -112,8 +116,12 @@ def test_trace_ac1_journey_correlates_to_case_diagnostics(database_url):
         read = support.get(f"/v1/company/traces/{trace_id}",
                            params={"tenant_id": tid, "grant_id": grant_id})
         assert read.status_code == 200, read.text
-        assert [s["span"] for s in read.json()["spans"]] == ["outbox_record", "worker_send",
-                                                              "provider_callback"]
+        read_spans = read.json()["spans"]
+        assert sum(s["span"] == "outbox_record" for s in read_spans) == 3
+        assert any(s["span"] == "worker_send"
+                   and s["detail"].get("communication_id") == str(row["id"]) for s in read_spans)
+        assert any(s["span"] == "provider_callback"
+                   and s["detail"].get("communication_id") == str(row["id"]) for s in read_spans)
         assert support.get(f"/v1/company/traces/{trace_id}",
                            params={"tenant_id": tid,
                                    "grant_id": "00000000-0000-0000-0000-000000000000"}
@@ -159,21 +167,18 @@ def test_trace_ac1_metrics_snapshot_counts(database_url):
     client = _client(database_url, owner)
     tid = tenant["tenant_id"]
     try:
-        _, _, _, client_id, appt_id, _ = _booked_appointment(client, tenant)
-        email = _client_email(engine, tid, client_id)
+        _, _, _, _, _, _ = _booked_appointment(client, tenant)
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
-            record_booking_communication(
-                connection=conn, tenant_id=tid, appointment_id=appt_id,
-                client_id=client_id, contact_value=email, channel="email",
-                purpose="booking_confirmation", entity_version=1)
+            recorded = conn.execute(text("SELECT count(*) FROM communications WHERE tenant_id=:t"),
+                                    {"t": tid}).scalar_one()
             dispatch_due_communications(connection=conn, tenant_id=tid,
                                         adapter=RecordingAdapter())
         conn = _scoped(engine, tid)
         try:
             snap = metrics_snapshot(conn, tenant_id=tid)
             assert snap["booking_commits_24h"] == 1
-            assert snap["communications_recorded_24h"] == 1
+            assert snap["communications_recorded_24h"] == recorded
             assert snap["failed_communications"] == 0
             assert snap["open_retry_queue"] == 0
             assert snap["generated_at"]
@@ -196,6 +201,9 @@ def test_trace_ac2_sanitizer_blocks_everything_sensitive():
         "callback": "https://customer.example.invalid/hook/secret",
         "nested": {"phone": "+14165550000"},
         "count": 3,
+        "reason": "Client Ada can be reached at +14165550000",
+        "route": "https://customer.example.invalid/book/secret",
+        "action": object(),
     }
     clean = sanitize_for_trace(hostile)
     assert clean == {"appointment_id": "123e4567-e89b-12d3-a456-426614174000",
@@ -232,3 +240,4 @@ def test_trace_ac2_stored_spans_carry_no_pii(database_url):
         assert "+14165550000" not in blob and "evil.example.invalid" not in blob
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
+

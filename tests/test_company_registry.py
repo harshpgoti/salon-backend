@@ -110,14 +110,40 @@ def test_company_ac1_registry_shows_health_without_client_data(database_url):
 
 
 def test_company_ac2_offboarding_revokes_sessions(database_url):
-    """AC-2: deactivation flips the switch and kills company sessions."""
+    """AC-2: offboarding kills sessions and that employee's support grants."""
     admin = _company_client(database_url, COMPANY, "admin-1")
+    issuer = "https://identity.example.invalid/offboard"
+    salon_engine, owner, tenant = _salon(database_url, issuer)
+    tid = tenant["tenant_id"]
     engine = create_engine(database_url)
     try:
         assert _invite(admin, COMPANY, "admin-1", "Ava Admin", "admin").status_code == 201
         assert _invite(admin, COMPANY, "support-9", "Sam Support", "support").status_code == 201
         support_id = admin.get("/v1/company/staff").json()["items"][1]["id"]
         with engine.begin() as conn:
+            case_id = conn.execute(
+                text("""INSERT INTO support_cases
+                           (tenant_id, title, opened_by_issuer, opened_by_subject)
+                        VALUES (:tenant, 'Synthetic offboarding case', :issuer, 'owner')
+                        RETURNING id"""),
+                {"tenant": tid, "issuer": issuer}).scalar_one()
+            owned_grants = []
+            for status in ("requested", "approved"):
+                owned_grants.append(conn.execute(
+                    text("""INSERT INTO support_access_grants
+                               (case_id, tenant_id, status, requested_by_issuer,
+                                requested_by_subject, justification)
+                            VALUES (:case, :tenant, :status, :issuer, 'support-9', 'synthetic test')
+                            RETURNING id"""),
+                    {"case": case_id, "tenant": tid, "status": status,
+                     "issuer": COMPANY}).scalar_one())
+            unrelated_grant = conn.execute(
+                text("""INSERT INTO support_access_grants
+                           (case_id, tenant_id, status, requested_by_issuer,
+                            requested_by_subject, justification)
+                        VALUES (:case, :tenant, 'approved', :issuer, 'support-10', 'synthetic test')
+                        RETURNING id"""),
+                {"case": case_id, "tenant": tid, "issuer": COMPANY}).scalar_one()
             conn.execute(
                 text("""INSERT INTO auth_sessions (session_hash, surface, issuer, subject, expires_at)
                         VALUES (:h, 'company', :i, :s, now() + interval '1 hour')"""),
@@ -125,7 +151,8 @@ def test_company_ac2_offboarding_revokes_sessions(database_url):
                  "i": COMPANY, "s": "support-9"})
         dropped = admin.post(f"/v1/company/staff/{support_id}/deactivate")
         assert dropped.status_code == 200, dropped.text
-        assert dropped.json() == {"id": support_id, "is_active": False, "sessions_revoked": 1}
+        assert dropped.json() == {"id": support_id, "is_active": False,
+                                  "sessions_revoked": 1, "grants_revoked": 2}
         with engine.connect() as conn:
             left = conn.execute(
                 text("""SELECT count(*) FROM auth_sessions
@@ -135,13 +162,20 @@ def test_company_ac2_offboarding_revokes_sessions(database_url):
                 text("""SELECT action FROM company_audit_events
                         WHERE resource_id=:r"""),
                 {"r": support_id}).scalars().all()
+            grant_statuses = conn.execute(
+                text("SELECT id, status FROM support_access_grants WHERE id = ANY(:ids)"),
+                {"ids": owned_grants + [unrelated_grant]}).all()
         assert left == 0
+        assert {str(row.id): row.status for row in grant_statuses} == {
+            str(owned_grants[0]): "revoked", str(owned_grants[1]): "revoked",
+            str(unrelated_grant): "approved"}
         assert "company.staff_deactivated" in audit
         support = _company_client(database_url, COMPANY, "support-9")
         assert support.get("/v1/company/tenants").status_code == 401
         assert admin.post(f"/v1/company/staff/{support_id}/deactivate").status_code == 404
     finally:
         engine.dispose()
+        _teardown(salon_engine, [tid], issuer)
         with create_engine(database_url).connect() as conn:
             conn.execute(text("DELETE FROM company_staff WHERE issuer=:i"), {"i": COMPANY})
             conn.execute(text("DELETE FROM identity_users WHERE issuer=:i"), {"i": COMPANY})

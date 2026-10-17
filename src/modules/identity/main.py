@@ -8,7 +8,7 @@ import os
 import re
 import secrets
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -37,6 +37,8 @@ from modules.closure_impacts import register_closure_impacts_routes
 from modules.booking.availability import register_availability_routes, resolve_public_location
 from modules.booking.holds import register_hold_routes
 from modules.booking.calendar import register_calendar_routes
+from modules.booking.recurring import register_recurring_routes
+from modules.booking.waitlist import register_waitlist_routes
 from modules.booking.transitions import register_transition_routes
 from modules.booking.receipts import register_receipt_routes
 from modules.analytics import register_analytics_routes
@@ -46,12 +48,14 @@ from modules.campaigns import register_campaign_routes
 from modules.company import register_company_routes, start_trial
 from modules.communications.callbacks import register_callback_routes
 from modules.communications.inbox import register_inbox_routes
+from modules.communications.consent import register_consent_routes
 from modules.communications.senders import register_sender_routes
 from modules.finance import register_finance_routes
 from modules.quiet import register_quiet_routes
 from modules.retention import register_retention_routes
 from modules.segments import register_segment_routes
 from modules.support import register_support_routes
+from modules.identity.dashboard import register_dashboard_routes
 from modules.trace import register_trace_routes
 from modules.communications.whatsapp import register_wa_sender_routes
 
@@ -66,10 +70,13 @@ class RecordingDeliveryAdapter:
 
     def send(
         self, *, channel: Literal["email", "sms", "whatsapp"], recipient: str, template: str,
-        sender: str | None = None,
+        sender: str | None = None, unsubscribe_url: str | None = None,
     ) -> dict[str, str]:
-        self.records.append({"channel": channel, "recipient": recipient, "template": template,
-                             "sender": sender})
+        record = {"channel": channel, "recipient": recipient, "template": template,
+                  "sender": sender}
+        if unsubscribe_url is not None:
+            record["unsubscribe_url"] = unsubscribe_url
+        self.records.append(record)
         return {"status": "recorded", "id": f"recorded-{len(self.records)}"}
 
 
@@ -435,15 +442,33 @@ def _create_tenant(engine: Engine, identity: AuthenticatedIdentity, request: Onb
 
 
 
-def _insert_audit(connection, tenant_id: uuid.UUID | str, identity: AuthenticatedIdentity, *, action: str,
+def _insert_audit(connection, tenant_id: uuid.UUID | str, identity: AuthenticatedIdentity | None, *, action: str,
                   resource_type: str, resource_id: uuid.UUID | str, reason: str, request_id: uuid.UUID,
                   changed_fields: list[str]) -> None:
+    # Audit reasons are generated from the event type. Never persist caller-provided free
+    # text here: cancellation/member reasons and names can contain contact details or secrets.
+    safe_reason = {
+        "tenant.onboarded": "owner initiated onboarding",
+        "membership.updated": "membership access updated",
+        "membership.deactivated": "membership deactivated by owner",
+        "staff.created": "staff profile created",
+        "appointment.created": "appointment created",
+        "appointment.cancelled": "appointment cancelled",
+        "appointment.rescheduled": "appointment rescheduled",
+    }.get(action)
+    if safe_reason is None and action.startswith("appointment."):
+        safe_reason = "appointment status changed"
+    if safe_reason is None and action.startswith("staff."):
+        safe_reason = "staff configuration changed"
+    if safe_reason is None:
+        safe_reason = "business change recorded"
     connection.execute(
         text("""INSERT INTO tenant_audit_events
                (tenant_id,actor_issuer,actor_subject,action,resource_type,resource_id,reason,request_id,changed_fields)
                VALUES (:tenant,:issuer,:subject,:action,:resource_type,:resource_id,:reason,:request_id,:fields)"""),
-        {"tenant": str(tenant_id), "issuer": identity.issuer, "subject": identity.subject, "action": action,
-         "resource_type": resource_type, "resource_id": str(resource_id), "reason": reason,
+        {"tenant": str(tenant_id), "issuer": identity.issuer if identity else "public",
+         "subject": identity.subject if identity else "public_booking", "action": action,
+         "resource_type": resource_type, "resource_id": str(resource_id), "reason": safe_reason,
          "request_id": str(request_id), "fields": changed_fields},
     )
 
@@ -1143,22 +1168,27 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
         try:
             with engine.begin() as connection:
                 _require_owner(connection, tenant_id, identity)
-                current = connection.execute(text("SELECT settings FROM tenants WHERE id=:tenant FOR UPDATE"),
-                                             {"tenant": str(tenant_id)}).scalar_one_or_none()
-                if current is None:
+                current_row = connection.execute(text("SELECT settings, booking_policy_version FROM tenants WHERE id=:tenant FOR UPDATE"),
+                                             {"tenant": str(tenant_id)}).mappings().one_or_none()
+                if current_row is None:
                     raise HTTPException(status_code=404, detail={"code": "tenant_not_found"})
+                current = current_row["settings"] or {}
                 merged = {**(current or {}), **changes}
                 for key in cleared:
                     merged.pop(key, None)
+                policy_changed = (current.get("cancellation_policy") != merged.get("cancellation_policy"))
                 row = connection.execute(
-                    text("""UPDATE tenants SET settings=CAST(:settings AS jsonb), settings_version=settings_version+1
-                            WHERE id=:tenant RETURNING settings_version"""),
-                    {"tenant": str(tenant_id), "settings": json.dumps(merged)}).mappings().one()
+                    text("""UPDATE tenants SET settings=CAST(:settings AS jsonb), settings_version=settings_version+1,
+                            booking_policy_version=booking_policy_version+:policy_changed
+                            WHERE id=:tenant RETURNING settings_version, booking_policy_version"""),
+                    {"tenant": str(tenant_id), "settings": json.dumps(merged),
+                     "policy_changed": int(policy_changed)}).mappings().one()
                 _insert_audit(connection, tenant_id, identity, action="tenant.settings_updated",
                               resource_type="tenant", resource_id=tenant_id,
                               reason="owner updated salon settings and branding",
                               request_id=request.state.request_id, changed_fields=sorted(set(changes) | set(cleared)))
-                return {"settings": merged, "settings_version": row["settings_version"]}
+                return {"settings": merged, "settings_version": row["settings_version"],
+                        "booking_policy_version": row["booking_policy_version"]}
         finally:
             engine.dispose()
 
@@ -1181,7 +1211,7 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
                 set_tenant_context(connection, tenant_id)
                 location = connection.execute(
                     text("""SELECT l.display_name, l.timezone, t.display_name AS business_name,
-                                   t.settings, t.settings_version
+                                   t.settings, t.settings_version, t.booking_policy_version
                             FROM locations l JOIN tenants t ON t.id=l.tenant_id
                             WHERE l.tenant_id=:tenant AND l.booking_slug=:slug"""),
                     {"tenant": str(tenant_id), "slug": slug}).mappings().one_or_none()
@@ -1194,6 +1224,11 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
                     "timezone": location["timezone"],
                     "branding": _public_brand(location["settings"] or {}),
                     "branding_version": location["settings_version"],
+                    "booking_policy": {
+                        "text": (location["settings"] or {}).get("cancellation_policy")
+                                or "Appointments are subject to the salon's booking and cancellation policy.",
+                        "version": location["booking_policy_version"],
+                    },
                     **_booking_readiness(state),
                 }
         finally:
@@ -1251,6 +1286,22 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
                             secure=os.getenv("SESSION_COOKIE_SECURE", "true").lower() == "true", samesite="lax",
                             path=f"/v1/auth/{surface}", domain=os.getenv("SESSION_COOKIE_DOMAIN") or None)
         return response
+
+    @app.get("/v1/auth/{surface}/password-reset", tags=["identity"], include_in_schema=False)
+    def auth_password_reset(surface: str) -> RedirectResponse:
+        if surface not in {"staff", "company"}:
+            raise HTTPException(status_code=404, detail={"code": "not_found"})
+        prefix = "STAFF" if surface == "staff" else "COMPANY"
+        reset_url = os.getenv(f"{prefix}_OIDC_PASSWORD_RESET_URL", "").strip()
+        try:
+            parsed = urlparse(reset_url)
+            valid = (parsed.scheme == "https" and bool(parsed.hostname) and not parsed.username
+                     and not parsed.password and not any(character.isspace() for character in reset_url))
+        except ValueError:
+            valid = False
+        if not valid:
+            raise HTTPException(status_code=503, detail={"code": "password_reset_unavailable"})
+        return RedirectResponse(reset_url, status_code=302)
 
     @app.get("/v1/auth/{surface}/callback", tags=["identity"], include_in_schema=False)
     def auth_callback(surface: str, request: Request, code: str, state: str) -> RedirectResponse:
@@ -1429,6 +1480,23 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
         membership_scope=_membership_scope,
         require_permission=_require_permission,
         insert_audit=_insert_audit,
+        resolve_public_location=resolve_public_location,
+    )
+
+    register_recurring_routes(
+        app,
+        require_identity=require_identity,
+        membership_scope=_membership_scope,
+        require_permission=_require_permission,
+        insert_audit=_insert_audit,
+    )
+
+    register_waitlist_routes(
+        app,
+        require_identity=require_identity,
+        membership_scope=_membership_scope,
+        require_permission=_require_permission,
+        insert_audit=_insert_audit,
     )
 
     register_transition_routes(
@@ -1470,6 +1538,8 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
         require_permission=_require_permission,
         insert_audit=_insert_audit,
     )
+
+    register_consent_routes(app)
 
     register_retention_routes(
         app,
@@ -1569,6 +1639,9 @@ def create_app(database_probe: Callable[[], bool] = database_is_reachable, engin
         require_permission=_require_permission,
         insert_audit=_insert_audit,
     )
+
+    register_dashboard_routes(app, require_identity=require_identity, require_company_identity=require_company_identity,
+        identity_type=AuthenticatedIdentity, create_tenant=_create_tenant, onboarding_request=OnboardingRequest, cookie_name=_cookie_name)
 
     return app
 

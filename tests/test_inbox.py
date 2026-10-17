@@ -7,6 +7,7 @@ AC-2: Permission/window limits and redaction apply to reply handling.
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,8 @@ from modules.communications.senders import (
     register_sender,
     verify_sender,
 )
+from modules.communications.outbox import dispatch_due_communications
+from modules.communications.whatsapp import approve_sender, register_wa_sender, submit_sender
 from test_clients import _salon, _client, _teardown
 
 SECRET = "test-inbox-secret-0123456789abcdef01"
@@ -108,7 +111,7 @@ def test_inbox_ac1_stop_help_reply_create_tasks(database_url):
 
 
 def test_inbox_ac1_unknown_sender_creates_nothing(database_url):
-    """AC-1: an identity serving no tenant resolves to nothing, taskless."""
+    """AC-1: unknown sender or client identities never create follow-up tasks."""
     issuer = "https://identity.example.invalid/inbox-2"
     engine, owner, tenant = _salon(database_url, issuer)
     client = _client(database_url, owner)
@@ -118,6 +121,22 @@ def test_inbox_ac1_unknown_sender_creates_nothing(database_url):
             out = handle_inbound_sms(conn, sender_identity="+19995550000",
                                      from_value="+14165550101", body="STOP")
             assert out == {"action": "unresolved", "tenant_id": None}
+            _sms_sender(conn, tenant["tenant_id"], identity="+14165550812")
+            unknown = handle_inbound_sms(conn, sender_identity="+14165550812",
+                from_value="+14165550112", body="STOP")
+            assert create_task_for_inbound(conn, tenant_id=tenant["tenant_id"],
+                                           inbound_id=unknown["inbound_id"]) is None
+            assert check_suppressed(conn, tenant_id=tenant["tenant_id"],
+                contact_value="+14165550112", channel="sms") is True
+            for name in ("Shared Client One", "Shared Client Two"):
+                created = client.post(f"/v1/tenants/{tenant['tenant_id']}/clients", json={
+                    "name": name, "contacts": [{"kind": "phone",
+                        "value": "+14165550113", "is_primary": True}]})
+                assert created.status_code == 201, created.text
+            ambiguous = handle_inbound_sms(conn, sender_identity="+14165550812",
+                from_value="+14165550113", body="Can someone call me?")
+            assert create_task_for_inbound(conn, tenant_id=tenant["tenant_id"],
+                                           inbound_id=ambiguous["inbound_id"]) is None
             assert list_inbox(conn, tenant_id=tenant["tenant_id"]) == []
             conn.commit()
         finally:
@@ -162,8 +181,8 @@ def test_inbox_ac1_http_inbound_is_signed_and_tasked(database_url):
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
 
-def test_inbox_ac2_list_redacts_and_resolve_is_audited(database_url):
-    """AC-2: list shows previews, never full bodies; resolution is audited."""
+def test_inbox_ac2_list_hides_message_and_sender_content_and_resolve_is_audited(database_url):
+    """AC-2: list exposes only static triage labels; resolution is audited."""
     issuer = "https://identity.example.invalid/inbox-4"
     engine, owner, tenant = _salon(database_url, issuer)
     client = _client(database_url, owner)
@@ -186,8 +205,10 @@ def test_inbox_ac2_list_redacts_and_resolve_is_audited(database_url):
         assert len(listed) == 1
         item = listed[0]
         assert item["client_name"] == "Inbox Client"
-        assert len(item["detail"]) <= 140 + 60  # preview plus its fixed prefix
-        assert "invoice invoice invoice" not in item["detail"]
+        assert item["detail"] == "Client replied; message content hidden"
+        assert "from_value" not in item
+        assert "+14165550303" not in json.dumps(item)
+        assert "invoice" not in json.dumps(item)
         assert "body" not in item
         resolved = client.post(
             f"/v1/tenants/{tenant['tenant_id']}/inbox/{task['id']}/resolve",
@@ -207,6 +228,98 @@ def test_inbox_ac2_list_redacts_and_resolve_is_audited(database_url):
                 {"t": tenant["tenant_id"], "r": task["id"]}).scalars().all()
         assert "inbox.task_resolved" in audit
         assert client.get(f"/v1/tenants/{tenant['tenant_id']}/inbox").json()["items"] == []
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_inbox_reply_is_bounded_idempotent_and_redacted(database_url):
+    """AC-3/AC-5: staff reply retries are safe and never echo content."""
+    issuer = "https://identity.example.invalid/inbox-reply"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    base = f"/v1/tenants/{tenant['tenant_id']}/clients"
+    try:
+        _client_with_phone(client, base, value="+14165550404")
+        conn = _scoped(engine, tenant["tenant_id"])
+        try:
+            _sms_sender(conn, tenant["tenant_id"], identity="+14165550804")
+            inbound = handle_inbound_sms(conn, sender_identity="+14165550804",
+                                         from_value="+14165550404", body="Can I book Friday?")
+            task = create_task_for_inbound(conn, tenant_id=tenant["tenant_id"],
+                                           inbound_id=inbound["inbound_id"])
+            conn.commit()
+        finally:
+            conn.close()
+        path = f"/v1/tenants/{tenant['tenant_id']}/inbox/{task['id']}/reply"
+        headers = {"Idempotency-Key": "support-reply-001"}
+        payload = {"body": "Yes, Friday has openings. What time works?"}
+        sent = client.post(path, json=payload, headers=headers)
+        assert sent.status_code == 200, sent.text
+        assert set(sent.json()) == {"id", "state"}
+        replay = client.post(path, json=payload, headers=headers)
+        assert replay.status_code == 200
+        assert replay.json()["id"] == sent.json()["id"]
+        conflict = client.post(path, json={"body": "A different answer"}, headers=headers)
+        assert conflict.status_code == 409
+        oversized = client.post(path, json={"body": "x" * 2001},
+                                headers={"Idempotency-Key": "support-reply-002"})
+        assert oversized.status_code == 422
+        assert payload["body"] not in sent.text
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_inbox_whatsapp_reply_window_is_checked_at_queue_and_dispatch(database_url):
+    """AC-4/AC-5: WhatsApp replies require the 24h window at both seams."""
+    issuer = "https://identity.example.invalid/inbox-wa-window"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    try:
+        client_id = _client_with_phone(client,
+            f"/v1/tenants/{tenant['tenant_id']}/clients", value="+14165550505")
+        conn = _scoped(engine, tenant["tenant_id"])
+        try:
+            sender = register_wa_sender(conn, tenant_id=tenant["tenant_id"],
+                business_name="Maple Salon", phone_number="+14165550805")
+            submit_sender(conn, tenant_id=tenant["tenant_id"], sender_id=sender["id"])
+            approve_sender(conn, tenant_id=tenant["tenant_id"], sender_id=sender["id"],
+                           quality_rating="green", messaging_limit=1000)
+            inbound = handle_inbound_sms(conn, sender_identity="+14165550805",
+                from_value="+14165550505", body="What time do you close?", channel="whatsapp")
+            task = create_task_for_inbound(conn, tenant_id=tenant["tenant_id"],
+                                           inbound_id=inbound["inbound_id"])
+            conn.commit()
+        finally:
+            conn.close()
+        path = f"/v1/tenants/{tenant['tenant_id']}/inbox/{task['id']}/reply"
+        response = client.post(path, json={"body": "We close at six."},
+                               headers={"Idempotency-Key": "wa-reply-key-001"})
+        assert response.status_code == 200, response.text
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            stored = conn.execute(text("""SELECT reply_body, state FROM communications
+                WHERE tenant_id=:t AND id=:id"""),
+                {"t": tenant["tenant_id"], "id": response.json()["id"]}).mappings().one()
+            assert stored["reply_body"] == "We close at six."
+            conn.execute(text("""UPDATE communications SET expires_at=:expired
+                WHERE tenant_id=:t AND id=:id"""),
+                {"t": tenant["tenant_id"], "id": response.json()["id"],
+                 "expired": datetime.now(timezone.utc) - timedelta(seconds=1)})
+            summary = dispatch_due_communications(conn, tenant_id=tenant["tenant_id"],
+                adapter=type("Sink", (), {"send": lambda self, **kwargs: {"id": "sent"}})())
+            assert summary["skipped_expired"] == 1
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            conn.execute(text("""UPDATE inbound_messages SET received_at=:old
+                WHERE tenant_id=:t AND id=:id"""),
+                {"t": tenant["tenant_id"], "id": inbound["inbound_id"],
+                 "old": datetime.now(timezone.utc) - timedelta(hours=25)})
+        closed = client.post(
+            f"/v1/tenants/{tenant['tenant_id']}/inbox/{task['id']}/reply",
+            json={"body": "Too late"}, headers={"Idempotency-Key": "wa-reply-key-002"})
+        assert closed.status_code == 422
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 

@@ -8,4 +8,9 @@ coverage.xml
 .env.*
 !.env.example
 
+# Consent-controlled attachment store (TASK-068): a synthetic local
+# content-addressed file store. Object bytes must never be tracked, so the
+# whole store directory is ignored rather than individual files.
+.data/
+
 *.egg-info/

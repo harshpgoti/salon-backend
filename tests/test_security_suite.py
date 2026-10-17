@@ -17,8 +17,9 @@ import sys
 import threading
 import time
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -118,7 +119,10 @@ def test_sec56_cross_tenant_data_unreachable(database_url):
         # And A's data is intact under its own scope.
         with engine_a.connect() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid_a})
-            assert conn.execute(text("SELECT count(*) FROM communications")).scalar_one() == 1
+            own_booking_comms = conn.execute(text("""SELECT count(*) FROM communications
+                WHERE tenant_id=:t AND source_type='appointment' AND source_id=:appointment"""),
+                {"t": tid_a, "appointment": appt_a}).scalar_one()
+            assert own_booking_comms >= 1
             assert conn.execute(text("SELECT count(*) FROM suppressions")).scalar_one() == 1
     finally:
         _teardown(engine_a, [tenant_a["tenant_id"]], issuer_a)
@@ -255,7 +259,7 @@ def test_sec56_appointment_idempotency_race_single_row(database_url):
         base, _, service, staff, client_row = _bookable(seeder, database_url, tenant)
         day = date.today() + timedelta(days=1)
         starts = datetime.combine(day, datetime.min.time()).replace(
-            hour=10, tzinfo=timezone.utc).isoformat()
+            hour=10, tzinfo=ZoneInfo("America/Toronto")).isoformat()
         key = "sec56-idem-" + uuid.uuid4().hex[:32]
         results, lock, barrier = [], threading.Lock(), threading.Barrier(10)
 
@@ -307,11 +311,10 @@ def test_sec56_provider_fault_keeps_booking_and_retries(database_url):
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
-            assert record_booking_communication(
-                connection=conn, tenant_id=tenant["tenant_id"],
-                appointment_id=appt_id, client_id=client_id,
-                contact_value=email, channel="email",
-                purpose="booking_confirmation", entity_version=1) is not None
+            queued = conn.execute(text("""SELECT id::text AS id FROM communications
+                WHERE tenant_id=:t AND source_type='appointment' AND source_id=:appointment
+                  AND purpose='booking_confirmation' AND channel='email'"""),
+                {"t": tenant["tenant_id"], "appointment": appt_id}).mappings().one()
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
@@ -326,11 +329,11 @@ def test_sec56_provider_fault_keeps_booking_and_retries(database_url):
                 text("SELECT status FROM appointments WHERE tenant_id=:t AND id=:id"),
                 {"t": tenant["tenant_id"], "id": appt_id}).scalar_one()
             comm_state = conn.execute(
-                text("SELECT state FROM communications WHERE tenant_id=:t"),
-                {"t": tenant["tenant_id"]}).scalar_one()
+                text("SELECT state FROM communications WHERE tenant_id=:t AND id=:id"),
+                {"t": tenant["tenant_id"], "id": queued["id"]}).scalar_one()
             attempt = conn.execute(
-                text("SELECT attempt, state FROM dispatch_attempts WHERE tenant_id=:t"),
-                {"t": tenant["tenant_id"]}).mappings().one()
+                text("SELECT attempt, state FROM dispatch_attempts WHERE tenant_id=:t AND communication_id=:id"),
+                {"t": tenant["tenant_id"], "id": queued["id"]}).mappings().one()
         assert status == "confirmed"
         assert comm_state == "retry_scheduled"
         assert (attempt["attempt"], attempt["state"]) == (1, "queued")
@@ -351,12 +354,10 @@ def test_sec56_suppress_between_record_and_dispatch_blocks_send(database_url):
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                          {"t": tenant["tenant_id"]})
-            row = record_booking_communication(
-                connection=conn, tenant_id=tenant["tenant_id"],
-                appointment_id=appt_id, client_id=client_id,
-                contact_value=email, channel="email",
-                purpose="booking_confirmation", entity_version=1)
-            assert row is not None
+            row = conn.execute(text("""SELECT id::text AS id FROM communications
+                WHERE tenant_id=:t AND source_type='appointment' AND source_id=:appointment
+                  AND purpose='booking_confirmation' AND channel='email'"""),
+                {"t": tenant["tenant_id"], "appointment": appt_id}).mappings().one()
             # The STOP arrives after the message was recorded (the race), then
             # arrives AGAIN (provider retries / double tap) — the upsert keeps
             # exactly one suppression row.

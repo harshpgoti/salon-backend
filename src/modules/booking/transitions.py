@@ -18,12 +18,16 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
+from modules.booking.calendar import _command_receipt, _save_receipt
+from modules.communications.outbox import record_appointment_email_update
 from modules.retention import create_cycles_for_visit
+from salon_platform.authorization import require_assigned_location
 
 # Allowed target statuses from each source status (architecture.md:68). A status not
 # listed has no outgoing edge; reaching a terminal state and leaving it is a correction.
@@ -38,7 +42,7 @@ RELEASING = frozenset({"cancelled", "rejected", "no_show"})
 
 
 class TransitionIn(BaseModel):
-    to_status: str
+    to_status: Literal["pending_approval", "confirmed", "checked_in", "in_service", "completed", "cancelled", "no_show", "rejected"]
     expected_version: int
     reason: str | None = Field(default=None, max_length=240)
     idempotency_key: str = Field(min_length=8, max_length=64)
@@ -58,28 +62,43 @@ def register_transition_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "appointments.manage")
+                facts = {"appointment_id": str(appointment_id),
+                         **payload.model_dump(mode="json", exclude={"idempotency_key"})}
+                fingerprint, replay = _command_receipt(
+                    connection, tenant_id, identity, payload.idempotency_key, "transition", facts)
                 appt = connection.execute(
-                    text("SELECT status, version FROM appointments WHERE tenant_id=:tenant AND id=:id FOR UPDATE"),
+                    text("SELECT status, version, location_id FROM appointments WHERE tenant_id=:tenant AND id=:id FOR UPDATE"),
                     {"tenant": str(tenant_id), "id": str(appointment_id)}).mappings().one_or_none()
                 if appt is None:
                     raise HTTPException(status_code=404, detail={"code": "appointment_not_found"})
+                require_assigned_location(role, assigned, appt["location_id"])
+                if replay is not None:
+                    return replay
+                if appt["version"] != payload.expected_version:
+                    raise HTTPException(status_code=409, detail={"code": "appointment_version_conflict"})
                 current = appt["status"]
+                reason = payload.reason.strip() if payload.reason else None
+                if payload.to_status in RELEASING and not reason:
+                    raise HTTPException(status_code=422, detail={"code": "appointment_reason_required"})
                 if payload.to_status == current:
-                    # Idempotent no-op transition (same target): harmless replay.
-                    return {"appointment_id": str(appointment_id), "status": current, "replayed": True}
+                    # Same-target retries are harmless but still bind the key to these
+                    # exact facts so it cannot be reused for a different command.
+                    response = {"appointment_id": str(appointment_id), "status": current,
+                                "visit_id": None, "replayed": True}
+                    _save_receipt(connection, tenant_id, payload.idempotency_key, fingerprint, response)
+                    return response
                 legal = payload.to_status in ALLOWED.get(current, frozenset())
                 if not legal and current not in TERMINAL:
                     raise HTTPException(status_code=409, detail={"code": "illegal_transition"})
                 if current in TERMINAL and not legal:
                     # A correction out of a terminal state needs an explicit reason
                     # (FR-031: complete/no-show correction requires reason and permission).
-                    if not payload.reason:
+                    if not reason:
                         raise HTTPException(status_code=422, detail={"code": "correction_reason_required"})
-                if appt["version"] != payload.expected_version:
-                    raise HTTPException(status_code=409, detail={"code": "appointment_version_conflict"})
-
+                    if role != "owner":
+                        raise HTTPException(status_code=403, detail={"code": "owner_correction_required"})
                 connection.execute(
                     text("UPDATE appointments SET status=:to, version=version+1, updated_at=now() "
                          "WHERE tenant_id=:tenant AND id=:id"),
@@ -89,22 +108,34 @@ def register_transition_routes(
                         text("UPDATE reservations SET state='released' "
                              "WHERE tenant_id=:tenant AND appointment_id=:id AND state='active'"),
                         {"tenant": str(tenant_id), "id": str(appointment_id)})
+                if current == "completed" and payload.to_status != "completed":
+                    # A completion correction invalidates the visit fact. Its
+                    # visit_services and rebooking cycles cascade with it.
+                    connection.execute(
+                        text("DELETE FROM visits WHERE tenant_id=:tenant AND appointment_id=:id"),
+                        {"tenant": str(tenant_id), "id": str(appointment_id)})
                 connection.execute(
                     text("""INSERT INTO appointment_transitions
                             (tenant_id,id,appointment_id,from_status,to_status,actor_issuer,actor_subject,reason)
                             VALUES (:tenant,:id,:appointment,:from,:to,:issuer,:subject,:reason)"""),
                     {"tenant": str(tenant_id), "id": str(uuid.uuid4()), "appointment": str(appointment_id),
                      "from": current, "to": payload.to_status, "issuer": identity.issuer,
-                     "subject": identity.subject, "reason": payload.reason})
+                     "subject": identity.subject, "reason": reason})
                 visit_id = None
                 if payload.to_status == "completed":
                     visit_id = _complete_visit(connection, tenant_id, appointment_id)
                 insert_audit(connection, tenant_id, identity, action=f"appointment.{payload.to_status}",
                              resource_type="appointment", resource_id=appointment_id,
-                             reason=payload.reason or payload.to_status, request_id=request.state.request_id,
+                             reason=reason or payload.to_status, request_id=request.state.request_id,
                              changed_fields=["status"])
-            return {"appointment_id": str(appointment_id), "status": payload.to_status,
-                    "visit_id": visit_id, "replayed": False}
+                if payload.to_status in {"cancelled", "rejected"}:
+                    record_appointment_email_update(
+                        connection, tenant_id=str(tenant_id), appointment_id=str(appointment_id),
+                        purpose="booking_cancelled", trace_id=request.state.trace_id)
+                response = {"appointment_id": str(appointment_id), "status": payload.to_status,
+                            "visit_id": visit_id, "replayed": False}
+                _save_receipt(connection, tenant_id, payload.idempotency_key, fingerprint, response)
+            return response
         finally:
             engine.dispose()
 

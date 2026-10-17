@@ -84,10 +84,10 @@ def validate_segment_ast(node, *, depth: int = 0, counter: list | None = None) -
         if not isinstance(value, str) or not (1 <= len(value.strip()) <= 40):
             raise SegmentModuleError("tag must be 1-40 characters")
     elif op in ("min_spend_minor", "max_spend_minor"):
-        if not isinstance(value, int) or value < 0:
+        if type(value) is not int or value < 0:
             raise SegmentModuleError(f"{op} must be a non-negative integer")
     elif op == "inactive_days":
-        if not isinstance(value, int) or not (1 <= value <= 3650):
+        if type(value) is not int or not (1 <= value <= 3650):
             raise SegmentModuleError("inactive_days must be 1-3650")
     else:
         raise SegmentModuleError(f"unknown filter operator {op!r}")
@@ -166,12 +166,14 @@ def resolve_segment(connection, *, tenant_id: str, segment_id: str,
     eligible: list[str] = []
     exclusions = {"no_consent": 0, "suppressed": 0, "unreachable": 0}
     numbers: dict[str, int] = {}
+    contact_kind = "email" if channel == "email" else "phone"
     for client_id in client_ids:
         contact = connection.execute(
             text("""SELECT kind, normalized_value FROM client_contacts
                     WHERE tenant_id=:tenant AND client_id=:client
-                    ORDER BY is_primary DESC, created_at LIMIT 1"""),
-            {"tenant": tenant_id, "client": client_id}).mappings().one_or_none()
+                      AND kind=:kind
+                    ORDER BY is_primary DESC, created_at, id LIMIT 1"""),
+            {"tenant": tenant_id, "client": client_id, "kind": contact_kind}).mappings().one_or_none()
         if contact is None:
             exclusions["unreachable"] += 1
             continue
@@ -181,7 +183,8 @@ def resolve_segment(connection, *, tenant_id: str, segment_id: str,
             exclusions["suppressed"] += 1
             continue
         if not check_consented(connection, tenant_id=tenant_id, client_id=client_id,
-                               channel=channel, purpose="marketing"):
+                               channel=channel, purpose="marketing",
+                               contact_value=contact["normalized_value"]):
             exclusions["no_consent"] += 1
             continue
         eligible.append(client_id)

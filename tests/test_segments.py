@@ -15,6 +15,7 @@ from sqlalchemy import text
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from test_clients import _salon, _client, _teardown
+from modules.communications.consent import record_suppression
 
 
 @pytest.fixture
@@ -46,7 +47,8 @@ def _setup(client, tenant):
 def _client_with(client, base, name, phone=None):
     body = {"name": name}
     if phone:
-        body["contacts"] = [{"kind": "phone", "value": phone, "is_primary": True}]
+        kind, value = phone if isinstance(phone, tuple) else ("phone", phone)
+        body["contacts"] = [{"kind": kind, "value": value, "is_primary": True}]
     created = client.post(f"{base}/clients", json=body)
     assert created.status_code == 201, created.text
     return created.json()
@@ -72,16 +74,19 @@ def _complete(client, base, service, staff, client_id, day, hour, key):
 
 
 def _grant(engine, tenant_id, client_row, channel="sms"):
-    contact = next(c for c in client_row["contacts"])
+    kind = "email" if channel == "email" else "phone"
+    contact = next(c for c in client_row["contacts"] if c["kind"] == kind)
     with engine.begin() as conn:
         conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                      {"t": tenant_id})
         conn.execute(
             text("""INSERT INTO consents
                     (tenant_id, id, client_id, contact_id, channel, purpose,
-                     source, wording_version, status)
+                     source, wording_version, status, contact_value_snapshot)
                     VALUES (:t, gen_random_uuid(), :c, :contact, :ch,
-                            'marketing', 'client_self', 'v1', 'granted')"""),
+                            'marketing', 'client_self', 'v1', 'granted',
+                            lower(btrim((SELECT normalized_value FROM client_contacts
+                                         WHERE tenant_id=:t AND id=:contact))))"""),
             {"t": tenant_id, "c": client_row["id"], "contact": contact["id"],
              "ch": channel})
 
@@ -108,34 +113,39 @@ def test_segment_ac1_filters_and_exclusions(database_url):
         tid = tenant["tenant_id"]
 
         def grant(row):
-            contact = next(c for c in row["contacts"])
-            with engine.begin() as conn:
-                conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
-                conn.execute(
-                    text("""INSERT INTO consents
-                            (tenant_id, id, client_id, contact_id, channel, purpose,
-                             source, wording_version, status)
-                            VALUES (:t, gen_random_uuid(), :c, :contact, 'sms',
-                                    'marketing', 'client_self', 'v1', 'granted')"""),
-                    {"t": tid, "c": row["id"], "contact": contact["id"]})
+            _grant(engine, tid, row, "sms")
 
         vip = _client_with(client, base, "VIP", "+14165550101")
-        vip_appt = _complete(client, base, service, staff, vip["id"], day, 10, "seg-key-vip")
+        vip_appt = _complete(client, base, service, staff, vip["id"], day, 14, "seg-key-vip")
         _receipt(client, base, vip_appt, 10000)
         _tag(client, base, vip["id"], "vip")
         grant(vip)
 
         quiet = _client_with(client, base, "Quiet", "+14165550202")
-        quiet_appt = _complete(client, base, service, staff, quiet["id"], day, 12, "seg-key-quiet")
+        quiet_appt = _complete(client, base, service, staff, quiet["id"], day, 15, "seg-key-quiet")
         _receipt(client, base, quiet_appt, 10000)
 
         # Household shares one number: two clients, one reachable number.
-        for name, hour, key in (("Sharer1", 13, "seg-key-s1"), ("Sharer2", 14, "seg-key-s2")):
+        for name, hour, key in (("Sharer1", 16, "seg-key-s1"), ("Sharer2", 17, "seg-key-s2")):
             sharer = _client_with(client, base, name, "+14165550303")
             _complete(client, base, service, staff, sharer["id"], day, hour, key)
             grant(sharer)
 
         ghost = _client_with(client, base, "Ghost")
+
+        mixed = client.post(f"{base}/clients", json={"name": "Mixed contact", "contacts": [
+            {"kind": "email", "value": "segment-mixed@example.invalid", "is_primary": True},
+            {"kind": "phone", "value": "+14165550505", "is_primary": False},
+        ]}).json()
+        _complete(client, base, service, staff, mixed["id"], day, 13, "seg-key-mixed")
+        _grant(engine, tid, mixed, "sms")
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            record_suppression(conn, tenant_id=tid, client_id=mixed["id"],
+                               contact_value="+14165550505", channel="sms",
+                               reason="stop", source="client_self")
+        email_only = _client_with(client, base, "Email only", ("email", "segment-email@example.invalid"))
+        _complete(client, base, service, staff, email_only["id"], day, 18, "seg-key-email")
 
         vips = client.post(f"{base}/segments", json={
             "name": "VIPs",
@@ -153,20 +163,33 @@ def test_segment_ac1_filters_and_exclusions(database_url):
         seen = client.post(
             f"{base}/segments/{cutters.json()['id']}/preview", json={"channel": "sms"}).json()
         # Ghost never completed: not a candidate. Quiet never consented.
-        assert seen["candidates"] == 4
+        assert seen["candidates"] == 6
         assert seen["eligible_count"] == 3
         assert seen["exclusions"]["no_consent"] == 1
+        assert seen["exclusions"]["suppressed"] == 1
+        assert seen["exclusions"]["unreachable"] == 1
         assert seen["reachable_numbers"] == 2
         assert seen["shared_numbers"] == 1
+
+        located = client.post(f"{base}/clients", json={"name": "Located", "preferred_location_id": tenant["location_id"],
+            "contacts": [{"kind": "phone", "value": "+14165550606", "is_primary": True}]}).json()
+        _grant(engine, tid, located)
+        location_segment = client.post(f"{base}/segments", json={
+            "name": "Located clients", "definition": {"location": tenant["location_id"]}})
+        assert location_segment.status_code == 201, location_segment.text
+        by_location = client.post(
+            f"{base}/segments/{location_segment.json()['id']}/preview", json={"channel": "sms"}).json()
+        assert (by_location["candidates"], by_location["eligible_count"]) == (1, 1)
 
         lapsed = client.post(f"{base}/segments", json={
             "name": "Lapsed", "definition": {"inactive_days": 30}})
         assert lapsed.status_code == 201, lapsed.text
         old = client.post(
             f"{base}/segments/{lapsed.json()['id']}/preview", json={"channel": "sms"}).json()
-        assert old["candidates"] == 1
+        # Inactive includes clients with no visit history; the located client is reachable.
+        assert old["candidates"] == 2
         assert old["exclusions"]["unreachable"] == 1
-        assert old["eligible_count"] == 0
+        assert old["eligible_count"] == 1
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -188,6 +211,9 @@ def test_segment_ac2_invalid_ast_never_expands(database_url):
         assert attempt({"service": "not-a-uuid"}) == 422
         assert attempt({"and": []}) == 422
         assert attempt({"min_spend_minor": -5}) == 422
+        assert attempt({"min_spend_minor": True}) == 422
+        assert attempt({"max_spend_minor": True}) == 422
+        assert attempt({"inactive_days": True}) == 422
         deep = {"tag": "x"}
         for _ in range(7):
             deep = {"not": deep}
@@ -211,7 +237,7 @@ def test_segment_ac1_tenant_isolation(database_url):
         base_b, service_b, staff_b, day_b = _setup(client_b, tenant_b)
         other = _client_with(client_b, base_b, "Other VIP", "+14165550404")
         other_appt = _complete(client_b, base_b, service_b, staff_b, other["id"],
-                               day_b, 10, "seg-key-other")
+                               day_b, 14, "seg-key-other")
         _receipt(client_b, base_b, other_appt, 50000)
         _tag(client_b, base_b, other["id"], "vip")
         seg = client_a.post(f"{base_a}/segments", json={

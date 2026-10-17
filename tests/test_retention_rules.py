@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import text
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from modules.communications.consent import record_suppression
 from test_clients import _salon, _client, _teardown
 
 
@@ -55,10 +56,12 @@ def _client_with(client, base, name, contact=None):
 def _book_complete(client, base, service, staff, client_id, day, hour, key):
     starts = (datetime.combine(day, datetime.min.time())
               + timedelta(hours=hour)).replace(tzinfo=timezone.utc)
-    appt = client.post(f"{base}/appointments", json={
+    created = client.post(f"{base}/appointments", json={
         "client_id": client_id, "staff_id": staff, "service_id": service,
         "starts_at": starts.isoformat(), "source": "staff",
-        "idempotency_key": key}).json()["appointment_id"]
+        "idempotency_key": key})
+    assert created.status_code == 201, created.text
+    appt = created.json()["appointment_id"]
     version = 1
     for to_status in ("checked_in", "in_service", "completed"):
         moved = client.post(f"{base}/appointments/{appt}/transitions", json={
@@ -69,16 +72,19 @@ def _book_complete(client, base, service, staff, client_id, day, hour, key):
 
 
 def _grant(client, engine, tenant_id, client_row, channel):
-    contact = next(c for c in client_row["contacts"])
+    expected_kind = "email" if channel == "email" else "phone"
+    contact = next(c for c in client_row["contacts"] if c["kind"] == expected_kind)
     with engine.begin() as conn:
         conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                      {"t": tenant_id})
         conn.execute(
             text("""INSERT INTO consents
                     (tenant_id, id, client_id, contact_id, channel, purpose,
-                     source, wording_version, status)
+                     source, wording_version, status, contact_value_snapshot)
                     VALUES (:t, gen_random_uuid(), :c, :contact, :ch,
-                            'marketing', 'client_self', 'v1', 'granted')"""),
+                            'marketing', 'client_self', 'v1', 'granted',
+                            lower(btrim((SELECT normalized_value FROM client_contacts
+                                         WHERE tenant_id=:t AND id=:contact))))"""),
             {"t": tenant_id, "c": client_row["id"], "contact": contact["id"],
              "ch": channel})
 
@@ -99,20 +105,39 @@ def test_rule_ac1_preview_counts_and_cost(database_url):
         base, service, staff, day = _setup(client, tenant)
         # Eligible: due + consented + reachable.
         willing = _client_with(client, base, "Willing", ("phone", "+14165550101"))
-        _book_complete(client, base, service, staff, willing["id"], day, 10, "rule-a-1")
+        # The salon is America/Toronto: keep these 14:00-16:00 UTC starts
+        # inside the configured 09:00-17:00 local opening interval.
+        _book_complete(client, base, service, staff, willing["id"], day, 14, "rule-a-1")
         _grant(client, engine, tenant["tenant_id"], willing, "sms")
         # Suppressed: due but never consented.
         quiet = _client_with(client, base, "Quiet", ("phone", "+14165550202"))
-        _book_complete(client, base, service, staff, quiet["id"], day, 12, "rule-a-2")
+        _book_complete(client, base, service, staff, quiet["id"], day, 15, "rule-a-2")
         # Unreachable: due with no contact at all.
         ghost = _client_with(client, base, "Ghost")
-        _book_complete(client, base, service, staff, ghost["id"], day, 14, "rule-a-3")
+        _book_complete(client, base, service, staff, ghost["id"], day, 16, "rule-a-3")
+        # A primary email must not satisfy an SMS preview's reachability or
+        # stand in for a suppressed secondary phone number.
+        mixed = client.post(f"{base}/clients", json={"name": "Mixed contacts", "contacts": [
+            {"kind": "email", "value": "mixed@example.invalid", "is_primary": True},
+            {"kind": "phone", "value": "+14165550303", "is_primary": False},
+        ]}).json()
+        _book_complete(client, base, service, staff, mixed["id"], day, 13, "rule-a-4")
+        _grant(client, engine, tenant["tenant_id"], mixed, "sms")
+        with engine.begin() as connection:
+            connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                               {"t": tenant["tenant_id"]})
+            record_suppression(connection, tenant_id=tenant["tenant_id"],
+                               client_id=mixed["id"], contact_value="+14165550303",
+                               channel="sms", reason="stop", source="client_self")
+        email_only = _client_with(
+            client, base, "Email only", ("email", "email-only@example.invalid"))
+        _book_complete(client, base, service, staff, email_only["id"], day, 17, "rule-a-5")
         created = _rule(client, base, service)
         assert created.status_code == 201, created.text
         rule_id = created.json()["id"]
         first = client.post(f"{base}/rebooking-rules/{rule_id}/preview").json()
         assert (first["due_total"], first["eligible"], first["suppressed"],
-                first["unreachable"]) == (3, 1, 1, 1)
+                first["unreachable"]) == (5, 1, 2, 2)
         # One eligible client x (prompt + 1 follow-up) x 1c SMS segment.
         assert first["estimated_sends"] == 2
         assert first["estimated_cost_minor"] == 2
@@ -133,6 +158,8 @@ def test_rule_ac2_invalid_refs_and_scripts_rejected(database_url):
     issuer = "https://identity.example.invalid/rule-2"
     engine, owner, tenant = _salon(database_url, issuer)
     client = _client(database_url, owner)
+    other_engine = None
+    other_tenant = None
     try:
         base, service, staff, day = _setup(client, tenant)
         assert _rule(client, base, service, channel="pigeon").status_code == 422
@@ -145,6 +172,14 @@ def test_rule_ac2_invalid_refs_and_scripts_rejected(database_url):
                      segment_id=str(uuid.uuid4())).status_code == 422
         # A service from another salon (or nowhere) is rejected.
         assert _rule(client, base, str(uuid.uuid4())).status_code == 422
+        other_engine, other_owner, other_tenant = _salon(
+            database_url, "https://identity.example.invalid/rule-other-tenant")
+        other_client = _client(database_url, other_owner)
+        other_base = f"/v1/tenants/{other_tenant['tenant_id']}"
+        foreign_service = other_client.post(f"{other_base}/services", json={
+            "name": "Other salon service", "duration_minutes": 30,
+            "price_minor": 3000}).json()["id"]
+        assert _rule(client, base, foreign_service).status_code == 422
         # An arbitrary script field is rejected, never stored or executed.
         smuggled = client.post(f"{base}/rebooking-rules", json={
             "service_id": service, "interval_days": 42, "channel": "sms",
@@ -162,3 +197,6 @@ def test_rule_ac2_invalid_refs_and_scripts_rejected(database_url):
         assert updated.status_code == 200 and updated.json()["version"] == 2
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
+        if other_engine is not None and other_tenant is not None:
+            _teardown(other_engine, [other_tenant["tenant_id"]],
+                      "https://identity.example.invalid/rule-other-tenant")

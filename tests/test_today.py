@@ -6,8 +6,10 @@ AC-2: Location/role scope plus empty/error/stale UI states verified.
 
 import os
 import sys
+import uuid
 from datetime import date, timedelta, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text
@@ -35,9 +37,10 @@ def _move(client, base, appt_id, to_status, version, reason="today"):
     assert moved.status_code == 200, moved.text
 
 
-def _book_on(client, base, service, staff, client_id, day, hour, key):
+def _book_on(client, base, service, staff, client_id, day, hour, key,
+             timezone_name="America/Toronto"):
     starts = (datetime.combine(day, datetime.min.time())
-              + timedelta(hours=hour)).replace(tzinfo=timezone.utc)
+              + timedelta(hours=hour)).replace(tzinfo=ZoneInfo(timezone_name))
     created = client.post(f"{base}/appointments", json={
         "client_id": client_id, "staff_id": staff, "service_id": service,
         "starts_at": starts.isoformat(), "source": "staff",
@@ -56,15 +59,22 @@ def test_today_ac1_aggregates_reconcile(database_url):
         day = date.today() + timedelta(days=1)
         loc = tenant["location_id"]
         tid = tenant["tenant_id"]
+        zone = "Pacific/Kiritimati"
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            conn.execute(text("UPDATE locations SET timezone=:zone WHERE tenant_id=:t AND id=:l"),
+                         {"zone": zone, "t": tid, "l": loc})
+            conn.execute(text("UPDATE clients SET preferred_location_id=:l WHERE tenant_id=:t AND id=:c"),
+                         {"l": loc, "t": tid, "c": client_id})
 
-        confirmed = _book_on(client, base, service, staff, client_id, day, 10, "today-k-1")
-        checked = _book_on(client, base, service, staff, client_id, day, 12, "today-k-2")
+        confirmed = _book_on(client, base, service, staff, client_id, day, 10, "today-k-1", zone)
+        checked = _book_on(client, base, service, staff, client_id, day, 12, "today-k-2", zone)
         _move(client, base, checked, "checked_in", 1)
-        dropped = _book_on(client, base, service, staff, client_id, day, 14, "today-k-3")
+        dropped = _book_on(client, base, service, staff, client_id, day, 14, "today-k-3", zone)
         _move(client, base, dropped, "cancelled", 1, reason="client request")
         # pending_approval has no producing API yet: fixture the state directly
         # so the dashboard proves it aggregates whatever exists.
-        waiting = _book_on(client, base, service, staff, client_id, day, 15, "today-k-4")
+        waiting = _book_on(client, base, service, staff, client_id, day, 15, "today-k-4", zone)
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
             conn.execute(text("""UPDATE appointments SET status='pending_approval'
@@ -100,11 +110,46 @@ def test_today_ac1_aggregates_reconcile(database_url):
                             provider_ref="today-ghost-ref")
             # An inbound reply opens a follow-up task (task 3).
             conn.execute(
-                text("""INSERT INTO follow_up_tasks (tenant_id, id, kind, title, detail,
+            text("""INSERT INTO follow_up_tasks (tenant_id, id, client_id, kind, title, detail,
                                                       source_type)
-                        VALUES (:t, gen_random_uuid(), 'inbound_reply', 'Client replied',
+                    VALUES (:t, gen_random_uuid(), :client, 'inbound_reply', 'Client replied',
                                 'triage', 'manual')"""),
-                {"t": tid})
+            {"t": tid, "client": client_id})
+
+        # A second location has its own failed broadcast and unresolved task.
+        other_loc = str(uuid.uuid4())
+        conn = engine.connect()
+        try:
+            with conn.begin():
+                conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+                conn.execute(text("""INSERT INTO locations
+                                    (tenant_id, id, display_name, timezone, slug, booking_slug)
+                                    VALUES (:t, :id, 'Second location', 'America/Toronto',
+                                            'second', :booking_slug)"""),
+                             {"t": tid, "id": other_loc,
+                              "booking_slug": "today-" + other_loc.replace("-", "")})
+        finally:
+            conn.close()
+        other_client = client.post(f"{base}/clients", json={
+            "name": "Second location client", "preferred_location_id": other_loc}).json()
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            other_comm = record_booking_communication(
+                connection=conn, tenant_id=tid, appointment_id=other_loc,
+                client_id=other_client["id"], contact_value="client@example.invalid",
+                channel="email", purpose="closure_broadcast", entity_version=1,
+                source_type="location_broadcast")
+            conn.execute(text("UPDATE communications SET state='failed' WHERE tenant_id=:t AND id=:id"),
+                         {"t": tid, "id": other_comm["id"]})
+            conn.execute(text("""INSERT INTO dead_letters
+                                (tenant_id, id, communication_id, reason, attempts)
+                                VALUES (:t, gen_random_uuid(), :id, 'exhausted_retries', 1)"""),
+                         {"t": tid, "id": other_comm["id"]})
+            conn.execute(text("""INSERT INTO follow_up_tasks
+                                (tenant_id, id, client_id, kind, title, detail, source_type)
+                                VALUES (:t, gen_random_uuid(), :client, 'inbound_reply',
+                                        'Other location task', 'triage', 'manual')"""),
+                         {"t": tid, "client": other_client["id"]})
 
         report = client.get(f"/v1/tenants/{tid}/reports/today",
                             params={"day": day.isoformat()})
@@ -117,10 +162,16 @@ def test_today_ac1_aggregates_reconcile(database_url):
         assert [a["id"] for a in body["pending_approvals"]] == [waiting]
         assert len(body["appointments"]) == 4
         assert len(body["active_closure_impacts"]) == 1
-        assert body["delivery_tasks"] == {"failed_communications": 1,
-                                          "open_dead_letters": 1,
-                                          "open_follow_up_tasks": 1}
+        assert body["delivery_tasks"] == {"failed_communications": 2,
+                                          "open_dead_letters": 2,
+                                          "open_follow_up_tasks": 2}
         assert any(s["staff_id"] == staff for s in body["staff_on_shift"])
+        location_report = client.get(f"/v1/tenants/{tid}/reports/today",
+                                     params={"day": day.isoformat(), "location_id": loc}).json()
+        assert len(location_report["appointments"]) == 4
+        assert location_report["delivery_tasks"] == {"failed_communications": 1,
+                                                       "open_dead_letters": 0,
+                                                       "open_follow_up_tasks": 1}
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -164,3 +215,64 @@ def test_today_ac2_front_desk_roles_can_read():
     assert "appointments.read" in ROLE_PERMISSIONS["receptionist"]
     assert "appointments.read" not in ROLE_PERMISSIONS["stylist"]
     assert "appointments.read" not in ROLE_PERMISSIONS["analyst"]
+
+
+def test_today_default_day_uses_salon_timezone(database_url, monkeypatch):
+    """An early-UTC request can already be the next calendar day for the salon."""
+    from modules import analytics
+
+    fixed_now = datetime(2026, 10, 14, 1, 0, tzinfo=timezone.utc)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr(analytics, "datetime", FrozenDateTime)
+    issuer = "https://identity.example.invalid/today-default-zone"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    try:
+        base, _, _, _, _ = _bookable(client, database_url, tenant)
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            conn.execute(text("UPDATE locations SET timezone='Pacific/Kiritimati' WHERE tenant_id=:t AND id=:l"),
+                         {"t": tenant["tenant_id"], "l": tenant["location_id"]})
+
+        response = client.get(f"/v1/tenants/{tenant['tenant_id']}/reports/today",
+                              params={"location_id": tenant["location_id"]})
+        assert response.status_code == 200, response.text
+        assert response.json()["date"] == "2026-10-14"
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_today_receptionist_without_location_assignment_sees_no_locations(database_url):
+    """AC-2: front-desk permission does not turn an empty assignment into tenant-wide access."""
+    from modules.identity.main import AuthenticatedIdentity
+
+    issuer = "https://identity.example.invalid/today-unassigned"
+    engine, owner, tenant = _salon(database_url, issuer)
+    try:
+        identity = AuthenticatedIdentity(issuer, str(uuid.uuid4()))
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                         {"t": tenant["tenant_id"]})
+            conn.execute(text("INSERT INTO identity_users (id, issuer, subject) VALUES (:id, :issuer, :subject)"),
+                         {"id": str(uuid.uuid4()), "issuer": issuer, "subject": identity.subject})
+            user_id = conn.execute(text("SELECT id FROM identity_users WHERE issuer=:issuer AND subject=:subject"),
+                                   {"issuer": issuer, "subject": identity.subject}).scalar_one()
+            conn.execute(text("INSERT INTO memberships (tenant_id, user_id, role) VALUES (:t, :u, 'receptionist')"),
+                         {"t": tenant["tenant_id"], "u": user_id})
+        receptionist = _client(database_url, identity)
+        response = receptionist.get(f"/v1/tenants/{tenant['tenant_id']}/reports/today")
+        assert response.status_code == 200, response.text
+        assert response.json()["locations_scoped"] == []
+        assert response.json()["appointments"] == []
+        outside = receptionist.get(
+            f"/v1/tenants/{tenant['tenant_id']}/reports/today",
+            params={"location_id": tenant["location_id"]})
+        assert outside.status_code == 403
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)

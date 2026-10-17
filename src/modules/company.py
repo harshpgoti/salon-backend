@@ -19,9 +19,11 @@ any membership so the checkout page can render.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from typing import Protocol
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -37,6 +39,7 @@ __all__ = [
     "company_scope",
     "rebuild_entitlements",
     "register_company_routes",
+    "run_billing_reconciliation",
     "run_billing_tick",
     "start_trial",
     "tenant_health",
@@ -66,7 +69,7 @@ COMPANY_PERMISSIONS: dict[str, frozenset[str]] = {
 COMPANY_ROLES = ("admin", "finance", "support", "success")
 
 
-def company_scope(connection, identity) -> str:
+def company_scope(connection, identity, *, lock: bool = False) -> str:
     """Resolve a company identity to its role, enforcing active + MFA.
 
     Separate from salon membership on purpose: company powers never leak
@@ -74,7 +77,8 @@ def company_scope(connection, identity) -> str:
     """
     row = connection.execute(
         text("""SELECT role, mfa_enrolled, is_active FROM company_staff
-                WHERE issuer=:issuer AND subject=:subject"""),
+                WHERE issuer=:issuer AND subject=:subject"""
+             + (" FOR SHARE" if lock else "")),
         {"issuer": identity.issuer, "subject": identity.subject},
     ).mappings().one_or_none()
     if row is None or not row["is_active"]:
@@ -111,6 +115,17 @@ class SyntheticStripeAdapter:
     """
 
     provider = "stripe_test"
+
+    def retrieve_subscription(self, connection, *, tenant_id: str,
+                              subscription_ref: str) -> dict | None:
+        """Read current canonical facts from the local synthetic provider store."""
+        row = connection.execute(
+            text("""SELECT customer_ref, provider_status, plan_code, period_end,
+                           cancel_at_period_end, provider_updated_at
+                    FROM billing_provider_facts
+                    WHERE tenant_id=:tenant AND subscription_ref=:subscription"""),
+            {"tenant": tenant_id, "subscription": subscription_ref}).mappings().one_or_none()
+        return dict(row) if row else None
 
     def create_checkout_session(self, *, tenant_id: str, plan_id: str,
                                 plan_code: str, amount_minor: int) -> dict:
@@ -185,9 +200,10 @@ def assert_bookings_allowed(connection, *, tenant_id: str) -> None:
     status = connection.execute(
         text("SELECT status FROM tenant_subscriptions WHERE tenant_id=:tenant"),
         {"tenant": tenant_id}).scalar_one_or_none()
-    if status == "restricted":
+    if status in ("restricted", "cancelled"):
+        code = "billing_cancelled" if status == "cancelled" else "billing_restricted"
         raise HTTPException(status_code=402, detail={
-            "code": "billing_restricted",
+            "code": code,
             "message": "new bookings are paused until billing recovers; "
                        "existing appointments, exports and billing stay available"})
     if status == "suspended":
@@ -209,7 +225,7 @@ def run_billing_tick(connection, *, tenant_id: str,
     moment = now or datetime.now(timezone.utc)
     connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
                        {"t": tenant_id})
-    applied = restricted = 0
+    applied = restricted = cancelled = 0
     due = connection.execute(
         text("""SELECT scheduled_plan_id::text AS plan_id FROM tenant_subscriptions
                 WHERE tenant_id=:tenant AND scheduled_plan_id IS NOT NULL
@@ -225,6 +241,17 @@ def run_billing_tick(connection, *, tenant_id: str,
             {"tenant": tenant_id, "plan": row["plan_id"]})
         rebuild_entitlements(connection, tenant_id=tenant_id)
         applied += 1
+    ended = connection.execute(
+        text("""UPDATE tenant_subscriptions
+                SET status='cancelled', version=version+1, updated_at=now()
+                WHERE tenant_id=:tenant AND status IN ('trial', 'active')
+                  AND cancel_at_period_end IS TRUE
+                  AND current_period_end IS NOT NULL AND current_period_end <= :now
+                RETURNING tenant_id"""),
+        {"tenant": tenant_id, "now": moment.isoformat()}).scalar_one_or_none()
+    if ended is not None:
+        rebuild_entitlements(connection, tenant_id=tenant_id)
+        cancelled = 1
     expired = connection.execute(
         text("""SELECT 1 FROM tenant_subscriptions
                 WHERE tenant_id=:tenant AND status='past_due' AND grace_until IS NOT NULL
@@ -238,7 +265,8 @@ def run_billing_tick(connection, *, tenant_id: str,
             {"tenant": tenant_id})
         rebuild_entitlements(connection, tenant_id=tenant_id)
         restricted = 1
-    return {"scheduled_applied": applied, "grace_expired": restricted}
+    return {"scheduled_applied": applied, "grace_expired": restricted,
+            "cancellation_expired": cancelled}
 
 
 class CheckoutIn(BaseModel):
@@ -251,12 +279,6 @@ WEBHOOK_EVENTS = (
     "payment.requires_action",
 )
 
-# Events that move money/state vs. events that only record evidence.
-STATEFUL_EVENTS = frozenset({
-    "checkout.session.completed", "invoice.paid", "invoice.payment_failed",
-    "customer.subscription.updated",
-})
-
 # Provider subscription states mapped onto our lifecycle (FR-067). Unknown
 # values never move state — they are recorded and reported.
 PROVIDER_STATUS_MAP = {
@@ -265,13 +287,102 @@ PROVIDER_STATUS_MAP = {
 }
 
 
+class BillingProviderAdapter(Protocol):
+    """Retrieves canonical subscription state without trusting callback order."""
+
+    def retrieve_subscription(self, connection, *, tenant_id: str,
+                              subscription_ref: str) -> dict | None: ...
+
+
+def run_billing_reconciliation(connection, *, tenant_id: str,
+                               provider: BillingProviderAdapter | None = None) -> dict:
+    """Refresh one tenant's subscription and entitlements from provider facts.
+
+    A billing worker calls this on its schedule, including when no callback was
+    received. Missing or unsupported facts are a no-op; callback contents never
+    grant access by themselves. The subscription row lock serializes callbacks
+    and worker refreshes for this tenant.
+    """
+    if provider is None and os.environ.get("APP_ENV", "").strip().lower() not in {
+            "demo", "development", "test"}:
+        return {"status": "provider_unconfigured", "state_changed": False}
+    adapter = provider or SyntheticStripeAdapter()
+    connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                       {"t": tenant_id})
+    sub = connection.execute(
+        text("""SELECT stripe_subscription_ref, stripe_customer_ref, status,
+                       plan_id::text AS plan_id,
+                       current_period_end, cancel_at_period_end, grace_until
+                FROM tenant_subscriptions WHERE tenant_id=:tenant FOR UPDATE"""),
+        {"tenant": tenant_id}).mappings().one_or_none()
+    if sub is None or not sub["stripe_subscription_ref"]:
+        return {"status": "provider_reference_unavailable", "state_changed": False}
+    facts = adapter.retrieve_subscription(
+        connection, tenant_id=tenant_id,
+        subscription_ref=sub["stripe_subscription_ref"])
+    if facts is None:
+        return {"status": "provider_facts_unavailable", "state_changed": False}
+    status = PROVIDER_STATUS_MAP.get(facts["provider_status"])
+    plan = connection.execute(
+        text("""SELECT id::text AS id FROM billing_plans
+                WHERE code=:code AND is_active ORDER BY version DESC LIMIT 1"""),
+        {"code": facts["plan_code"]}).scalar_one_or_none()
+    if status is None or plan is None:
+        return {"status": "provider_facts_unsupported", "state_changed": False}
+    connection.execute(
+        text("""INSERT INTO billing_customer_map (customer_ref, tenant_id)
+                VALUES (:customer, :tenant) ON CONFLICT (customer_ref) DO NOTHING"""),
+        {"customer": facts["customer_ref"], "tenant": tenant_id})
+    mapped_tenant = connection.execute(
+        text("SELECT tenant_id::text FROM billing_customer_map WHERE customer_ref=:customer"),
+        {"customer": facts["customer_ref"]}).scalar_one_or_none()
+    if mapped_tenant != tenant_id:
+        return {"status": "provider_customer_mapping_conflict", "state_changed": False}
+    end = facts["period_end"]
+    suspended = sub["status"] == "suspended"
+    projected_status = "suspended" if suspended else status
+    grace_until = sub["grace_until"]
+    if status == "active":
+        grace_until = None
+    elif status == "past_due":
+        provider_grace = facts["provider_updated_at"] + timedelta(days=GRACE_DAYS)
+        grace_until = max(grace_until, provider_grace) if grace_until else provider_grace
+    changed = (str(sub["plan_id"]) != str(plan)
+               or sub["status"] != projected_status
+               or sub["current_period_end"] != end
+               or sub["grace_until"] != grace_until
+               or sub["cancel_at_period_end"] != facts["cancel_at_period_end"]
+               or sub["stripe_customer_ref"] != facts["customer_ref"])
+    if changed:
+        connection.execute(
+            text("""UPDATE tenant_subscriptions
+                    SET plan_id=:plan, status=:status,
+                        current_period_end=:period,
+                        grace_until=:grace_until,
+                        cancel_at_period_end=:cancel,
+                        stripe_customer_ref=:customer,
+                        last_provider_event_at=GREATEST(
+                            COALESCE(last_provider_event_at, :updated), :updated),
+                        version=version+1, updated_at=now()
+                    WHERE tenant_id=:tenant"""),
+            {"tenant": tenant_id, "plan": str(plan), "status": projected_status,
+             "period": end, "cancel": facts["cancel_at_period_end"],
+             "grace_until": grace_until, "customer": facts["customer_ref"],
+             "updated": facts["provider_updated_at"]})
+    # Rebuild even on an unchanged provider snapshot: repair stale cached
+    # projections during replay, including those left by older entitlement rules.
+    rebuild_entitlements(connection, tenant_id=tenant_id)
+    return {"status": "reconciled", "state_changed": changed,
+            "subscription_status": projected_status}
+
+
 def rebuild_entitlements(connection, *, tenant_id: str) -> dict:
     """Rebuild the entitlement projection from the current subscription row.
 
     Idempotent: same subscription always yields the same projection, so
     out-of-order redelivery converges instead of drifting. Marketing is
-    allowed on trial/active (and pre-end cancelled); every other status
-    pauses it — TASK-048 refines grace/restricted behavior on top.
+    allowed only on trial/active; terminal provider cancellation pauses it.
+    TASK-048 refines grace/restricted behavior on top.
     """
     sub = connection.execute(
         text("""SELECT s.status, p.code, p.limits FROM tenant_subscriptions s
@@ -281,7 +392,7 @@ def rebuild_entitlements(connection, *, tenant_id: str) -> dict:
     if sub is None:
         return {}
     limits = sub["limits"] or {}
-    marketing = sub["status"] in ("trial", "active", "cancelled")
+    marketing = sub["status"] in ("trial", "active")
     connection.execute(
         text("""INSERT INTO tenant_entitlements
                 (tenant_id, plan_code, status, max_locations, max_staff,
@@ -308,20 +419,13 @@ def rebuild_entitlements(connection, *, tenant_id: str) -> dict:
 
 
 def ingest_billing_webhook(
-    connection, *,
-    raw_body: bytes,
-    signature: str,
-    event_type: str,
-    provider_event_id: str,
-    occurred_at: datetime | None,
-    data: dict,
+    connection, *, raw_body: bytes, signature: str, event_type: str,
+    provider_event_id: str, occurred_at: datetime | None, data: dict,
 ) -> dict:
-    """Verify, dedupe and apply one provider billing event (FR-067).
+    """Verify and deduplicate an event, then refresh from provider facts.
 
-    Returns applied / duplicate / stale (older than the last applied event).
-    Unknown customers and unknown event types are rejected, never stored:
-    the provider retries, and nothing is invented. Only signed, deduplicated
-    events ever move subscription state — the browser success page cannot.
+    Event timestamps never decide the projection. A signed callback is a hint
+    to retrieve canonical subscription state, so out-of-order events converge.
     """
     import hashlib
     import hmac
@@ -336,21 +440,19 @@ def ingest_billing_webhook(
             hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest(),
             (signature or "").strip().lower()):
         raise CompanyModuleError("billing webhook signature mismatch")
-    customer_ref = (data or {}).get("customer_ref")
-    tenant_hint = (data or {}).get("tenant_id")
+    data = data or {}
+    customer_ref = data.get("customer_ref")
+    tenant_hint = data.get("tenant_id")
     mapped = connection.execute(
         text("SELECT tenant_id::text AS tenant_id FROM billing_customer_map WHERE customer_ref=:c"),
         {"c": customer_ref}).scalar_one_or_none() if customer_ref else None
     if mapped is not None and tenant_hint is not None and mapped != tenant_hint:
         raise CompanyModuleError("customer reference does not belong to this tenant")
-    # The first event (checkout completion) predates the customer map: the
-    # provider echoes the checkout metadata tenant, authenticated by the
-    # HMAC above, and the scoped session lookup below proves it.
     tenant_id = mapped or tenant_hint
     if tenant_id is None:
         raise CompanyModuleError("unknown customer reference")
-    connection.execute(
-        text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+    connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                       {"t": tenant_id})
     moment = occurred_at or datetime.now(timezone.utc)
     try:
         connection.execute(
@@ -358,102 +460,46 @@ def ingest_billing_webhook(
                     (tenant_id, id, provider_event_id, event_type, occurred_at, payload)
                     VALUES (:tenant, :id, :peid, :type, :at, :payload)"""),
             {"tenant": tenant_id, "id": str(uuid.uuid4()), "peid": provider_event_id,
-             "type": event_type, "at": moment.isoformat(),
-             "payload": json.dumps(data or {})},
-        )
+             "type": event_type, "at": moment.isoformat(), "payload": json.dumps(data)})
     except IntegrityError:
         return {"status": "duplicate", "tenant_id": tenant_id}
-    if event_type not in STATEFUL_EVENTS:
-        # Evidence only: refunds, disputes and pending-authentication change
-        # no state here; finance and recovery workflows read the trail.
-        rebuild_entitlements(connection, tenant_id=tenant_id)
-        return {"status": "applied", "tenant_id": tenant_id, "state_changed": False}
-    last = connection.execute(
-        text("""SELECT last_provider_event_at FROM tenant_subscriptions
-                WHERE tenant_id=:tenant"""),
-        {"tenant": tenant_id}).scalar_one_or_none()
-    if last is not None and moment < last.replace(tzinfo=timezone.utc):
-        return {"status": "stale", "tenant_id": tenant_id}
-    _apply_stateful_event(connection, tenant_id=tenant_id, event_type=event_type,
-                          data=data or {}, moment=moment)
-    rebuild_entitlements(connection, tenant_id=tenant_id)
-    return {"status": "applied", "tenant_id": tenant_id, "state_changed": True}
 
-
-def _apply_stateful_event(connection, *, tenant_id: str, event_type: str,
-                          data: dict, moment: datetime) -> None:
-    """Move subscription state for signed, deduplicated, in-order events."""
     if event_type == "checkout.session.completed":
-        plan = connection.execute(
-            text("""SELECT id FROM billing_plans WHERE code=:code AND is_active
-                    ORDER BY version DESC LIMIT 1"""),
-            {"code": data.get("plan_code", "growth")}).scalar_one_or_none()
-        if plan is None:
-            raise CompanyModuleError("checkout references an unknown plan")
-        # The echoed tenant is proven: its own checkout session must exist.
         session_row = connection.execute(
             text("""SELECT id FROM billing_checkout_sessions
                     WHERE tenant_id=:tenant AND provider_session_ref=:ref"""),
             {"tenant": tenant_id, "ref": data.get("session_ref")}).scalar_one_or_none()
         if session_row is None:
             raise CompanyModuleError("checkout session unknown to this tenant")
-        connection.execute(
-            text("""UPDATE tenant_subscriptions
-                    SET plan_id=:plan, status='active',
-                        stripe_customer_ref=:customer,
-                        stripe_subscription_ref=:sub,
-                        current_period_end=:period,
-                        cancel_at_period_end=false,
-                        last_provider_event_at=:at,
-                        version=version+1, updated_at=now()
-                    WHERE tenant_id=:tenant"""),
-            {"tenant": tenant_id, "plan": str(plan),
-             "customer": data.get("customer_ref"), "sub": data.get("subscription_ref"),
-             "period": data.get("period_end"), "at": moment.isoformat()})
+        if not data.get("subscription_ref") or not data.get("customer_ref"):
+            raise CompanyModuleError("checkout provider references are required")
         connection.execute(
             text("""INSERT INTO billing_customer_map (customer_ref, tenant_id)
-                    VALUES (:c, :t) ON CONFLICT (customer_ref) DO NOTHING"""),
-            {"c": data.get("customer_ref"), "t": tenant_id})
+                    VALUES (:customer, :tenant) ON CONFLICT (customer_ref) DO NOTHING"""),
+            {"customer": data["customer_ref"], "tenant": tenant_id})
+        mapped_tenant = connection.execute(
+            text("SELECT tenant_id::text FROM billing_customer_map WHERE customer_ref=:customer"),
+            {"customer": data["customer_ref"]}).scalar_one_or_none()
+        if mapped_tenant != tenant_id:
+            raise CompanyModuleError("provider customer reference belongs to another tenant")
+        connection.execute(
+            text("""UPDATE tenant_subscriptions
+                    SET stripe_customer_ref=:customer, stripe_subscription_ref=:sub,
+                        updated_at=now() WHERE tenant_id=:tenant"""),
+            {"tenant": tenant_id, "customer": data["customer_ref"],
+             "sub": data["subscription_ref"]})
+
+    reconciled = run_billing_reconciliation(connection, tenant_id=tenant_id)
+    if (event_type == "checkout.session.completed"
+            and reconciled["status"] == "reconciled"
+            and reconciled["subscription_status"] in ("active", "trial", "past_due")):
         connection.execute(
             text("""UPDATE billing_checkout_sessions SET status='complete'
                     WHERE tenant_id=:tenant AND provider_session_ref=:ref"""),
-            {"tenant": tenant_id, "ref": data.get("session_ref")})
-    elif event_type == "invoice.paid":
-        connection.execute(
-            text("""UPDATE tenant_subscriptions
-                    SET status='active', current_period_end=:period,
-                        grace_until=NULL, last_provider_event_at=:at,
-                        version=version+1, updated_at=now()
-                    WHERE tenant_id=:tenant"""),
-            {"tenant": tenant_id, "period": data.get("period_end"),
-             "at": moment.isoformat()})
-    elif event_type == "invoice.payment_failed":
-        # The seven-day grace window runs from the failure (or the existing
-        # window, whichever is later — a second failure never shortens it).
-        grace_at = moment + timedelta(days=GRACE_DAYS)
-        connection.execute(
-            text("""UPDATE tenant_subscriptions
-                    SET status='past_due',
-                        grace_until=GREATEST(COALESCE(grace_until, now()), :grace_at),
-                        last_provider_event_at=:at,
-                        version=version+1, updated_at=now()
-                    WHERE tenant_id=:tenant AND status NOT IN ('cancelled', 'suspended')"""),
-            {"tenant": tenant_id, "grace_at": grace_at.isoformat(),
-             "at": moment.isoformat()})
-    elif event_type == "customer.subscription.updated":
-        mapped = PROVIDER_STATUS_MAP.get(data.get("provider_status", ""))
-        if mapped is None:
-            return
-        connection.execute(
-            text("""UPDATE tenant_subscriptions
-                    SET status=:status, current_period_end=COALESCE(:period, current_period_end),
-                        cancel_at_period_end=COALESCE(:cancel_at, cancel_at_period_end),
-                        last_provider_event_at=:at,
-                        version=version+1, updated_at=now()
-                    WHERE tenant_id=:tenant"""),
-            {"tenant": tenant_id, "status": mapped, "period": data.get("period_end"),
-             "cancel_at": data.get("cancel_at_period_end"), "at": moment.isoformat()})
-
+            {"tenant": tenant_id, "ref": data["session_ref"]})
+    return {"status": "applied", "tenant_id": tenant_id,
+            "state_changed": reconciled.get("state_changed", False),
+            "reconciliation": reconciled["status"]}
 
 class WebhookIn(BaseModel):
     id: str = Field(min_length=1, max_length=120)
@@ -515,9 +561,11 @@ def tenant_health(connection, *, tenant_id: str,
         reasons.append(f"setup {steps['done']}/{steps['total']} steps complete (-15)")
     recent_bookings = connection.execute(
         text("""SELECT count(*) FROM appointments
-                WHERE tenant_id=:tenant AND starts_at > :since"""),
+                WHERE tenant_id=:tenant AND starts_at >= :since
+                  AND starts_at <= :until"""),
         {"tenant": tenant_id,
-         "since": (moment - timedelta(days=14)).isoformat()}).scalar_one()
+         "since": (moment - timedelta(days=14)).isoformat(),
+         "until": moment.isoformat()}).scalar_one()
     if not recent_bookings:
         score -= 10
         reasons.append("no bookings in fourteen days (-10)")
@@ -531,12 +579,15 @@ def tenant_health(connection, *, tenant_id: str,
         reasons.append(f"{open_cases} open support case(s) (-{deduction})")
     failed = connection.execute(
         text("""SELECT count(*) FROM communications
-                WHERE tenant_id=:tenant AND state='failed'"""),
-        {"tenant": tenant_id}).scalar_one()
+                WHERE tenant_id=:tenant AND state='failed'
+                  AND created_at >= :since AND created_at <= :until"""),
+        {"tenant": tenant_id,
+         "since": (moment - timedelta(days=14)).isoformat(),
+         "until": moment.isoformat()}).scalar_one()
     if failed:
         deduction = min(15, 5 * failed)
         score -= deduction
-        reasons.append(f"{failed} failed message(s) (-{deduction})")
+        reasons.append(f"{failed} failed message(s) in fourteen days (-{deduction})")
     return {"tenant_id": tenant_id, "score": max(0, score), "reasons": reasons,
             "subscription_status": status}
 
@@ -598,6 +649,16 @@ def register_company_routes(
 ) -> None:
     adapter = SyntheticStripeAdapter()
 
+    def require_synthetic_billing_allowed() -> None:
+        # The current adapter returns reserved .test URLs and synthetic invoices.
+        # Fail closed unless the process explicitly identifies as a local mode.
+        if (isinstance(adapter, SyntheticStripeAdapter)
+                and os.environ.get("APP_ENV", "").strip().lower() not in {"demo", "development", "test"}):
+            raise HTTPException(status_code=503, detail={
+                "code": "billing_provider_unconfigured",
+                "message": "A live billing provider is not configured.",
+            })
+
     @app.get("/v1/tenants/{tenant_id}/billing/plans", tags=["company"])
     def list_plans(tenant_id: uuid.UUID, identity=Depends(require_identity)) -> dict:
         engine = app.state.engine_factory()
@@ -636,6 +697,7 @@ def register_company_routes(
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 # The salon billing role is the owner (team.manage holders).
                 require_permission(role, "team.manage")
+                require_synthetic_billing_allowed()
                 plan = connection.execute(
                     text("""SELECT id::text AS id, code, name, price_minor FROM billing_plans
                             WHERE code=:code AND is_active ORDER BY version DESC LIMIT 1"""),
@@ -674,6 +736,7 @@ def register_company_routes(
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 # The salon billing role is the owner (team.manage holders).
                 require_permission(role, "team.manage")
+                require_synthetic_billing_allowed()
                 row = connection.execute(
                     text("""SELECT id::text AS id, status, checkout_url FROM billing_checkout_sessions
                             WHERE tenant_id=:tenant AND id=:id"""),
@@ -694,6 +757,7 @@ def register_company_routes(
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 # The salon billing role is the owner (team.manage holders).
                 require_permission(role, "team.manage")
+                require_synthetic_billing_allowed()
                 sub = _subscription(connection, str(tenant_id))
                 if sub is None:
                     raise HTTPException(status_code=404, detail={"code": "subscription_not_found"})
@@ -715,6 +779,7 @@ def register_company_routes(
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 # The salon billing role is the owner (team.manage holders).
                 require_permission(role, "team.manage")
+                require_synthetic_billing_allowed()
                 sub = _subscription(connection, str(tenant_id))
                 if sub is None:
                     raise HTTPException(status_code=404, detail={"code": "subscription_not_found"})
@@ -730,6 +795,7 @@ def register_company_routes(
     @app.post("/v1/billing/webhooks/stripe", tags=["company"])
     async def receive_billing_webhook(request: Request) -> dict:
         """Provider billing webhook. Authenticates by HMAC signature only."""
+        require_synthetic_billing_allowed()
         raw_body = await request.body()
         try:
             payload = WebhookIn.model_validate_json(raw_body)
@@ -784,6 +850,7 @@ def register_company_routes(
             with engine.begin() as connection:
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "team.manage")
+                require_synthetic_billing_allowed()
                 sub = connection.execute(
                     text("""SELECT s.status, s.current_period_end, p.price_minor AS current_price
                             FROM tenant_subscriptions s
@@ -792,7 +859,7 @@ def register_company_routes(
                     {"tenant": str(tenant_id)}).mappings().one_or_none()
                 if sub is None:
                     raise HTTPException(status_code=404, detail={"code": "subscription_not_found"})
-                if sub["status"] in ("suspended", "restricted"):
+                if sub["status"] in ("suspended", "restricted", "cancelled"):
                     raise HTTPException(status_code=409, detail={
                         "code": "plan_change_blocked",
                         "message": "recover billing first; plan changes wait"})
@@ -843,14 +910,22 @@ def register_company_routes(
             with engine.begin() as connection:
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "team.manage")
+                require_synthetic_billing_allowed()
                 row = connection.execute(
                     text("""UPDATE tenant_subscriptions SET cancel_at_period_end=:flag,
                                    version=version+1, updated_at=now()
-                            WHERE tenant_id=:tenant
+                            WHERE tenant_id=:tenant AND status <> 'cancelled'
                             RETURNING status, cancel_at_period_end"""),
                     {"tenant": str(tenant_id), "flag": payload.at_period_end},
                 ).mappings().one_or_none()
                 if row is None:
+                    status = connection.execute(
+                        text("SELECT status FROM tenant_subscriptions WHERE tenant_id=:tenant"),
+                        {"tenant": str(tenant_id)}).scalar_one_or_none()
+                    if status == "cancelled":
+                        raise HTTPException(status_code=409, detail={
+                            "code": "subscription_terminated",
+                            "message": "a cancelled subscription must be restarted through checkout"})
                     raise HTTPException(status_code=404, detail={"code": "subscription_not_found"})
                 insert_audit(connection, tenant_id, identity, action="billing.cancel_flagged",
                              resource_type="tenant_subscription", resource_id=str(tenant_id),
@@ -927,11 +1002,7 @@ def register_company_routes(
     @app.post("/v1/company/staff/{staff_id}/deactivate", tags=["company"])
     def deactivate_staff(staff_id: uuid.UUID,
                          identity=Depends(require_company_identity)) -> dict:
-        """Offboard an employee: deactivate and revoke company sessions.
-
-        Grants die with the sessions; there is no separate grant table to
-        sweep because company powers derive from the staff row every request.
-        """
+        """Offboard an employee and persist session and support-grant revocation."""
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
@@ -950,11 +1021,18 @@ def register_company_routes(
                             WHERE issuer=:issuer AND subject=:subject
                               AND surface='company'"""),
                     {"issuer": row["issuer"], "subject": row["subject"]}).rowcount
+                grants_revoked = connection.execute(
+                    text("""UPDATE support_access_grants SET status='revoked',
+                                   version=version+1, updated_at=now()
+                            WHERE requested_by_issuer=:issuer AND requested_by_subject=:subject
+                              AND status IN ('requested', 'approved')"""),
+                    {"issuer": row["issuer"], "subject": row["subject"]}).rowcount
                 _company_audit(connection, identity=identity, action="company.staff_deactivated",
                                resource_type="company_staff", resource_id=str(staff_id),
-                               reason=f"revoked {revoked} session(s)")
+                               reason=f"revoked {revoked} session(s) and {grants_revoked} grant(s)")
             return {"id": str(staff_id), "is_active": False,
-                    "sessions_revoked": revoked or 0}
+                    "sessions_revoked": revoked or 0,
+                    "grants_revoked": grants_revoked or 0}
         finally:
             engine.dispose()
 
@@ -1146,7 +1224,7 @@ def register_company_routes(
     def read_metrics(identity=Depends(require_company_identity)) -> dict:
         """Company health: live numbers plus stored snapshots with freshness.
 
-        Snapshots older than a day read back stale:true; months never stored
+        Snapshots older than 24 hours read back stale:true; months never stored
         read back as unavailable — never as silent old numbers (FR-064). No
         client data anywhere in these aggregates (FR-063).
         """
@@ -1155,7 +1233,7 @@ def register_company_routes(
         try:
             with engine.begin() as connection:
                 role = company_scope(connection, identity)
-                _require_company(role, "company.registry.read")
+                _require_company(role, "company.finance.read")
                 live = connection.execute(
                     text("SELECT company_compute_metrics()")).scalar_one()
                 live = _json.loads(live) if isinstance(live, str) else dict(live)
@@ -1166,16 +1244,45 @@ def register_company_routes(
             now = datetime.now(timezone.utc)
             snapshots = []
             for row in rows:
-                age_days = (now - row["computed_at"]).days \
+                age_seconds = (now - row["computed_at"]).total_seconds() \
                     if row["computed_at"].tzinfo else 0
                 snapshots.append({"metric": row["metric"], "period": row["period"],
                                   "value_num": float(row["value_num"])
                                   if row["value_num"] is not None else None,
                                   "value_json": dict(row["value_json"] or {}),
                                   "computed_at": row["computed_at"].isoformat(),
-                                  "stale": age_days > 1})
-            return {"live": live, "snapshots": snapshots,
-                    "generated_at": now.isoformat()}
+                                  "stale": age_seconds > 24 * 60 * 60})
+            return {
+                "live": live,
+                "snapshots": snapshots,
+                "generated_at": now.isoformat(),
+                "metric_contract": {
+                    "version": 1,
+                    "as_of": now.isoformat(),
+                    "source_date_basis": "UTC database timestamps",
+                    "timezone": "UTC",
+                    "currency": "CAD",
+                    "history": "Historical periods are shown only when a stored snapshot exists. "
+                               "Backfill is unavailable because provider and subscription state "
+                               "history is incomplete.",
+                    "definitions": {
+                        "mrr_minor": "Sum of current monthly base prices for active subscriptions; "
+                                     "excludes tax, one-off and messaging fees; no denominator.",
+                        "paying_tenants": "Active subscription tenants / all current subscription tenants.",
+                        "logo_churn_rate_pct": "Cancelled paid tenants in the month / paid tenant "
+                                               "cohort at month start; unavailable until a trustworthy "
+                                               "opening-cohort snapshot exists.",
+                        "estimated_usage_month_minor": "Non-voided monthly usage reservations; "
+                                                          "estimated_minor per reservation.",
+                        "channel_cost_month_minor": "Application messaging cost-ledger estimates "
+                                                    "in month; denominator is recorded message-cost rows.",
+                        "provider_matched_cost_month_minor": "Matched provider-reported cost in month; "
+                                                              "denominator is matched cost rows.",
+                        "support_open_pct": "Open support cases / all recorded support cases.",
+                        "onboarding_complete_pct": "Tenants with all setup steps complete / all tenants.",
+                    },
+                },
+            }
         finally:
             engine.dispose()
 
@@ -1207,8 +1314,19 @@ def register_company_routes(
                     text("SELECT company_compute_metrics()")).scalar_one()
                 live = _json.loads(live) if isinstance(live, str) else dict(live)
                 stored = 0
+                live_keys = set(live)
+                existing = connection.execute(
+                    text("SELECT metric FROM company_metric_snapshots WHERE period=:period"),
+                    {"period": current_month}).scalars().all()
+                for metric in existing:
+                    if metric not in live_keys:
+                        connection.execute(
+                            text("DELETE FROM company_metric_snapshots "
+                                 "WHERE period=:period AND metric=:metric"),
+                            {"period": current_month, "metric": metric})
                 for metric, value in live.items():
-                    numeric = value if isinstance(value, (int, float)) else None
+                    numeric = (value if isinstance(value, (int, float))
+                               and not isinstance(value, bool) else None)
                     connection.execute(
                         text("""INSERT INTO company_metric_snapshots
                                 (metric, period, value_num, value_json, source)

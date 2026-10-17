@@ -270,6 +270,10 @@ def test_only_owner_and_manager_may_write_client_records(database_url):
                     {"issuer": "https://identity.example.invalid/crm-6", "subject": f"{role}-subject"}).scalar_one()
                 connection.execute(text("INSERT INTO memberships (tenant_id,user_id,role) VALUES (:tenant,:user,:role)"),
                                    {"tenant": tenant["tenant_id"], "user": str(ids[role]), "role": role})
+            for scoped_role in ("manager", "receptionist"):
+                connection.execute(
+                    text("INSERT INTO membership_locations (tenant_id,user_id,location_id) VALUES (:tenant,:user,:location)"),
+                    {"tenant": tenant["tenant_id"], "user": str(ids[scoped_role]), "location": tenant["location_id"]})
 
         base = f"/v1/tenants/{tenant['tenant_id']}/clients"
         for role in ("receptionist", "stylist", "analyst"):
@@ -487,6 +491,55 @@ def test_update_contact_enforces_ownership_and_transitions(database_url):
         assert email["deliverability"] == "undeliverable"
     finally:
         _teardown(engine, [tenant["tenant_id"]], "https://identity.example.invalid/crm-11")
+
+
+def test_manager_client_access_is_limited_to_assigned_locations(database_url):
+    """FR-003/requirements role matrix: manager client data is location scoped."""
+    engine, owner, tenant = _salon(database_url, "https://identity.example.invalid/crm-location-scope")
+    owner_client = _client(database_url, owner)
+    base = f"/v1/tenants/{tenant['tenant_id']}/clients"
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("SELECT set_config('app.tenant_id', :tenant, true)"),
+                               {"tenant": tenant["tenant_id"]})
+            other_location = connection.execute(
+                text("INSERT INTO locations (tenant_id,slug,booking_slug,display_name,timezone) "
+                     "VALUES (:tenant,'other','other-booking','Other','America/Toronto') RETURNING id"),
+                {"tenant": tenant["tenant_id"]}).scalar_one()
+            manager_id = connection.execute(
+                text("INSERT INTO identity_users (issuer,subject) VALUES (:issuer,:subject) RETURNING id"),
+                {"issuer": "https://identity.example.invalid/crm-location-scope", "subject": "manager"}
+            ).scalar_one()
+            connection.execute(
+                text("INSERT INTO memberships (tenant_id,user_id,role) VALUES (:tenant,:user,'manager')"),
+                {"tenant": tenant["tenant_id"], "user": str(manager_id)})
+            connection.execute(
+                text("INSERT INTO membership_locations (tenant_id,user_id,location_id) VALUES (:tenant,:user,:location)"),
+                {"tenant": tenant["tenant_id"], "user": str(manager_id), "location": tenant["location_id"]})
+
+        visible = owner_client.post(base, json={"name": "East client",
+                                               "preferred_location_id": tenant["location_id"]}).json()
+        hidden = owner_client.post(base, json={"name": "West client",
+                                              "preferred_location_id": str(other_location)}).json()
+        unassigned = owner_client.post(base, json={"name": "Unassigned client"}).json()
+        manager = _client(database_url, AuthenticatedIdentity(
+            "https://identity.example.invalid/crm-location-scope", "manager"))
+
+        assert manager.get(f"{base}/{visible['id']}").status_code == 200
+        assert manager.get(f"{base}/{hidden['id']}").status_code == 404
+        assert manager.get(f"{base}/{unassigned['id']}").status_code == 404
+        listed = manager.get(f"{base}/search").json()
+        assert [item["id"] for item in listed["items"]] == [visible["id"]]
+        assert listed["total"] == 1
+        assert manager.patch(f"{base}/{hidden['id']}",
+                             json={"name": "Changed", "expected_version": 1}).status_code == 404
+        created_by_manager = manager.post(base, json={"name": "Assigned client"})
+        assert created_by_manager.status_code == 201, created_by_manager.text
+        assert created_by_manager.json()["preferred_location_id"] == tenant["location_id"]
+        assert manager.post(base, json={"name": "Foreign location client",
+                                        "preferred_location_id": str(other_location)}).status_code == 404
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], "https://identity.example.invalid/crm-location-scope")
 
 
 def test_add_contact_primary_invariant_and_soft_delete_patch(database_url):

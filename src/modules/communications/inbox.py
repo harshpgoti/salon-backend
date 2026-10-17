@@ -18,29 +18,28 @@ and permissions cannot be bypassed from the inbox.
 
 from __future__ import annotations
 
+import hashlib
+import re
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from modules.communications.callbacks import verify_callback_signature
-from modules.communications.senders import handle_inbound_sms, resolve_client_for_value
+from modules.communications.senders import handle_inbound_sms
+from modules.communications.consent import check_suppressed
 
 __all__ = [
     "InboxModuleError",
-    "PREVIEW_CHARS",
     "create_task_for_inbound",
     "list_inbox",
     "register_inbox_routes",
     "resolve_task",
+    "queue_staff_reply",
 ]
-
-# Triage preview length: enough to route, not enough to leak a full message
-# through the list API (AC-2 redaction).
-PREVIEW_CHARS = 140
 
 TASK_KIND_BY_ACTION = {
     "suppressed": "opt_out",
@@ -57,11 +56,6 @@ TASK_TITLE_BY_KIND = {
 
 class InboxModuleError(Exception):
     """Base exception for inbox operations."""
-
-
-def _preview(body: str | None) -> str:
-    text_body = (body or "").strip().replace("\n", " ")
-    return text_body[:PREVIEW_CHARS]
 
 
 def create_task_for_inbound(connection, *, tenant_id: str, inbound_id: str) -> dict | None:
@@ -81,13 +75,16 @@ def create_task_for_inbound(connection, *, tenant_id: str, inbound_id: str) -> d
     if inbound["action"] == "unresolved":
         return None
     kind = TASK_KIND_BY_ACTION.get(inbound["action"], "inbound_reply")
-    resolved = resolve_client_for_value(
-        connection, tenant_id=tenant_id,
-        contact_value=inbound["from_value"].strip().lower())
-    client_id = resolved["client_id"] if resolved else None
+    matches = connection.execute(text("""SELECT DISTINCT client_id::text AS client_id
+        FROM client_contacts WHERE tenant_id=:tenant AND
+          lower(normalized_value)=lower(:value) LIMIT 2"""),
+        {"tenant": tenant_id, "value": inbound["from_value"].strip()}).mappings().all()
+    # Household/shared numbers do not prove which client sent this message.
+    if len(matches) != 1:
+        return None
+    client_id = matches[0]["client_id"]
     title = TASK_TITLE_BY_KIND[kind]
-    detail = (f"{inbound['channel']} {inbound['keyword']} from {inbound['from_value']}: "
-              f"{_preview(inbound['body'])}")
+    detail = f"{title}; message content hidden"
     row = connection.execute(
         text("""INSERT INTO follow_up_tasks
                 (tenant_id, id, client_id, kind, title, detail,
@@ -111,7 +108,7 @@ def create_task_for_inbound(connection, *, tenant_id: str, inbound_id: str) -> d
 
 def list_inbox(connection, *, tenant_id: str, status: str = "open",
                limit: int = 50) -> list[dict]:
-    """List follow-up tasks with their linked client and message preview."""
+    """List follow-up tasks using fixed labels, never sender/message content."""
     if status not in ("open", "done", "dismissed", "all"):
         raise InboxModuleError(f"unknown status filter {status!r}")
     filt = "" if status == "all" else "AND t.status = :status"
@@ -120,7 +117,11 @@ def list_inbox(connection, *, tenant_id: str, status: str = "open",
                         t.kind, t.title, t.detail, t.source_type,
                         t.source_id::text AS source_id, t.status,
                         t.created_at, c.name AS client_name,
-                        m.from_value, m.channel, m.keyword, m.received_at
+                        m.channel, m.received_at,
+                        (SELECT max(recent.received_at) FROM inbound_messages recent
+                         WHERE recent.tenant_id=t.tenant_id
+                           AND recent.channel=m.channel
+                           AND lower(recent.from_value)=lower(m.from_value)) AS latest_inbound
                  FROM follow_up_tasks t
                  LEFT JOIN clients c ON c.tenant_id=t.tenant_id AND c.id=t.client_id
                  LEFT JOIN inbound_messages m ON m.tenant_id=t.tenant_id
@@ -132,12 +133,14 @@ def list_inbox(connection, *, tenant_id: str, status: str = "open",
     for r in rows:
         items.append({
             "id": r["id"], "client_id": r["client_id"], "client_name": r["client_name"],
-            "kind": r["kind"], "title": r["title"], "detail": r["detail"],
+            "kind": r["kind"], "title": r["title"],
+            "detail": TASK_TITLE_BY_KIND.get(r["kind"], "Follow-up needed") + "; message content hidden",
             "source_type": r["source_type"], "source_id": r["source_id"],
             "status": r["status"], "created_at": r["created_at"].isoformat(),
-            "from_value": r["from_value"], "channel": r["channel"],
-            "keyword": r["keyword"],
+            "channel": r["channel"],
             "received_at": r["received_at"].isoformat() if r["received_at"] else None,
+            "reply_window_open": bool(r["channel"] == "whatsapp" and r["latest_inbound"]
+                and r["latest_inbound"] + timedelta(hours=24) > datetime.now(timezone.utc)),
         })
     return items
 
@@ -160,6 +163,74 @@ def resolve_task(connection, *, tenant_id: str, task_id: str, resolution: str,
     return dict(row)
 
 
+def queue_staff_reply(connection, *, tenant_id: str, task_id: str, body: str,
+                      idempotency_key: str, actor_id: str,
+                      now: datetime | None = None) -> tuple[dict, bool]:
+    """Persist a permissioned, client-linked staff reply in the shared outbox."""
+    now = now or datetime.now(timezone.utc)
+    body = body.strip()
+    if not body or len(body) > 2000:
+        raise InboxModuleError("reply body must contain 1 to 2000 characters")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", idempotency_key):
+        raise InboxModuleError("invalid idempotency key")
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    task = connection.execute(text("""SELECT id::text id, client_id::text client_id,
+            status, version, kind, source_id::text inbound_id
+        FROM follow_up_tasks WHERE tenant_id=:tenant AND id=:id FOR UPDATE"""),
+        {"tenant": tenant_id, "id": task_id}).mappings().one_or_none()
+    if task is None:
+        raise InboxModuleError("unknown task")
+    replay = connection.execute(text("""SELECT id::text id, state, reply_request_hash
+        FROM communications WHERE tenant_id=:tenant AND source_type='inbox_task'
+          AND source_id=:task AND reply_idempotency_key=:key"""),
+        {"tenant": tenant_id, "task": task_id, "key": idempotency_key}).mappings().one_or_none()
+    if replay:
+        if replay["reply_request_hash"] != digest:
+            raise InboxModuleError("idempotency key reused with different reply")
+        return {"id": replay["id"], "state": replay["state"]}, False
+    if task["status"] != "open" or task["kind"] not in ("help_request", "inbound_reply") or not task["client_id"]:
+        raise InboxModuleError("task is not eligible for a staff reply")
+    inbound = connection.execute(text("""SELECT m.from_value, m.channel
+        FROM inbound_messages m WHERE m.tenant_id=:tenant AND m.id=:inbound"""),
+        {"tenant": tenant_id, "inbound": task["inbound_id"]}).mappings().one_or_none()
+    if inbound is None:
+        raise InboxModuleError("task has no linked inbound contact")
+    contact = connection.execute(text("""SELECT normalized_value FROM client_contacts
+        WHERE tenant_id=:tenant AND client_id=:client AND kind='phone'
+          AND lower(normalized_value)=lower(:contact) LIMIT 1"""),
+        {"tenant": tenant_id, "client": task["client_id"],
+         "contact": inbound["from_value"]}).scalar_one_or_none()
+    if contact is None:
+        raise InboxModuleError("inbound contact is not linked to this client")
+    if check_suppressed(connection, tenant_id=tenant_id,
+                        contact_value=contact, channel=inbound["channel"]):
+        raise InboxModuleError("contact is suppressed for this channel")
+    expires = None
+    if inbound["channel"] == "whatsapp":
+        latest = connection.execute(text("""SELECT max(received_at) FROM inbound_messages
+            WHERE tenant_id=:tenant AND channel='whatsapp' AND lower(from_value)=lower(:contact)"""),
+            {"tenant": tenant_id, "contact": contact}).scalar_one()
+        if latest is None or latest + timedelta(hours=24) <= now:
+            raise InboxModuleError("WhatsApp reply window is closed")
+        expires = latest + timedelta(hours=24)
+    row = connection.execute(text("""INSERT INTO communications
+        (tenant_id,id,client_id,contact_value,channel,purpose,source_type,source_id,
+         expected_entity_version,state,scheduled_at,expires_at,dedupe_key,
+         reply_body,reply_idempotency_key,reply_request_hash,reply_actor_id)
+        VALUES (:tenant,:id,:client,:contact,:channel,'inbox_reply','inbox_task',:task,
+         :version,'recorded',:now,:expires,:dedupe,:body,:key,:digest,:actor)
+        ON CONFLICT (tenant_id,dedupe_key) DO NOTHING
+        RETURNING id::text id,state"""),
+        {"tenant": tenant_id, "id": str(uuid.uuid4()), "client": task["client_id"],
+         "contact": contact, "channel": inbound["channel"], "task": task_id,
+         "version": task["version"], "now": now, "expires": expires,
+         "dedupe": "inbox_reply:" + hashlib.sha256(f"{task_id}:{idempotency_key}".encode()).hexdigest(),
+         "body": body, "key": idempotency_key, "digest": digest, "actor": actor_id}).mappings().one_or_none()
+    if row is None:
+        raise InboxModuleError("reply already queued; retry with the original key")
+    return dict(row), True
+
+
 class InboundIn(BaseModel):
     sender_identity: str = Field(min_length=4, max_length=20)
     from_value: str = Field(min_length=3, max_length=320)
@@ -170,6 +241,10 @@ class InboundIn(BaseModel):
 class TaskResolveIn(BaseModel):
     resolution: str
     note: str | None = Field(default=None, max_length=500)
+
+
+class StaffReplyIn(BaseModel):
+    body: str = Field(min_length=1, max_length=2000)
 
 
 def register_inbox_routes(
@@ -259,9 +334,36 @@ def register_inbox_routes(
                                                                  "message": str(exc)})
                 insert_audit(connection, tenant_id, identity, action="inbox.task_resolved",
                              resource_type="follow_up_task", resource_id=result["id"],
-                             reason=f"{result['status']}: {payload.note or ''}"[:240],
+                             reason=f"task {result['status']}",
                              request_id=request.state.request_id,
                              changed_fields=["status"])
+            return result
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/tenants/{tenant_id}/inbox/{task_id}/reply", tags=["communications"])
+    def reply_to_task(tenant_id: uuid.UUID, task_id: uuid.UUID, payload: StaffReplyIn,
+                      request: Request, identity=Depends(require_identity)) -> dict:
+        key = request.headers.get("Idempotency-Key", "")
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, user_id, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "communications.manage")
+                try:
+                    result, created = queue_staff_reply(connection, tenant_id=str(tenant_id),
+                        task_id=str(task_id), body=payload.body, idempotency_key=key,
+                        actor_id=str(user_id))
+                    if created:
+                        insert_audit(connection, tenant_id, identity,
+                            action="inbox.reply_queued", resource_type="communication",
+                            resource_id=result["id"], reason="staff reply queued",
+                            request_id=request.state.request_id,
+                            changed_fields=["state"])
+                except InboxModuleError as exc:
+                    code = "idempotency_conflict" if "idempotency key reused" in str(exc) else "reply_not_allowed"
+                    raise HTTPException(status_code=409 if code == "idempotency_conflict" else 422,
+                                        detail={"code": code})
             return result
         finally:
             engine.dispose()

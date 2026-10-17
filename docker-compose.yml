@@ -11,58 +11,9 @@ services:
       - "127.0.0.1:5433:5432"
     volumes:
       - salon-postgres:/var/lib/postgresql/data
-      - ./db/migrations/000_app_role.sql:/docker-entrypoint-initdb.d/000_app_role.sql:ro
-      - ./db/migrations/001_foundation.sql:/docker-entrypoint-initdb.d/001_foundation.sql:ro
-      - ./db/migrations/002_identity_onboarding.sql:/docker-entrypoint-initdb.d/002_identity_onboarding.sql:ro
-      - ./db/migrations/003_auth_sessions.sql:/docker-entrypoint-initdb.d/003_auth_sessions.sql:ro
-      - ./db/migrations/004_authorization.sql:/docker-entrypoint-initdb.d/004_authorization.sql:ro
-      - ./db/migrations/005_scoped_resources.sql:/docker-entrypoint-initdb.d/005_scoped_resources.sql:ro
-      - ./db/migrations/006_audit_events.sql:/docker-entrypoint-initdb.d/006_audit_events.sql:ro
-      - ./db/migrations/007_membership_lifecycle.sql:/docker-entrypoint-initdb.d/007_membership_lifecycle.sql:ro
-      - ./db/migrations/008_ownership_history.sql:/docker-entrypoint-initdb.d/008_ownership_history.sql:ro
-      - ./db/migrations/009_setup_and_branding.sql:/docker-entrypoint-initdb.d/009_setup_and_branding.sql:ro
-      - ./db/migrations/010_client_contacts.sql:/docker-entrypoint-initdb.d/010_client_contacts.sql:ro
-      - ./db/migrations/011_client_search.sql:/docker-entrypoint-initdb.d/011_client_search.sql:ro
-      - ./db/migrations/012_custom_fields_notes.sql:/docker-entrypoint-initdb.d/012_custom_fields_notes.sql:ro
-      - ./db/migrations/013_client_imports.sql:/docker-entrypoint-initdb.d/013_client_imports.sql:ro
-      - ./db/migrations/014_client_merges.sql:/docker-entrypoint-initdb.d/014_client_merges.sql:ro
-      - ./db/migrations/015_privacy_requests.sql:/docker-entrypoint-initdb.d/015_privacy_requests.sql:ro
-      - ./db/migrations/016_service_catalogue.sql:/docker-entrypoint-initdb.d/016_service_catalogue.sql:ro
-      - ./db/migrations/017_staff_scheduling.sql:/docker-entrypoint-initdb.d/017_staff_scheduling.sql:ro
-      - ./db/migrations/018_location_hours.sql:/docker-entrypoint-initdb.d/018_location_hours.sql:ro
-      - ./db/migrations/019_bookable_resources.sql:/docker-entrypoint-initdb.d/019_bookable_resources.sql:ro
-      - ./db/migrations/020_booking_core.sql:/docker-entrypoint-initdb.d/020_booking_core.sql:ro
-      - ./db/migrations/021_visits.sql:/docker-entrypoint-initdb.d/021_visits.sql:ro
-      - ./db/migrations/022_salon_receipts.sql:/docker-entrypoint-initdb.d/022_salon_receipts.sql:ro
-      - ./db/migrations/026_closure_impacts.sql:/docker-entrypoint-initdb.d/026_closure_impacts.sql:ro
-      - ./db/migrations/027_communications.sql:/docker-entrypoint-initdb.d/027_communications.sql:ro
-      - ./db/migrations/028_consents_suppressions.sql:/docker-entrypoint-initdb.d/028_consents_suppressions.sql:ro
-      - ./db/migrations/029_sms_senders.sql:/docker-entrypoint-initdb.d/029_sms_senders.sql:ro
-      - ./db/migrations/030_delivery_callbacks.sql:/docker-entrypoint-initdb.d/030_delivery_callbacks.sql:ro
-      - ./db/migrations/031_whatsapp_onboarding.sql:/docker-entrypoint-initdb.d/031_whatsapp_onboarding.sql:ro
-      - ./db/migrations/032_quiet_hours_fallback.sql:/docker-entrypoint-initdb.d/032_quiet_hours_fallback.sql:ro
-      - ./db/migrations/033_broadcast_source.sql:/docker-entrypoint-initdb.d/033_broadcast_source.sql:ro
-      - ./db/migrations/034_follow_up_tasks.sql:/docker-entrypoint-initdb.d/034_follow_up_tasks.sql:ro
-      - ./db/migrations/035_rebooking_cycles.sql:/docker-entrypoint-initdb.d/035_rebooking_cycles.sql:ro
-      - ./db/migrations/036_rebooking_rules.sql:/docker-entrypoint-initdb.d/036_rebooking_rules.sql:ro
-      - ./db/migrations/037_rebooking_prompts.sql:/docker-entrypoint-initdb.d/037_rebooking_prompts.sql:ro
-      - ./db/migrations/038_client_segments.sql:/docker-entrypoint-initdb.d/038_client_segments.sql:ro
-      - ./db/migrations/039_offer_campaigns.sql:/docker-entrypoint-initdb.d/039_offer_campaigns.sql:ro
-      - ./db/migrations/040_offer_redemptions.sql:/docker-entrypoint-initdb.d/040_offer_redemptions.sql:ro
-      - ./db/migrations/045_company_metrics.sql:/docker-entrypoint-initdb.d/045_company_metrics.sql:ro
-      - ./db/migrations/046_billing_foundation.sql:/docker-entrypoint-initdb.d/046_billing_foundation.sql:ro
-      - ./db/migrations/047_billing_webhooks.sql:/docker-entrypoint-initdb.d/047_billing_webhooks.sql:ro
-      - ./db/migrations/048_billing_lifecycle.sql:/docker-entrypoint-initdb.d/048_billing_lifecycle.sql:ro
-      - ./db/migrations/049_usage_budgets.sql:/docker-entrypoint-initdb.d/049_usage_budgets.sql:ro
-      - ./db/migrations/050_company_registry.sql:/docker-entrypoint-initdb.d/050_company_registry.sql:ro
-      - ./db/migrations/050_company_registry_functions.sql:/docker-entrypoint-initdb.d/050_company_registry_functions.sql:ro
-      - ./db/migrations/051_support_cases.sql:/docker-entrypoint-initdb.d/051_support_cases.sql:ro
-      - ./db/migrations/052_finance_controls.sql:/docker-entrypoint-initdb.d/052_finance_controls.sql:ro
-      - ./db/migrations/060_ops_alerts.sql:/docker-entrypoint-initdb.d/060_ops_alerts.sql:ro
-      - ./db/migrations/062_customer_success.sql:/docker-entrypoint-initdb.d/062_customer_success.sql:ro
-      - ./db/migrations/053_request_tracing.sql:/docker-entrypoint-initdb.d/053_request_tracing.sql:ro
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U salon -d salon"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U salon -d salon"]
       interval: 3s
       timeout: 3s
       retries: 20

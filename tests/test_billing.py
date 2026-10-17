@@ -13,6 +13,7 @@ from sqlalchemy import text
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from test_clients import _salon, _client, _teardown
+from modules.identity.main import AuthenticatedIdentity
 
 
 @pytest.fixture
@@ -111,3 +112,61 @@ def test_billing_billing_role_is_owner():
     assert "*" in ROLE_PERMISSIONS["owner"]
     assert "team.manage" not in ROLE_PERMISSIONS["manager"]
     assert "team.manage" not in ROLE_PERMISSIONS["receptionist"]
+
+
+def test_billing_plan_catalogue_is_readable_but_billing_actions_are_owner_only(database_url):
+    """AC-1: salon managers may inspect plans; only the billing owner can act."""
+    issuer = "https://identity.example.invalid/bill-manager"
+    engine, owner, tenant = _salon(database_url, issuer)
+    manager = AuthenticatedIdentity(issuer, "manager-" + tenant["tenant_id"])
+    with engine.begin() as connection:
+        connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                           {"t": tenant["tenant_id"]})
+        user_id = connection.execute(
+            text("INSERT INTO identity_users (issuer,subject) VALUES (:i,:s) RETURNING id"),
+            {"i": manager.issuer, "s": manager.subject},
+        ).scalar_one()
+        connection.execute(
+            text("INSERT INTO memberships (tenant_id,user_id,role) VALUES (:t,:u,'manager')"),
+            {"t": tenant["tenant_id"], "u": str(user_id)},
+        )
+    client = _client(database_url, manager)
+    base = f"/v1/tenants/{tenant['tenant_id']}/billing"
+    try:
+        assert client.get(f"{base}/plans").status_code == 200
+        assert client.get(f"{base}/subscription").status_code == 403
+        assert client.post(f"{base}/checkout", json={"plan_code": "growth"}).status_code == 403
+        assert client.post(f"{base}/portal").status_code == 403
+        assert client.get(f"{base}/invoices").status_code == 403
+        # The owner remains the authorized billing role for the same tenant.
+        owner_client = _client(database_url, owner)
+        assert owner_client.get(f"{base}/subscription").status_code == 200
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+def test_synthetic_billing_provider_fails_closed_outside_local_modes(database_url, monkeypatch):
+    """AC-2 and G-COMMERCIAL: no test adapter may be presented as live billing."""
+    issuer = "https://identity.example.invalid/bill-production-disabled"
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    base = f"/v1/tenants/{tenant['tenant_id']}/billing"
+    monkeypatch.setenv("APP_ENV", "production")
+    try:
+        # Reading the local catalogue and trial remains available for supportability.
+        assert client.get(f"{base}/plans").status_code == 200
+        assert client.get(f"{base}/subscription").status_code == 200
+        def unavailable(response):
+            assert response.status_code == 503, response.text
+            assert response.json()["detail"]["code"] == "billing_provider_unconfigured"
+
+        unavailable(client.post(f"{base}/checkout", json={"plan_code": "growth"}))
+        unavailable(client.get(f"{base}/checkout/00000000-0000-4000-8000-000000000000"))
+        unavailable(client.post(f"{base}/portal"))
+        unavailable(client.get(f"{base}/invoices"))
+        unavailable(client.post(f"{base}/subscription/plan", json={"plan_code": "growth"}))
+        unavailable(client.post(f"{base}/subscription/cancel", json={"at_period_end": True}))
+        unavailable(client.post("/v1/billing/webhooks/stripe", json={}))
+        assert client.get(f"{base}/subscription").json()["plan_code"] == "essential"
+    finally:
+        _teardown(engine, [tenant["tenant_id"]], issuer)

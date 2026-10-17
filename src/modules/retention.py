@@ -14,9 +14,12 @@ references resolve only to tenant-owned rows.
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -64,13 +67,23 @@ def create_cycles_for_visit(connection, *, tenant_id: str, visit_id: str) -> lis
     interval are skipped without error.
     """
     visit = connection.execute(
-        text("""SELECT id::text AS id, client_id::text AS client_id,
-                       appointment_id::text AS appointment_id, completed_at
-                FROM visits WHERE tenant_id=:tenant AND id=:visit"""),
+        text("""SELECT v.id::text AS id, v.client_id::text AS client_id,
+                       v.appointment_id::text AS appointment_id,
+                       (v.completed_at AT TIME ZONE a.local_timezone)::date AS completion_date
+                FROM visits v JOIN appointments a
+                  ON a.tenant_id=v.tenant_id AND a.id=v.appointment_id
+                WHERE v.tenant_id=:tenant AND v.id=:visit"""),
         {"tenant": tenant_id, "visit": visit_id}).mappings().one_or_none()
     if visit is None:
         return []
-    base_date = visit["completed_at"].date() if visit["completed_at"] else date.today()
+    # Serialize completions for a client. Without this transaction lock two
+    # simultaneous visits can both observe the same due-cycle set, then race
+    # on the partial unique index instead of both completions succeeding.
+    connection.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"rebooking:{tenant_id}:{visit['client_id']}"},
+    )
+    base_date = visit["completion_date"]
     lines = connection.execute(
         text("""SELECT service_id::text AS service_id, service_version
                 FROM visit_services
@@ -144,17 +157,20 @@ def preview_rule(connection, *, tenant_id: str, rule_id: str) -> dict:
         {"tenant": tenant_id, "service": rule["service_id"]}).mappings().all()
     eligible = suppressed = unreachable = 0
     for row in due:
+        expected_kind = "email" if rule["channel"] == "email" else "phone"
         contact = connection.execute(
             text("""SELECT id::text AS id, kind, normalized_value FROM client_contacts
-                    WHERE tenant_id=:tenant AND client_id=:client
+                    WHERE tenant_id=:tenant AND client_id=:client AND kind=:kind
                     ORDER BY is_primary DESC, created_at LIMIT 1"""),
-            {"tenant": tenant_id, "client": row["client_id"]}).mappings().one_or_none()
+            {"tenant": tenant_id, "client": row["client_id"],
+             "kind": expected_kind}).mappings().one_or_none()
         if contact is None:
             unreachable += 1
             continue
         consented = check_consented(
             connection, tenant_id=tenant_id, client_id=row["client_id"],
-            channel=rule["channel"], purpose="marketing")
+            channel=rule["channel"], purpose="marketing",
+            contact_id=contact["id"], contact_value=contact["normalized_value"])
         blocked = check_suppressed(
             connection, tenant_id=tenant_id, contact_value=contact["normalized_value"],
             channel=rule["channel"])
@@ -191,19 +207,19 @@ def run_rebooking_prompts(connection, *, tenant_id: str,
     from modules.communications.consent import check_consented, check_suppressed
     from modules.communications.outbox import record_booking_communication
     moment = now or datetime.now(_tz.utc)
-    today = moment.date()
     summary = {"prompted": 0, "follow_ups": 0, "snoozed_skip": 0,
                "salon_skip": 0, "inactive_skip": 0, "future_booking_skip": 0,
                "capped_skip": 0, "cooldown_skip": 0, "invalid_contact_skip": 0,
                "consent_skip": 0, "suppressed_skip": 0, "channel_skip": 0,
-               "flag_disabled": 0}
+               "send_time_skip": 0, "booking_link_skip": 0, "flag_disabled": 0}
     from modules.finance import flag_enabled
     if not flag_enabled(connection, tenant_id=tenant_id,
                         flag="rebooking_prompts_enabled", default=True):
         summary["flag_disabled"] = 1
         return summary
     rules = connection.execute(
-        text("""SELECT id::text AS id, service_id::text AS service_id, channel
+        text("""SELECT id::text AS id, service_id::text AS service_id, channel,
+                       send_time_local, max_follow_ups
                 FROM rebooking_rules
                 WHERE tenant_id=:tenant AND is_active"""),
         {"tenant": tenant_id}).mappings().all()
@@ -216,17 +232,28 @@ def run_rebooking_prompts(connection, *, tenant_id: str,
         cycles = connection.execute(
             text("""SELECT c.id::text AS id, c.client_id::text AS client_id,
                            c.service_id::text AS service_id, c.version, c.due_date,
-                           c.snoozed_until, cl.lifecycle
+                           c.snoozed_until, cl.lifecycle, a.local_timezone,
+                           l.booking_slug, s.name AS service_name
                     FROM rebooking_cycles c
                     JOIN clients cl ON cl.tenant_id=c.tenant_id AND cl.id=c.client_id
+                    JOIN appointments a ON a.tenant_id=c.tenant_id
+                                        AND a.id=c.source_appointment_id
+                    JOIN locations l ON l.tenant_id=a.tenant_id AND l.id=a.location_id
+                    JOIN services s ON s.tenant_id=c.tenant_id AND s.id=c.service_id
                     WHERE c.tenant_id=:tenant AND c.service_id=:service
-                      AND c.status='due' AND c.due_date <= :today
+                      AND c.status='due'
+                      AND c.due_date <= (:now AT TIME ZONE a.local_timezone)::date
                     ORDER BY c.due_date"""),
             {"tenant": tenant_id, "service": rule["service_id"],
-             "today": today.isoformat()}).mappings().all()
+             "now": moment.isoformat()}).mappings().all()
         for cycle in cycles:
-            if cycle["snoozed_until"] is not None and str(cycle["snoozed_until"]) > today.isoformat():
+            local_now = moment.astimezone(ZoneInfo(cycle["local_timezone"]))
+            local_date = local_now.date()
+            if cycle["snoozed_until"] is not None and cycle["snoozed_until"] > local_date:
                 summary["snoozed_skip"] += 1
+                continue
+            if local_now.time().replace(tzinfo=None) < rule["send_time_local"]:
+                summary["send_time_skip"] += 1
                 continue
             if sub_status not in ("trial", "active", "cancelled"):
                 summary["salon_skip"] += 1
@@ -253,7 +280,8 @@ def run_rebooking_prompts(connection, *, tenant_id: str,
                 text("""SELECT count(*), max(sent_at) FROM rebooking_prompts
                         WHERE tenant_id=:tenant AND cycle_id=:cycle"""),
                 {"tenant": tenant_id, "cycle": cycle["id"]}).one()
-            if (sent[0] or 0) >= MAX_PROMPTS_PER_CYCLE:
+            prompt_limit = min(MAX_PROMPTS_PER_CYCLE, 1 + int(rule["max_follow_ups"]))
+            if (sent[0] or 0) >= prompt_limit:
                 summary["capped_skip"] += 1
                 continue
             kind = "due_prompt" if not sent[0] else "follow_up"
@@ -264,11 +292,13 @@ def run_rebooking_prompts(connection, *, tenant_id: str,
                 if (moment - last).days < FOLLOW_UP_DELAY_DAYS:
                     summary["cooldown_skip"] += 1
                     continue
+            expected_kind = "email" if rule["channel"] == "email" else "phone"
             contact = connection.execute(
                 text("""SELECT kind, normalized_value FROM client_contacts
-                        WHERE tenant_id=:tenant AND client_id=:client
+                        WHERE tenant_id=:tenant AND client_id=:client AND kind=:kind
                         ORDER BY is_primary DESC, created_at LIMIT 1"""),
-                {"tenant": tenant_id, "client": cycle["client_id"]},
+                {"tenant": tenant_id, "client": cycle["client_id"],
+                 "kind": expected_kind},
             ).mappings().one_or_none()
             if contact is None:
                 summary["invalid_contact_skip"] += 1
@@ -289,12 +319,20 @@ def run_rebooking_prompts(connection, *, tenant_id: str,
                 summary["channel_skip"] += 1
                 continue
             token = uuid.uuid4().hex
+            web_base_url = os.getenv("WEB_BASE_URL", "").strip().rstrip("/")
+            if not web_base_url or not cycle["booking_slug"]:
+                summary["booking_link_skip"] += 1
+                continue
+            booking_url = (f"{web_base_url}/book/{quote(cycle['booking_slug'], safe='')}?"
+                           f"{urlencode({'attribution_token': token})}")
+            message_body = (f"Ready to book your next {cycle['service_name']}? "
+                            f"Choose a time: {booking_url}")
             row = record_booking_communication(
                 connection, tenant_id=tenant_id, appointment_id=cycle["id"],
                 client_id=cycle["client_id"], contact_value=contact["normalized_value"],
                 channel=rule["channel"], purpose="marketing",
                 entity_version=cycle["version"], source_type="rebooking_cycle",
-                dedupe_suffix=kind)
+                dedupe_suffix=kind, reply_body=message_body)
             if row is None:
                 continue
             connection.execute(
@@ -303,10 +341,10 @@ def run_rebooking_prompts(connection, *, tenant_id: str,
                 {"tenant": tenant_id, "id": row["id"], "token": token})
             connection.execute(
                 text("""INSERT INTO rebooking_prompts
-                        (tenant_id, id, cycle_id, kind, communication_id)
-                        VALUES (:tenant, :id, :cycle, :kind, :comm)"""),
+                        (tenant_id, id, cycle_id, kind, communication_id, sent_at)
+                        VALUES (:tenant, :id, :cycle, :kind, :comm, :sent_at)"""),
                 {"tenant": tenant_id, "id": str(uuid.uuid4()), "cycle": cycle["id"],
-                 "kind": kind, "comm": row["id"]})
+                 "kind": kind, "comm": row["id"], "sent_at": moment})
             summary["prompted"] += 1
             if kind == "follow_up":
                 summary["follow_ups"] += 1
@@ -324,14 +362,44 @@ def attribute_booking(connection, *, tenant_id: str, attribution_token: str | No
     """
     if not attribution_token:
         return None
+    from modules.attribution import (ATTRIBUTION_DAYS,
+                                     claim_appointment_attribution)
     prompt = connection.execute(
-        text("""SELECT p.cycle_id::text AS cycle_id, p.communication_id::text AS comm_id
+        text("""SELECT p.cycle_id::text AS cycle_id, p.communication_id::text AS comm_id,
+                       c.dispatched_at, cycle.client_id::text AS client_id,
+                       a.client_id::text AS appointment_client_id
                 FROM rebooking_prompts p
                 JOIN communications c ON c.tenant_id=p.tenant_id
                                       AND c.id=p.communication_id
+                JOIN rebooking_cycles cycle ON cycle.tenant_id=p.tenant_id
+                                            AND cycle.id=p.cycle_id
+                JOIN appointments a ON a.tenant_id=p.tenant_id
+                                    AND a.id=:appointment
+                                    AND (a.client_id=cycle.client_id OR EXISTS (
+                                        SELECT 1 FROM client_contacts contact
+                                        WHERE contact.tenant_id=a.tenant_id
+                                          AND contact.client_id=a.client_id
+                                          AND contact.kind=c.channel
+                                          AND contact.normalized_value=c.contact_value))
                 WHERE p.tenant_id=:tenant AND c.attribution_token=:token"""),
-        {"tenant": tenant_id, "token": attribution_token}).mappings().one_or_none()
+        {"tenant": tenant_id, "token": attribution_token,
+         "appointment": appointment_id}).mappings().one_or_none()
     if prompt is None:
+        return None
+    sent_at = prompt["dispatched_at"]
+    if sent_at is None:
+        return None
+    if sent_at.tzinfo is None:
+        sent_at = sent_at.replace(tzinfo=timezone.utc)
+    moment = datetime.now(timezone.utc)
+    if moment < sent_at or moment > sent_at + timedelta(days=ATTRIBUTION_DAYS):
+        return None
+    savepoint = connection.begin_nested()
+    if not claim_appointment_attribution(
+            connection, tenant_id=tenant_id, appointment_id=appointment_id,
+            kind="rebooking", cycle_id=prompt["cycle_id"],
+            communication_id=prompt["comm_id"]):
+        savepoint.rollback()
         return None
     row = connection.execute(
         text("""UPDATE rebooking_cycles SET status='booked',
@@ -341,8 +409,12 @@ def attribute_booking(connection, *, tenant_id: str, attribution_token: str | No
                 RETURNING id::text AS id"""),
         {"tenant": tenant_id, "cycle": prompt["cycle_id"], "appt": appointment_id,
          "comm": prompt["comm_id"]}).mappings().one_or_none()
+    if row is None:
+        savepoint.rollback()
+        return None
+    savepoint.commit()
     return {"cycle_id": row["id"], "appointment_id": appointment_id,
-            "communication_id": prompt["comm_id"]} if row else None
+            "communication_id": prompt["comm_id"]}
 
 
 class RuleIn(BaseModel):

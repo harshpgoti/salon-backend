@@ -12,7 +12,6 @@ against a hostile payload.
 from __future__ import annotations
 
 import json
-import re
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -33,22 +32,26 @@ __all__ = [
 TRACE_HEADER = "X-Trace-ID"
 
 # Allowlist: the only keys telemetry may carry. Everything else is dropped.
-TRACE_SAFE_KEYS = frozenset({
-    "appointment_id", "attempt", "action", "basis", "channel", "client_id",
-    "communication_id", "count", "event", "expires_at", "grant_id", "hold_id",
-    "location_id", "method", "plan_code", "purpose", "reason", "recipient_kind",
-    "route", "segments", "sender_kind", "service_id", "source", "staff_id",
-    "state", "status", "status_code", "template_kind", "tenant_id",
+_UUID_KEYS = frozenset({
+    "appointment_id", "client_id", "communication_id", "grant_id", "hold_id",
+    "location_id", "service_id", "source_id", "staff_id", "tenant_id",
 })
-
-# Values that must never appear even under a safe key (belt and suspenders):
-# secrets/tokens, contact values, URLs, and anything shaped like PII.
-_UNSAFE_VALUE_RES = (
-    re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
-    re.compile(r"\+?[0-9][0-9 .()-]{6,}[0-9]"),
-    re.compile(r"https?://\S+"),
-    re.compile(r"(?i)(bearer|token|secret|password|key)[=:]\S+"),
-)
+_ENUMS = {
+    "channel": frozenset({"email", "sms", "whatsapp"}),
+    "event": frozenset({"delivered", "failed", "read"}),
+    "purpose": frozenset({
+        "appointment_reminder_2h", "appointment_reminder_24h", "booking_cancelled",
+        "booking_confirmation", "booking_rescheduled", "closure_broadcast",
+        "closure_notice", "marketing",
+    }),
+    "source": frozenset({"appointment"}),
+    "state": frozenset({
+        "delivered", "dispatched", "failed", "read", "recorded", "sending",
+        "skipped_expired", "skipped_stale", "suppressed", "unknown",
+    }),
+}
+_COUNTER_KEYS = frozenset({"attempt", "count", "segments", "status_code"})
+_TRACE_SPANS = frozenset({"outbox_record", "worker_send", "provider_callback"})
 
 
 class TraceModuleError(Exception):
@@ -60,36 +63,32 @@ def new_trace_id() -> str:
 
 
 def sanitize_for_trace(detail: dict) -> dict:
-    """Allowlist a span payload; drop everything else, scrub the rest.
-
-    Only JSON primitives survive, so the result always serializes. Values
-    that parse as UUIDs are identifiers by construction and skip the
-    free-text scans (a UUID's digit runs must not trip the phone pattern).
-    """
+    """Keep only validated identifiers, bounded counters and known enums."""
+    if not isinstance(detail, dict):
+        return {}
     clean: dict = {}
     for key, value in (detail or {}).items():
-        if key not in TRACE_SAFE_KEYS or isinstance(value, (dict, list)):
-            continue
-        if isinstance(value, str):
+        if key in _UUID_KEYS and isinstance(value, (str, uuid.UUID)):
             try:
-                uuid.UUID(value)
-                clean[key] = value
-                continue
+                clean[key] = str(uuid.UUID(str(value)))
             except (ValueError, AttributeError):
-                pass
-            if any(pattern.search(value) for pattern in _UNSAFE_VALUE_RES):
                 continue
+        elif key in _ENUMS and isinstance(value, str) and value in _ENUMS[key]:
             clean[key] = value
-        elif isinstance(value, (int, float, bool)) or value is None:
-            clean[key] = value
-        else:
-            clean[key] = str(value)
+        elif key in _COUNTER_KEYS and type(value) is int:
+            upper_bound = 599 if key == "status_code" else 1000000
+            if 0 <= value <= upper_bound:
+                clean[key] = value
     return clean
 
 
 def record_trace_event(connection, *, tenant_id: str, trace_id: str,
                        span: str, detail: dict | None = None) -> str:
     """Append one sanitized span; returns the event id."""
+    tenant_id = str(uuid.UUID(tenant_id))
+    trace_id = str(uuid.UUID(trace_id))
+    if span not in _TRACE_SPANS:
+        raise ValueError("unknown trace span")
     event_id = str(uuid.uuid4())
     connection.execute(
         text("""INSERT INTO trace_events (tenant_id, id, trace_id, span, detail)
@@ -168,10 +167,10 @@ def register_trace_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role = company_scope(connection, identity)
+                role = company_scope(connection, identity, lock=True)
                 _require_company(role, "company.support.manage")
                 grant = _grant_valid(connection, grant_id=str(grant_id),
-                                     tenant_id=str(tenant_id))
+                                     tenant_id=str(tenant_id), identity=identity)
                 if grant is None:
                     raise HTTPException(status_code=403, detail={
                         "code": "grant_not_authorized",

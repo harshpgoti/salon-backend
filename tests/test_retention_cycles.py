@@ -7,8 +7,9 @@ AC-2: Cancelled/no-show and corrected/superseded completion create no stale cycl
 import os
 import sys
 import uuid
-from datetime import date, timedelta, datetime, timezone
+from datetime import date, timedelta, datetime, time, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text
@@ -46,8 +47,7 @@ def _setup(client, tenant, interval_days=42):
 
 
 def _book(client, base, service, staff, client_id, day, hour=10, key=None):
-    starts = (datetime.combine(day, datetime.min.time())
-              + timedelta(hours=hour)).replace(tzinfo=timezone.utc)
+    starts = datetime.combine(day, time(hour), ZoneInfo("America/Toronto"))
     created = client.post(f"{base}/appointments", json={
         "client_id": client_id, "staff_id": staff, "service_id": service,
         "starts_at": starts.isoformat(), "source": "staff",
@@ -94,7 +94,7 @@ def test_retention_ac1_service_interval_sets_due_date(database_url):
         rows = _cycles(engine, tenant["tenant_id"])
         assert len(rows) == 1
         assert rows[0]["interval_days"] == 42
-        assert str(rows[0]["due_date"]) == (date.today() + timedelta(days=42)).isoformat()
+        assert str(rows[0]["due_date"]) == (datetime.now(ZoneInfo("America/Toronto")).date() + timedelta(days=42)).isoformat()
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -114,7 +114,7 @@ def test_retention_ac1_client_override_wins(database_url):
         rows = _cycles(engine, tenant["tenant_id"])
         assert len(rows) == 1
         assert rows[0]["interval_days"] == 14
-        assert str(rows[0]["due_date"]) == (date.today() + timedelta(days=14)).isoformat()
+        assert str(rows[0]["due_date"]) == (datetime.now(ZoneInfo("America/Toronto")).date() + timedelta(days=14)).isoformat()
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
 
@@ -226,3 +226,37 @@ def test_retention_cycle_list_route(database_url):
         assert items[0]["status"] == "due"
     finally:
         _teardown(engine, [tenant["tenant_id"]], issuer)
+
+
+@pytest.mark.parametrize("local_zone, completed_at, local_day", [
+    ("America/Toronto", "2026-03-08T04:30:00+00:00", "2026-03-07"),
+    ("America/Vancouver", "2026-03-08T05:30:00+00:00", "2026-03-07"),
+    ("America/St_Johns", "2026-11-01T03:30:00+00:00", "2026-11-01"),
+    ("UTC", "2026-03-08T04:30:00+00:00", "2026-03-08"),
+])
+def test_due_date_uses_completion_day_in_snapshot_timezone(database_url, local_zone, completed_at, local_day):
+    """Frozen completion facts cross UTC day and Canadian DST boundaries."""
+    from modules.retention import create_cycles_for_visit
+    issuer = "https://identity.example.invalid/ret-local-" + uuid.uuid4().hex
+    engine, owner, tenant = _salon(database_url, issuer)
+    client = _client(database_url, owner)
+    tid = tenant["tenant_id"]
+    try:
+        base, service, staff, client_id, day = _setup(client, tenant, interval_days=None)
+        appt_id = _book(client, base, service, staff, client_id, day)
+        visit_id = _complete(client, base, appt_id)["visit_id"]
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            conn.execute(text("UPDATE appointments SET local_timezone=:z WHERE tenant_id=:t AND id=:a"), {"z": local_zone, "t": tid, "a": appt_id})
+            conn.execute(text("UPDATE visits SET completed_at=:at WHERE tenant_id=:t AND id=:v"), {"at": completed_at, "t": tid, "v": visit_id})
+            conn.execute(text("UPDATE services SET rebooking_interval_days=42 WHERE tenant_id=:t AND id=:s"), {"t": tid, "s": service})
+            created = create_cycles_for_visit(conn, tenant_id=tid, visit_id=visit_id)
+        assert len(created) == 1
+        assert created[0]["due_date"] == date.fromisoformat(local_day) + timedelta(days=42)
+        # The location still has its original Toronto timezone: the historical
+        # appointment snapshot, not mutable settings or the host zone, wins.
+        with engine.connect() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            assert conn.execute(text("SELECT timezone FROM locations WHERE tenant_id=:t AND id=:l"), {"t": tid, "l": tenant["location_id"]}).scalar_one() == "America/Toronto"
+    finally:
+        _teardown(engine, [tid], issuer)

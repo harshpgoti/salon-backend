@@ -81,7 +81,7 @@ def period_spend_minor(connection, *, tenant_id: str,
                 JOIN communications c ON c.tenant_id=mc.tenant_id
                                       AND c.id=mc.communication_id
                 WHERE mc.tenant_id=:tenant AND mc.recorded_at >= :start
-                  AND mc.recorded_at < :end AND c.state='dispatched'"""),
+                  AND mc.recorded_at < :end"""),
         {"tenant": tenant_id, "start": start, "end": end}).scalar_one()
     reserved = connection.execute(
         text("""SELECT COALESCE(SUM(estimated_minor), 0) FROM usage_reservations
@@ -184,21 +184,32 @@ def reconcile_provider_usage(connection, *, tenant_id: str, provider_ref: str,
     nothing. Unknown communication: the line stays pending; no charge is
     invented and nothing is billed.
     """
-    try:
-        row = connection.execute(
-            text("""INSERT INTO provider_usage
+    row = connection.execute(
+        text("""INSERT INTO provider_usage
                     (tenant_id, id, provider_ref, communication_id, segments, cost_minor)
                     VALUES (:tenant, :id, :ref, :comm, :segments, :cost)
-                    ON CONFLICT (tenant_id, provider_ref) DO NOTHING
+                    ON CONFLICT (tenant_id, provider_ref) DO UPDATE
+                    SET communication_id=COALESCE(provider_usage.communication_id,
+                                                  EXCLUDED.communication_id),
+                        segments=COALESCE(provider_usage.segments, EXCLUDED.segments),
+                        cost_minor=COALESCE(provider_usage.cost_minor, EXCLUDED.cost_minor)
+                    WHERE provider_usage.state='pending'
                     RETURNING id::text AS id, state"""),
-            {"tenant": tenant_id, "id": str(uuid.uuid4()), "ref": provider_ref,
-             "comm": communication_id, "segments": segments, "cost": cost_minor},
-        ).mappings().one_or_none()
-    except IntegrityError:
-        row = None
+        {"tenant": tenant_id, "id": str(uuid.uuid4()), "ref": provider_ref,
+         "comm": communication_id, "segments": segments, "cost": cost_minor},
+    ).mappings().one_or_none()
     if row is None:
         return {"provider_ref": provider_ref, "status": "duplicate"}
-    if communication_id is None:
+    if row["state"] != "pending":
+        return {"provider_ref": provider_ref, "status": "duplicate"}
+    provider_line = connection.execute(
+        text("""SELECT communication_id::text AS communication_id,
+                       segments, cost_minor FROM provider_usage
+                WHERE tenant_id=:tenant AND provider_ref=:ref"""),
+        {"tenant": tenant_id, "ref": provider_ref}).mappings().one()
+    communication_id = provider_line["communication_id"]
+    cost_minor = provider_line["cost_minor"]
+    if communication_id is None or cost_minor is None:
         return {"provider_ref": provider_ref, "status": "pending"}
     known = connection.execute(
         text("""SELECT 1 FROM usage_reservations
@@ -206,15 +217,38 @@ def reconcile_provider_usage(connection, *, tenant_id: str, provider_ref: str,
         {"tenant": tenant_id, "comm": communication_id}).scalar_one_or_none()
     if known is None:
         return {"provider_ref": provider_ref, "status": "pending"}
+    # Keep a concurrent dispatch reservation behind actual-cost reconciliation:
+    # a later send sees committed provider actuals before it takes its estimate.
     connection.execute(
-        text("""UPDATE usage_reservations SET actual_minor=:cost, updated_at=now()
-                WHERE tenant_id=:tenant AND communication_id=:comm"""),
-        {"tenant": tenant_id, "comm": communication_id,
-         "cost": cost_minor if cost_minor is not None else 0})
+        text("""INSERT INTO messaging_budgets (tenant_id) VALUES (:tenant)
+                ON CONFLICT (tenant_id) DO NOTHING"""),
+        {"tenant": tenant_id})
+    connection.execute(
+        text("""SELECT spend_ceiling_minor FROM messaging_budgets
+                WHERE tenant_id=:tenant FOR UPDATE"""),
+        {"tenant": tenant_id}).scalar_one()
     connection.execute(
         text("""UPDATE provider_usage SET state='matched'
                 WHERE tenant_id=:tenant AND provider_ref=:ref"""),
         {"tenant": tenant_id, "ref": provider_ref})
+    actual = connection.execute(
+        text("""SELECT SUM(cost_minor) AS cost_minor, SUM(segments) AS segments
+                FROM provider_usage
+                WHERE tenant_id=:tenant AND communication_id=:comm
+                  AND state='matched'"""),
+        {"tenant": tenant_id, "comm": communication_id}).mappings().one()
+    connection.execute(
+        text("""UPDATE usage_reservations
+                SET actual_minor=:cost, updated_at=now()
+                WHERE tenant_id=:tenant AND communication_id=:comm"""),
+        {"tenant": tenant_id, "comm": communication_id,
+         "cost": actual["cost_minor"]})
+    connection.execute(
+        text("""UPDATE message_costs
+                SET cost_minor=:cost, segments=COALESCE(:segments, segments)
+                WHERE tenant_id=:tenant AND communication_id=:comm"""),
+        {"tenant": tenant_id, "comm": communication_id,
+         "cost": actual["cost_minor"], "segments": actual["segments"]})
     return {"provider_ref": provider_ref, "status": "matched"}
 
 

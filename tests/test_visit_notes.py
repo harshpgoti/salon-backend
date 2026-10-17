@@ -33,6 +33,11 @@ def test_visit_note_crud_and_visibility(database_url):
         assert resp.status_code == 201
         note_id_1 = resp.json()["id"]
 
+        unprotected_allergy = client.post(f"{base}/clients/{client_id}/visit-notes", json={
+            "class": "allergy", "visibility": "standard", "body": "Synthetic allergy fixture",
+        })
+        assert unprotected_allergy.status_code == 422, unprotected_allergy.text
+
         # Create private note (clinical)
         resp = client.post(f"{base}/clients/{client_id}/visit-notes", json={
             "class": "clinical", "visibility": "private", "body": "Allergic to ammonia-based color."
@@ -61,6 +66,11 @@ def test_visit_note_crud_and_visibility(database_url):
         assert resp.status_code == 200
         assert resp.json()["body"] == "Updated: prefers morning appointments."
         assert resp.json()["version"] == 2
+
+        declassified = client.patch(f"{base}/clients/{client_id}/visit-notes/{note_id_1}", json={
+            "class": "clinical", "visibility": "standard", "expected_version": 2,
+        })
+        assert declassified.status_code == 422, declassified.text
 
         # Version conflict
         resp = client.patch(f"{base}/clients/{client_id}/visit-notes/{note_id_1}",
@@ -115,7 +125,8 @@ def test_private_note_excluded_from_page_and_total(database_url):
     base = f"/v1/tenants/{tenant['tenant_id']}"
     receptionist = AuthenticatedIdentity(issuer, str(uuid.uuid4()))
     try:
-        resp = client.post(f"{base}/clients", json={"name": "Paged Notes"})
+        resp = client.post(f"{base}/clients", json={"name": "Paged Notes",
+                                                       "preferred_location_id": tenant["location_id"]})
         assert resp.status_code == 201
         client_id = resp.json()["id"]
         for body in ("standard one", "standard two"):
@@ -136,6 +147,8 @@ def test_private_note_excluded_from_page_and_total(database_url):
                                          {"issuer": issuer, "subject": receptionist.subject}).scalar_one()
             connection.execute(text("INSERT INTO memberships (tenant_id,user_id,role) VALUES (:tenant,:user,'receptionist')"),
                                {"tenant": tenant["tenant_id"], "user": str(user_id)})
+            connection.execute(text("INSERT INTO membership_locations (tenant_id,user_id,location_id) VALUES (:tenant,:user,:location)"),
+                               {"tenant": tenant["tenant_id"], "user": str(user_id), "location": tenant["location_id"]})
         receptionist_app = create_app(engine_factory=lambda: create_engine(database_url, pool_pre_ping=True))
         receptionist_app.dependency_overrides[require_identity] = lambda: receptionist
         receptionist_client = TestClient(receptionist_app)

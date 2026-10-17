@@ -224,7 +224,7 @@ def get_approved_wa_sender(connection, *, tenant_id: str) -> dict | None:
         text("""SELECT id::text AS id, business_name, phone_number, quality_rating,
                        messaging_limit FROM whatsapp_senders
                 WHERE tenant_id=:tenant AND status='approved'
-                ORDER BY approved_at NULLS LAST, created_at LIMIT 1"""),
+                ORDER BY approved_at NULLS LAST, created_at LIMIT 1 FOR UPDATE"""),
         {"tenant": tenant_id}).mappings().one_or_none()
     return dict(row) if row else None
 
@@ -246,7 +246,9 @@ def wa_window_open(connection, *, tenant_id: str, contact_value: str,
 
 
 def check_wa_eligible(connection, *, tenant_id: str, contact_value: str,
-                      template_id: str | None, now: datetime | None = None) -> dict:
+                      template_id: str | None, purpose: str | None = None,
+                      expected_template_version: int | None = None,
+                      now: datetime | None = None) -> dict:
     """Decide whether one WhatsApp send may go, and on what basis.
 
     Returns ``{"ok": True, "basis": ...}`` or ``{"ok": False, "reason": ...}``.
@@ -259,6 +261,21 @@ def check_wa_eligible(connection, *, tenant_id: str, contact_value: str,
     if sender.get("quality_rating") == "red":
         return {"ok": False,
                 "reason": "sender quality is red; Meta would block these sends"}
+    moment = now or datetime.now(timezone.utc)
+    limit = sender.get("messaging_limit")
+    if limit is not None:
+        counts = connection.execute(
+            text("""SELECT count(DISTINCT contact_value) AS recipients,
+                           bool_or(contact_value=:contact) AS already_reached
+                    FROM communications
+                    WHERE tenant_id=:tenant AND channel='whatsapp'
+                      AND state IN ('dispatched', 'delivered', 'read')
+                      AND dispatched_at >= :since"""),
+            {"tenant": tenant_id, "contact": contact_value,
+             "since": moment - CONVERSATION_WINDOW}).mappings().one()
+        if counts["recipients"] >= limit and not counts["already_reached"]:
+            return {"ok": False,
+                    "reason": "WhatsApp sender's 24h messaging limit has been reached"}
     if wa_window_open(connection, tenant_id=tenant_id,
                       contact_value=contact_value, now=now):
         return {"ok": True, "basis": "open_window", "sender": sender}
@@ -266,7 +283,8 @@ def check_wa_eligible(connection, *, tenant_id: str, contact_value: str,
         return {"ok": False,
                 "reason": "outside the 24h window an approved template is required"}
     template = connection.execute(
-        text("""SELECT id::text AS id, name, category, locale, status FROM whatsapp_templates
+        text("""SELECT id::text AS id, name, category, locale, status, version
+                FROM whatsapp_templates
                 WHERE tenant_id=:tenant AND id=:tid"""),
         {"tenant": tenant_id, "tid": template_id}).mappings().one_or_none()
     if template is None:
@@ -274,6 +292,14 @@ def check_wa_eligible(connection, *, tenant_id: str, contact_value: str,
     if template["status"] != "approved":
         return {"ok": False,
                 "reason": f"template {template['name']} is {template['status']}, not approved"}
+    if (expected_template_version is not None
+            and template["version"] != expected_template_version):
+        return {"ok": False,
+                "reason": "WhatsApp template changed after campaign approval"}
+    expected_category = "marketing" if purpose in ("marketing", "closure_broadcast") else "utility"
+    if template["category"] != expected_category:
+        return {"ok": False,
+                "reason": f"{template['category']} template is not allowed for {expected_category} messages"}
     return {"ok": True, "basis": "approved_template", "sender": sender,
             "template": dict(template)}
 
@@ -292,8 +318,8 @@ class WaTemplateIn(BaseModel):
 
 class WaDecisionIn(BaseModel):
     note: str | None = None
-    quality_rating: str | None = None
-    messaging_limit: int | None = None
+    quality_rating: str | None = Field(default=None, pattern="^(green|yellow|red)$")
+    messaging_limit: int | None = Field(default=None, gt=0)
 
 
 def register_wa_sender_routes(
@@ -325,7 +351,7 @@ def register_wa_sender_routes(
                     _fail(exc, "invalid_whatsapp_sender")
                 insert_audit(connection, tenant_id, identity, action="wa_sender.registered",
                              resource_type="whatsapp_sender", resource_id=created["id"],
-                             reason=created["phone_number"],
+                             reason="registered salon WhatsApp sender",
                              request_id=request.state.request_id,
                              changed_fields=["business_name", "phone_number"])
             return created
@@ -397,6 +423,40 @@ def register_wa_sender_routes(
                                    isv_reference, quality_rating, messaging_limit,
                                    decision_note FROM whatsapp_senders
                             WHERE tenant_id=:tenant ORDER BY created_at"""),
+                    {"tenant": str(tenant_id)}).mappings().all()
+            return {"items": [dict(r) for r in rows]}
+        finally:
+            engine.dispose()
+
+    @app.get("/v1/tenants/{tenant_id}/whatsapp-templates", tags=["communications"])
+    def list_wa_templates(tenant_id: uuid.UUID, identity=Depends(require_identity)) -> dict:
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "communications.manage")
+                rows = connection.execute(
+                    text("""SELECT id::text AS id, name, category, locale, status, body
+                            FROM whatsapp_templates WHERE tenant_id=:tenant
+                            ORDER BY created_at"""),
+                    {"tenant": str(tenant_id)}).mappings().all()
+            return {"items": [dict(r) for r in rows]}
+        finally:
+            engine.dispose()
+
+    @app.get("/v1/tenants/{tenant_id}/whatsapp-communications", tags=["communications"])
+    def list_wa_unsent(tenant_id: uuid.UUID, identity=Depends(require_identity)) -> dict:
+        """Show the salon its unresolved WhatsApp delivery tasks without contact data."""
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "communications.manage")
+                rows = connection.execute(
+                    text("""SELECT id::text AS id, purpose, state, skip_reason, created_at
+                            FROM communications WHERE tenant_id=:tenant
+                              AND channel='whatsapp' AND state='failed'
+                            ORDER BY created_at DESC LIMIT 50"""),
                     {"tenant": str(tenant_id)}).mappings().all()
             return {"items": [dict(r) for r in rows]}
         finally:

@@ -40,7 +40,7 @@ __all__ = [
 CAMPAIGN_FREQUENCY_CAP = 4
 CAMPAIGN_FREQUENCY_DAYS = 30
 
-CAMPAIGN_STATUSES = ("draft", "scheduled", "sending", "completed",
+CAMPAIGN_STATUSES = ("draft", "scheduled", "sending", "paused", "completed",
                      "partial", "cancelled", "failed")
 # Content edits never affect sending; mechanics edits reopen the draft.
 CONTENT_FIELDS = {"name", "offer_title", "offer_terms", "offer_code",
@@ -51,7 +51,8 @@ class CampaignModuleError(Exception):
     """Base exception for campaign operations."""
 
 
-def _campaign_or_404(connection, *, tenant_id: str, campaign_id: str) -> dict:
+def _campaign_or_404(connection, *, tenant_id: str, campaign_id: str,
+                     for_update: bool = False) -> dict:
     row = connection.execute(
         text("""SELECT id::text AS id, name, segment_id::text AS segment_id,
                        channel, offer_title, offer_terms, offer_code,
@@ -60,7 +61,8 @@ def _campaign_or_404(connection, *, tenant_id: str, campaign_id: str) -> dict:
                        budget_minor, scheduled_at, status,
                        approved_by_issuer, approved_at, audience_snapshot,
                        version FROM offer_campaigns
-                WHERE tenant_id=:tenant AND id=:id"""),
+                WHERE tenant_id=:tenant AND id=:id""" +
+        (" FOR UPDATE" if for_update else "")),
         {"tenant": tenant_id, "id": campaign_id}).mappings().one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail={"code": "campaign_not_found"})
@@ -84,19 +86,27 @@ def run_campaigns(connection, *, tenant_id: str,
                "skipped_budget": 0, "skipped_frequency": 0,
                "completed": 0, "partial": 0}
     due = connection.execute(
-        text("""SELECT id::text AS id, channel, budget_minor, snapshot_budget_minor
+        text("""SELECT id::text AS id, channel, status, budget_minor,
+                       snapshot_budget_minor, snapshot_template_body,
+                       snapshot_template_subject,
+                       snapshot_whatsapp_template_id::text AS whatsapp_template_id,
+                       snapshot_whatsapp_template_version AS whatsapp_template_version,
+                       snapshot_whatsapp_template_body
                 FROM offer_campaigns
-                WHERE tenant_id=:tenant AND status='scheduled'
-                  AND scheduled_at IS NOT NULL AND scheduled_at <= :now
-                ORDER BY scheduled_at LIMIT 10"""),
+                WHERE tenant_id=:tenant AND status IN ('scheduled', 'sending')
+                  AND COALESCE(snapshot_scheduled_at, scheduled_at) IS NOT NULL
+                  AND COALESCE(snapshot_scheduled_at, scheduled_at) <= :now
+                ORDER BY COALESCE(snapshot_scheduled_at, scheduled_at), id
+                LIMIT 10 FOR UPDATE SKIP LOCKED"""),
         {"tenant": tenant_id, "now": moment.isoformat()}).mappings().all()
     for campaign in due:
-        connection.execute(
-            text("""UPDATE offer_campaigns SET status='sending',
-                           version=version+1, updated_at=now()
-                    WHERE tenant_id=:tenant AND id=:id AND status='scheduled'"""),
-            {"tenant": tenant_id, "id": campaign["id"]})
-        summary["campaigns_started"] += 1
+        if campaign["status"] == "scheduled":
+            connection.execute(
+                text("""UPDATE offer_campaigns SET status='sending',
+                               version=version+1, updated_at=now()
+                        WHERE tenant_id=:tenant AND id=:id AND status='scheduled'"""),
+                {"tenant": tenant_id, "id": campaign["id"]})
+            summary["campaigns_started"] += 1
         budget = campaign["snapshot_budget_minor"]
         if budget is None:
             budget = campaign["budget_minor"]
@@ -191,7 +201,7 @@ def _send_one(connection, *, tenant_id: str, campaign: dict, send: dict,
         text("""SELECT count(*) FROM communications
                 WHERE tenant_id=:tenant AND source_type='campaign'
                   AND source_id=:campaign
-                  AND state IN ('recorded', 'sending', 'retry_scheduled', 'dispatched')"""),
+                  AND state IN ('recorded', 'sending', 'retry_scheduled')"""),
         {"tenant": tenant_id, "campaign": campaign["id"]}).scalar_one()
     if spent + outstanding * rate + rate > budget:
         _mark_send(connection, tenant_id=tenant_id, send_id=send["id"],
@@ -204,6 +214,14 @@ def _send_one(connection, *, tenant_id: str, campaign: dict, send: dict,
         channel=campaign["channel"], purpose="marketing",
         entity_version=_campaign_version(connection, tenant_id=tenant_id,
                                          campaign_id=campaign["id"]),
+        template_id=campaign["whatsapp_template_id"]
+        if campaign["channel"] == "whatsapp" else None,
+        template_version=campaign["whatsapp_template_version"]
+        if campaign["channel"] == "whatsapp" else None,
+        template_subject_snapshot=campaign["snapshot_template_subject"],
+        template_body_snapshot=(campaign["snapshot_whatsapp_template_body"]
+                                if campaign["channel"] == "whatsapp"
+                                else campaign["snapshot_template_body"]),
         source_type="campaign")
     if row is None:
         return "skipped_consent"
@@ -212,7 +230,7 @@ def _send_one(connection, *, tenant_id: str, campaign: dict, send: dict,
                 WHERE tenant_id=:tenant AND id=:id"""),
         {"tenant": tenant_id, "id": row["id"], "token": token})
     connection.execute(
-        text("""UPDATE campaign_sends SET state='sent', communication_id=:comm,
+        text("""UPDATE campaign_sends SET state='recorded', communication_id=:comm,
                        updated_at=now()
                 WHERE tenant_id=:tenant AND id=:send"""),
         {"tenant": tenant_id, "send": send["id"], "comm": row["id"]})
@@ -336,7 +354,8 @@ def register_campaign_routes(
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "retention.manage")
                 current = _campaign_or_404(connection, tenant_id=str(tenant_id),
-                                           campaign_id=str(campaign_id))
+                                           campaign_id=str(campaign_id),
+                                           for_update=True)
                 if current["status"] != "draft":
                     raise HTTPException(status_code=409, detail={
                         "code": "campaign_locked",
@@ -384,7 +403,8 @@ def register_campaign_routes(
                 role, _, _ = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "team.manage")
                 campaign = _campaign_or_404(connection, tenant_id=str(tenant_id),
-                                            campaign_id=str(campaign_id))
+                                            campaign_id=str(campaign_id),
+                                            for_update=True)
                 if campaign["status"] != "draft":
                     raise HTTPException(status_code=409, detail={
                         "code": "campaign_not_draft",
@@ -393,14 +413,17 @@ def register_campaign_routes(
                     raise HTTPException(status_code=422, detail={
                         "code": "campaign_unscheduled",
                         "message": "set the send time before approval"})
+                wa_template = None
                 if campaign["channel"] == "whatsapp":
-                    template = connection.execute(
-                        text("""SELECT status FROM whatsapp_templates
+                    wa_template = connection.execute(
+                        text("""SELECT id::text AS id, name, category, locale,
+                                      body, status, version
+                                FROM whatsapp_templates
                                 WHERE tenant_id=:t AND id=:tpl"""),
                         {"t": str(tenant_id),
                          "tpl": campaign["whatsapp_template_id"]},
-                    ).scalar_one_or_none() if campaign["whatsapp_template_id"] else None
-                    if template != "approved":
+                    ).mappings().one_or_none() if campaign["whatsapp_template_id"] else None
+                    if wa_template is None or wa_template["status"] != "approved":
                         raise HTTPException(status_code=422, detail={
                             "code": "whatsapp_template_unapproved",
                             "message": "WhatsApp campaigns need an approved template"})
@@ -419,14 +442,27 @@ def register_campaign_routes(
                             SET status='scheduled', approved_by_issuer=:issuer,
                                 approved_by_subject=:subject, approved_at=now(),
                                 audience_snapshot=:snapshot,
+                                snapshot_template_subject=template_subject,
                                 snapshot_template_body=template_body,
                                 snapshot_budget_minor=budget_minor,
                                 snapshot_scheduled_at=scheduled_at,
+                                snapshot_whatsapp_template_id=:wa_id,
+                                snapshot_whatsapp_template_version=:wa_version,
+                                snapshot_whatsapp_template_name=:wa_name,
+                                snapshot_whatsapp_template_category=:wa_category,
+                                snapshot_whatsapp_template_locale=:wa_locale,
+                                snapshot_whatsapp_template_body=:wa_body,
                                 version=version+1, updated_at=now()
                             WHERE tenant_id=:tenant AND id=:id AND status='draft'"""),
                     {"tenant": str(tenant_id), "id": str(campaign_id),
                      "issuer": identity.issuer, "subject": identity.subject,
-                     "snapshot": json.dumps(audience["eligible"])})
+                     "snapshot": json.dumps(audience["eligible"]),
+                     "wa_id": wa_template["id"] if wa_template else None,
+                     "wa_version": wa_template["version"] if wa_template else None,
+                     "wa_name": wa_template["name"] if wa_template else None,
+                     "wa_category": wa_template["category"] if wa_template else None,
+                     "wa_locale": wa_template["locale"] if wa_template else None,
+                     "wa_body": wa_template["body"] if wa_template else None})
                 insert_audit(connection, tenant_id, identity, action="campaign.approved",
                              resource_type="offer_campaign", resource_id=str(campaign_id),
                              reason=f"{len(audience['eligible'])} eligible, "
@@ -436,6 +472,63 @@ def register_campaign_routes(
             return {"id": str(campaign_id), "status": "scheduled",
                     "eligible": len(audience["eligible"]),
                     "exclusions": audience["exclusions"]}
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/tenants/{tenant_id}/campaigns/{campaign_id}/pause", tags=["retention"])
+    def pause_campaign(tenant_id: uuid.UUID, campaign_id: uuid.UUID,
+                       request: Request, identity=Depends(require_identity)) -> dict:
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "team.manage")
+                row = connection.execute(
+                    text("""UPDATE offer_campaigns
+                            SET paused_from_status=status, status='paused',
+                                version=version+1, updated_at=now()
+                            WHERE tenant_id=:tenant AND id=:id
+                              AND status IN ('scheduled', 'sending', 'completed', 'partial')
+                            RETURNING id::text AS id, status"""),
+                    {"tenant": str(tenant_id), "id": str(campaign_id)},
+                ).mappings().one_or_none()
+                if row is None:
+                    raise HTTPException(status_code=409, detail={
+                        "code": "campaign_not_pauseable"})
+                insert_audit(connection, tenant_id, identity, action="campaign.paused",
+                             resource_type="offer_campaign", resource_id=row["id"],
+                             reason="owner paused future sends",
+                             request_id=request.state.request_id,
+                             changed_fields=["status", "paused_from_status"])
+            return dict(row)
+        finally:
+            engine.dispose()
+
+    @app.post("/v1/tenants/{tenant_id}/campaigns/{campaign_id}/resume", tags=["retention"])
+    def resume_campaign(tenant_id: uuid.UUID, campaign_id: uuid.UUID,
+                        request: Request, identity=Depends(require_identity)) -> dict:
+        engine = app.state.engine_factory()
+        try:
+            with engine.begin() as connection:
+                role, _, _ = membership_scope(connection, tenant_id, identity)
+                require_permission(role, "team.manage")
+                row = connection.execute(
+                    text("""UPDATE offer_campaigns
+                            SET status=paused_from_status, paused_from_status=NULL,
+                                version=version+1, updated_at=now()
+                            WHERE tenant_id=:tenant AND id=:id AND status='paused'
+                            RETURNING id::text AS id, status"""),
+                    {"tenant": str(tenant_id), "id": str(campaign_id)},
+                ).mappings().one_or_none()
+                if row is None:
+                    raise HTTPException(status_code=409, detail={
+                        "code": "campaign_not_paused"})
+                insert_audit(connection, tenant_id, identity, action="campaign.resumed",
+                             resource_type="offer_campaign", resource_id=row["id"],
+                             reason="owner resumed approved campaign",
+                             request_id=request.state.request_id,
+                             changed_fields=["status", "paused_from_status"])
+            return dict(row)
         finally:
             engine.dispose()
 
@@ -450,9 +543,11 @@ def register_campaign_routes(
                 require_permission(role, "team.manage")
                 row = connection.execute(
                     text("""UPDATE offer_campaigns SET status='cancelled',
+                                   paused_from_status=NULL,
                                    version=version+1, updated_at=now()
                             WHERE tenant_id=:tenant AND id=:id
-                              AND status IN ('scheduled', 'sending')
+                              AND status IN ('scheduled', 'sending', 'paused',
+                                             'completed', 'partial')
                             RETURNING id::text AS id, status"""),
                     {"tenant": str(tenant_id), "id": str(campaign_id)},
                 ).mappings().one_or_none()
@@ -464,7 +559,14 @@ def register_campaign_routes(
                     text("""UPDATE campaign_sends SET state='skipped_cancelled',
                                    updated_at=now()
                             WHERE tenant_id=:tenant AND campaign_id=:campaign
-                              AND state='queued'"""),
+                              AND state IN ('queued', 'recorded')"""),
+                    {"tenant": str(tenant_id), "campaign": str(campaign_id)})
+                connection.execute(
+                    text("""UPDATE communications SET state='skipped_stale',
+                                   skip_reason='campaign cancelled before dispatch',
+                                   version=version+1, updated_at=now()
+                            WHERE tenant_id=:tenant AND source_type='campaign'
+                              AND source_id=:campaign AND state='recorded'"""),
                     {"tenant": str(tenant_id), "campaign": str(campaign_id)})
                 insert_audit(connection, tenant_id, identity, action="campaign.cancelled",
                              resource_type="offer_campaign", resource_id=row["id"],
@@ -504,13 +606,29 @@ def register_campaign_routes(
                     raise HTTPException(status_code=422, detail={
                         "code": "test_client_unconsented",
                         "message": "even tests follow consent"})
+                wa_template = None
+                if campaign["channel"] == "whatsapp":
+                    wa_template = connection.execute(
+                        text("""SELECT id::text AS id, version, status
+                                FROM whatsapp_templates
+                                WHERE tenant_id=:t AND id=:id"""),
+                        {"t": str(tenant_id),
+                         "id": campaign["whatsapp_template_id"]},
+                    ).mappings().one_or_none() if campaign["whatsapp_template_id"] else None
+                    if wa_template is None or wa_template["status"] != "approved":
+                        raise HTTPException(status_code=422, detail={
+                            "code": "whatsapp_template_unapproved"})
                 token = uuid.uuid4().hex
                 row = record_booking_communication(
                     connection, tenant_id=str(tenant_id), appointment_id=str(campaign_id),
                     client_id=str(payload.client_id),
                     contact_value=contact["normalized_value"],
                     channel=campaign["channel"], purpose="marketing",
-                    entity_version=campaign["version"], source_type="campaign")
+                    entity_version=campaign["version"], source_type="campaign_test",
+                    template_id=wa_template["id"] if wa_template else None,
+                    template_version=wa_template["version"] if wa_template else None,
+                    template_subject_snapshot=campaign["template_subject"],
+                    template_body_snapshot=campaign["template_body"])
                 if row is None:
                     raise HTTPException(status_code=409, detail={"code": "test_already_sent"})
                 connection.execute(
@@ -542,6 +660,10 @@ def register_campaign_routes(
                                    (SELECT count(*) FROM campaign_sends s
                                      WHERE s.tenant_id=c.tenant_id AND s.campaign_id=c.id
                                        AND s.state LIKE 'skipped%') AS skipped
+                                   ,(SELECT count(*) FROM communications m
+                                      WHERE m.tenant_id=c.tenant_id
+                                        AND m.source_type='campaign' AND m.source_id=c.id
+                                        AND m.state IN ('recorded', 'sending', 'retry_scheduled')) AS pending
                             FROM offer_campaigns c
                             WHERE c.tenant_id=:tenant ORDER BY c.created_at DESC"""),
                     {"tenant": str(tenant_id)}).mappings().all()

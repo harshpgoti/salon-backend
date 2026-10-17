@@ -6,7 +6,8 @@ AC-2: Timezone denominators/corrections/refunds and exports reconcile.
 
 import os
 import sys
-from datetime import date, timedelta, datetime, timezone
+from datetime import date, timedelta, datetime, time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,7 @@ def database_url() -> str:
 def _setup(client, tenant):
     base = f"/v1/tenants/{tenant['tenant_id']}"
     loc = tenant["location_id"]
-    day = date.today() + timedelta(days=1)
+    day = date.today() + timedelta(days=14)
     client.put(f"{base}/locations/{loc}/hours", json={
         "intervals": [{"weekday": day.weekday(), "opens_at": "09:00", "closes_at": "17:00"}]})
     cut = client.post(f"{base}/services", json={
@@ -45,8 +46,7 @@ def _setup(client, tenant):
 
 
 def _book(client, base, service, staff, client_id, day, hour, key):
-    starts = (datetime.combine(day, datetime.min.time())
-              + timedelta(hours=hour)).replace(tzinfo=timezone.utc)
+    starts = datetime.combine(day, time(hour), ZoneInfo("America/Toronto"))
     created = client.post(f"{base}/appointments", json={
         "client_id": client_id, "staff_id": staff, "service_id": service,
         "starts_at": starts.isoformat(), "source": "staff",
@@ -69,6 +69,26 @@ def _receipt(client, base, appt_id, kind, amount, key):
     assert posted.status_code == 201, posted.text
 
 
+def _backdate_completed_appointment(engine, tenant_id, appointment_id, starts_at):
+    ends_at = starts_at + timedelta(hours=1)
+    with engine.begin() as connection:
+        connection.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                           {"t": tenant_id})
+        connection.execute(text("""UPDATE appointments SET starts_at=:starts,ends_at=:ends
+            WHERE tenant_id=:t AND id=:appointment"""),
+            {"t": tenant_id, "appointment": appointment_id,
+             "starts": starts_at.isoformat(), "ends": ends_at.isoformat()})
+        connection.execute(text("""UPDATE appointment_services
+            SET starts_at=:starts,ends_at=:ends
+            WHERE tenant_id=:t AND appointment_id=:appointment"""),
+            {"t": tenant_id, "appointment": appointment_id,
+             "starts": starts_at.isoformat(), "ends": ends_at.isoformat()})
+        connection.execute(text("""UPDATE reservations SET occupied_range=tstzrange(:starts,:ends,'[)')
+            WHERE tenant_id=:t AND appointment_id=:appointment"""),
+            {"t": tenant_id, "appointment": appointment_id,
+             "starts": starts_at.isoformat(), "ends": ends_at.isoformat()})
+
+
 def test_operational_ac1_dictionary_figures_reconcile(database_url):
     """AC-1: every section follows its dictionary definition."""
     issuer = "https://identity.example.invalid/rep-1"
@@ -80,7 +100,14 @@ def test_operational_ac1_dictionary_figures_reconcile(database_url):
         regular = client.post(f"{base}/clients", json={"name": "Regular"}).json()["id"]
         newcomer = client.post(f"{base}/clients", json={"name": "Newcomer"}).json()["id"]
         # Pre-range history makes Regular a repeat client without entering counts.
-        _book(client, base, cut, staff, regular, day - timedelta(days=7), 10, "rep-key-0")
+        history = _book(client, base, cut, staff, regular, day - timedelta(days=7), 10, "rep-key-0")
+        _move(client, base, history, "checked_in", 1)
+        _move(client, base, history, "in_service", 2)
+        _move(client, base, history, "completed", 3)
+        _backdate_completed_appointment(
+            engine, tid, history,
+            datetime.combine(date.today() - timedelta(days=2), time(10),
+                             ZoneInfo("America/Toronto")))
         first = _book(client, base, cut, staff, regular, day, 10, "rep-key-1")
         _move(client, base, first, "checked_in", 1)
         _move(client, base, first, "in_service", 2)
@@ -91,23 +118,27 @@ def test_operational_ac1_dictionary_figures_reconcile(database_url):
         skipped = _book(client, base, cut, staff, newcomer, day, 15, "rep-key-4")
         _move(client, base, skipped, "no_show", 1)
         _receipt(client, base, first, "payment", 6000, "rep-key-r1")
-        _receipt(client, base, first, "refund", 1000, "rep-key-r2")
+        _receipt(client, base, first, "refund", -1000, "rep-key-r2")
         _receipt(client, base, first, "adjustment", 500, "rep-key-r3")
         report = client.get(
             f"/v1/tenants/{tid}/reports/operational",
-            params={"date_from": date.today().isoformat(), "date_to": day.isoformat()})
+            params={"date_from": (date.today() - timedelta(days=1)).isoformat(),
+                    "date_to": day.isoformat()})
         assert report.status_code == 200, report.text
         body = report.json()
-        assert body["timezone"] == "America/Toronto"
+        assert body["timezone"] == "appointment local_timezone snapshot"
         assert body["generated_at"]
         assert body["bookings"]["by_state"] == {"completed": 1, "confirmed": 1,
                                                 "cancelled": 1, "no_show": 1}
         assert body["bookings"]["total"] == 4
-        assert body["rates"] == {"completion_rate": 0.25, "cancellation_rate": 0.25,
-                                 "no_show_rate": 0.25}
+        assert body["rates"] == {
+            "completion_rate": {"numerator": 1, "denominator": 4, "value": 0.25},
+            "cancellation_rate": {"numerator": 1, "denominator": 4, "value": 0.25},
+            "no_show_rate": {"numerator": 1, "denominator": 2, "value": 0.5},
+        }
         mix = {m["service"]: (m["bookings"], m["booked_minor"]) for m in body["service_mix"]}
         assert mix == {"Cut": (1, 6000), "Tint": (1, 3000)}
-        assert body["clients"] == {"repeat_clients": 1, "new_clients": 1}
+        assert body["clients"] == {"repeat_clients": 1, "new_clients": 0}
         # One future confirmed booking (Tint 3000) forecasts booked value.
         assert body["forecast_booked_value_minor"] == 3000
         receipts = body["recorded_receipts"]
@@ -118,8 +149,8 @@ def test_operational_ac1_dictionary_figures_reconcile(database_url):
         assert receipts["by_kind"]["payment"]["entries"] == 1
         assert len(body["staff_utilization"]) == 1
         util = body["staff_utilization"][0]
-        assert util["booked_minutes"] == 90 and util["scheduled_minutes"] == 480
-        assert util["utilization"] == 0.188
+        assert util["booked_minutes"] == 90 and util["scheduled_minutes"] == 1440
+        assert util["utilization"] == 0.062
         assert set(body["definitions"]) >= {"booking_counts", "completion_rate",
                                             "service_mix", "recorded_receipts", "basis"}
     finally:
@@ -162,8 +193,11 @@ def test_operational_ac2_filters_scope_and_empty(database_url):
             "date_from": (day + timedelta(days=30)).isoformat(),
             "date_to": (day + timedelta(days=31)).isoformat()}).json()
         assert empty["bookings"] == {"by_state": {}, "total": 0}
-        assert empty["rates"] == {"completion_rate": None, "cancellation_rate": None,
-                                  "no_show_rate": None}
+        assert empty["rates"] == {
+            "completion_rate": {"numerator": 0, "denominator": 0, "value": None},
+            "cancellation_rate": {"numerator": 0, "denominator": 0, "value": None},
+            "no_show_rate": {"numerator": 0, "denominator": 0, "value": None},
+        }
         assert empty["recorded_receipts"]["net_minor"] == 0
         assert empty["generated_at"]
     finally:

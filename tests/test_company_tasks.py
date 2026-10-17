@@ -7,8 +7,9 @@ AC-2: Salons client data never reused for company sales; role scopes enforced.
 import json
 import os
 import sys
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,6 +22,7 @@ from modules.identity.main import (
     require_company_identity,
 )
 from test_clients import _salon, _client, _teardown
+from test_booking_holds import _bookable
 
 COMPANY = "https://company.example.invalid/success"
 
@@ -87,10 +89,26 @@ def test_success_ac1_health_explains_and_tasks_flow(database_url):
         assert "Private Person" not in blob and "+14165550909" not in blob
         with engine.begin() as conn:
             conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            conn.execute(text("""INSERT INTO communications
+                (tenant_id, client_id, contact_value, channel, purpose, source_type,
+                 source_id, expected_entity_version, state, dedupe_key, created_at)
+                VALUES (:t, :client, 'synthetic@example.invalid', 'email', 'appointment_reminder_24h',
+                        'appointment', gen_random_uuid(), 1, 'failed', 'success-old-failure',
+                        now() - interval '30 days'),
+                       (:t, :client, 'synthetic@example.invalid', 'email', 'appointment_reminder_24h',
+                        'appointment', gen_random_uuid(), 1, 'failed', 'success-recent-failure',
+                        now() - interval '2 days')"""), {"t": tid, "client": created.json()["id"]})
+        failed_health = success.get(f"/v1/company/tenants/{tid}/health").json()
+        assert failed_health["score"] == body["score"] - 5
+        assert any("failed message(s) in fourteen days" in reason
+                   for reason in failed_health["reasons"])
+        assert "synthetic@example.invalid" not in json.dumps(failed_health)
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
             conn.execute(text("""UPDATE tenant_subscriptions SET status='past_due'
                                  WHERE tenant_id=:t"""), {"t": tid})
         sicker = success.get(f"/v1/company/tenants/{tid}/health").json()
-        assert sicker["score"] == body["score"] - 20
+        assert sicker["score"] == failed_health["score"] - 20
         assert any("past_due" in reason for reason in sicker["reasons"])
         lead = success.post("/v1/company/tasks", json={
             "kind": "lead", "title": "Downtown barbershop",
@@ -136,6 +154,39 @@ def test_success_ac1_suggestions_surface_risks(database_url):
         assert (tid, "renewal") in kinds
         assert (tid, "risk") in kinds
         assert all("Private" not in json.dumps(s) for s in suggestions)
+    finally:
+        _teardown(engine, [tid], issuer)
+        _cleanup_company(database_url)
+
+
+def test_success_health_does_not_count_far_future_bookings_as_recent(database_url):
+    """Health activity counts completed/current history, never an upcoming booking."""
+    issuer = "https://identity.example.invalid/suc-future"
+    engine, owner, tenant = _salon(database_url, issuer)
+    salon = _client(database_url, owner)
+    tid = tenant["tenant_id"]
+    try:
+        base, _, service, staff, client_id = _bookable(salon, database_url, tenant)
+        start = datetime.combine(date.today() + timedelta(days=1), time(10),
+                                 ZoneInfo("America/Toronto"))
+        created = salon.post(f"{base}/appointments", json={
+            "client_id": client_id, "staff_id": staff, "service_id": service,
+            "starts_at": start.isoformat(), "source": "staff",
+            "idempotency_key": "success-future-" + tid[:8]})
+        assert created.status_code == 201, created.text
+        with engine.begin() as conn:
+            conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tid})
+            conn.execute(text("""UPDATE appointments
+                                SET starts_at=:start, ends_at=:end
+                                WHERE tenant_id=:t AND id=:id"""), {
+                "start": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+                "end": (datetime.now(timezone.utc) + timedelta(days=30, hours=1)).isoformat(),
+                "t": tid, "id": created.json()["appointment_id"]})
+        admin = _bootstrap(database_url)
+        _invite(admin, "suc-future", "success")
+        success = _company_client(database_url, "suc-future")
+        health = success.get(f"/v1/company/tenants/{tid}/health").json()
+        assert any("no bookings in fourteen days" in reason for reason in health["reasons"])
     finally:
         _teardown(engine, [tid], issuer)
         _cleanup_company(database_url)

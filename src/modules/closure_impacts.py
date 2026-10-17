@@ -14,6 +14,8 @@ unreachable count.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
@@ -22,6 +24,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
+from salon_platform.authorization import require_assigned_location
 
 CLOSE_STATUSES = ("active", "rescheduled", "cancelled", "left")
 
@@ -30,14 +33,16 @@ class ClosureImpactIn(BaseModel):
     appointment_id: uuid.UUID
     location_id: uuid.UUID
     exception_date: date
-    status: str = "active"
 
 
 class ResolveImpactIn(BaseModel):
     impact_id: uuid.UUID
-    resolution: str = Field(pattern=r"^(active|rescheduled|cancelled|left)$")
-    resolved_by: uuid.UUID
+    resolution: str = Field(pattern=r"^(rescheduled|cancelled|left)$")
+    impact_version: int = Field(ge=1)
+    appointment_version: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=8, max_length=64)
     reason: str | None = Field(default=None, max_length=240)
+    starts_at: str | None = Field(default=None, min_length=16, max_length=40)
 
     model_config = {
         "json_schema_extra": {
@@ -80,6 +85,15 @@ def register_closure_impacts_routes(
 ) -> None:
     """Register all closure-impact endpoints under /v1/tenants/{tenant_id}."""
 
+    def require_location_scope(connection, tenant_id, role, assigned, location_id):
+        require_assigned_location(role, assigned, location_id)
+        exists = connection.execute(
+            text("SELECT 1 FROM locations WHERE tenant_id=:tenant AND id=:location"),
+            {"tenant": str(tenant_id), "location": str(location_id)},
+        ).scalar_one_or_none()
+        if exists is None:
+            raise HTTPException(status_code=404, detail={"code": "location_not_found"})
+
     @app.post("/v1/tenants/{tenant_id}/closures/{location_id}/impacts", tags=["closure"])
     def record_closure_impact(
         tenant_id: uuid.UUID, location_id: uuid.UUID, payload: ClosureImpactIn,
@@ -89,10 +103,13 @@ def register_closure_impacts_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "closures.manage")
+                require_location_scope(connection, tenant_id, role, assigned, location_id)
+                if payload.location_id != location_id:
+                    raise HTTPException(status_code=422, detail={"code": "appointment_not_affected"})
                 exception = connection.execute(
-                    text("""SELECT id FROM location_exceptions
+                    text("""SELECT id, kind, opens_at, closes_at FROM location_exceptions
                             WHERE tenant_id=:tenant AND location_id=:location
                               AND exception_date=:date AND published_at IS NOT NULL"""),
                     {"tenant": str(tenant_id), "location": str(location_id),
@@ -102,10 +119,21 @@ def register_closure_impacts_routes(
 
                 appt = connection.execute(
                     text("""SELECT a.id, a.client_id, a.staff_id, a.starts_at, a.ends_at
-                            FROM appointments a WHERE tenant_id=:tenant AND id=:id"""),
-                    {"tenant": str(tenant_id), "id": str(payload.appointment_id)}).mappings().one_or_none()
+                            FROM appointments a
+                            JOIN locations l ON l.tenant_id=a.tenant_id AND l.id=a.location_id
+                            WHERE a.tenant_id=:tenant AND a.id=:id AND a.location_id=:location
+                              AND a.status IN ('pending_approval','confirmed','checked_in','in_service')
+                              AND (a.starts_at AT TIME ZONE l.timezone)::date=:date
+                              AND (:kind='closed' OR
+                                   CAST(a.starts_at AT TIME ZONE l.timezone AS time)<:opens_at OR
+                                   CAST(a.ends_at AT TIME ZONE l.timezone AS time)>:closes_at)
+                            FOR UPDATE OF a"""),
+                    {"tenant": str(tenant_id), "id": str(payload.appointment_id),
+                     "location": str(location_id), "date": payload.exception_date,
+                     "kind": exception["kind"], "opens_at": exception["opens_at"],
+                     "closes_at": exception["closes_at"]}).mappings().one_or_none()
                 if appt is None:
-                    raise HTTPException(status_code=404, detail={"code": "appointment_not_found"})
+                    raise HTTPException(status_code=422, detail={"code": "appointment_not_affected"})
 
                 impacted = connection.execute(
                     text("""INSERT INTO closure_impacts (
@@ -113,13 +141,10 @@ def register_closure_impacts_routes(
                             client_id, staff_id, starts_at, ends_at, status
                           ) VALUES (
                             :tenant, :location, :date, :appointment,
-                            :client, :staff, :starts, :ends, :status
+                            :client, :staff, :starts, :ends, 'active'
                           )
                           ON CONFLICT (tenant_id, location_id, exception_date, appointment_id)
-                          DO UPDATE SET
-                            status = EXCLUDED.status,
-                            version = closure_impacts.version + 1,
-                            updated_at = now()
+                          DO NOTHING
                           RETURNING *"""),
                     {"tenant": str(tenant_id), "location": str(location_id),
                      "date": str(payload.exception_date),
@@ -127,13 +152,21 @@ def register_closure_impacts_routes(
                      "client": str(appt["client_id"]),
                      "staff": str(appt["staff_id"]) if appt["staff_id"] else None,
                      "starts": str(appt["starts_at"]),
-                     "ends": str(appt["ends_at"]),
-                     "status": payload.status}).mappings().one()
-                insert_audit(connection, tenant_id, identity,
-                             action="closure_impact.recorded", resource_type="closure",
-                             resource_id=str(location_id),
-                             reason=f"exception {payload.exception_date} affected appointment {payload.appointment_id}",
-                             request_id=request.state.request_id, changed_fields=["status"])
+                     "ends": str(appt["ends_at"])}).mappings().one_or_none()
+                if impacted is None:
+                    impacted = connection.execute(
+                        text("""SELECT * FROM closure_impacts WHERE tenant_id=:tenant
+                                AND location_id=:location AND exception_date=:date
+                                AND appointment_id=:appointment"""),
+                        {"tenant": str(tenant_id), "location": str(location_id),
+                         "date": str(payload.exception_date),
+                         "appointment": str(payload.appointment_id)}).mappings().one()
+                else:
+                    insert_audit(connection, tenant_id, identity,
+                                 action="closure_impact.recorded", resource_type="closure",
+                                 resource_id=str(location_id),
+                                 reason=f"exception {payload.exception_date} affected appointment {payload.appointment_id}",
+                                 request_id=request.state.request_id, changed_fields=["status"])
                 return {
                     "id": str(impacted["id"]), "appointment_id": str(impacted["appointment_id"]),
                     "location_id": str(impacted["location_id"]),
@@ -151,21 +184,88 @@ def register_closure_impacts_routes(
         tenant_id: uuid.UUID, location_id: uuid.UUID, payload: ResolveImpactIn,
         request: Request, identity=Depends(require_identity),
     ) -> dict:
-        """Resolve an impact by setting its status (cancelled, rescheduled, left)."""
+        """Resolve a closure impact only after its appointment outcome is real."""
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, user_id, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "closures.manage")
+                require_location_scope(connection, tenant_id, role, assigned, location_id)
+                normalized = payload.model_dump(mode="json")
+                fingerprint = hashlib.sha256(json.dumps(
+                    normalized, sort_keys=True, separators=(",", ":")
+                ).encode()).hexdigest()
+                connection.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                    {"key": f"closure-resolution:{tenant_id}:{payload.idempotency_key}"},
+                )
+                receipt = connection.execute(
+                    text("""SELECT request_hash, response FROM closure_resolution_receipts
+                            WHERE tenant_id=:tenant AND idempotency_key=:key FOR UPDATE"""),
+                    {"tenant": str(tenant_id), "key": payload.idempotency_key},
+                ).mappings().one_or_none()
+                if receipt is not None:
+                    if receipt["request_hash"] != fingerprint:
+                        raise HTTPException(status_code=409, detail={"code": "idempotency_conflict"})
+                    return receipt["response"]
                 impact = connection.execute(
-                    text("""SELECT id, appointment_id, status, version
+                    text("""SELECT id, appointment_id, location_id, status, version
                             FROM closure_impacts
-                            WHERE tenant_id=:tenant AND id=:impact_id"""),
-                    {"tenant": str(tenant_id), "impact_id": str(payload.impact_id)}).mappings().one_or_none()
+                            WHERE tenant_id=:tenant AND location_id=:location AND id=:impact_id
+                            FOR UPDATE"""),
+                    {"tenant": str(tenant_id), "location": str(location_id),
+                     "impact_id": str(payload.impact_id)}).mappings().one_or_none()
                 if impact is None:
                     raise HTTPException(status_code=404, detail={"code": "impact_not_found"})
                 if impact["status"] != "active":
                     raise HTTPException(status_code=409, detail={"code": "impact_already_resolved"})
+                if impact["version"] != payload.impact_version:
+                    raise HTTPException(status_code=409, detail={"code": "impact_version_conflict"})
+                appointment = connection.execute(
+                    text("""SELECT version, status FROM appointments
+                            WHERE tenant_id=:tenant AND id=:appointment FOR UPDATE"""),
+                    {"tenant": str(tenant_id), "appointment": str(impact["appointment_id"])}
+                ).mappings().one_or_none()
+                if appointment is None:
+                    raise HTTPException(status_code=404, detail={"code": "appointment_not_found"})
+                if appointment["version"] != payload.appointment_version:
+                    raise HTTPException(status_code=409, detail={"code": "appointment_version_conflict"})
+
+                # Resolver identity is taken from the current membership. A profile is
+                # attached only when that authenticated user has an explicit staff profile.
+                resolved_by = connection.execute(
+                    text("""SELECT id FROM staff_profiles
+                            WHERE tenant_id=:tenant AND user_ref=:user"""),
+                    {"tenant": str(tenant_id), "user": str(user_id)}).scalar_one_or_none()
+                if payload.resolution == "cancelled":
+                    from modules.booking.calendar import CancelIn, _cancel_command
+
+                    reason = (payload.reason or "").strip()
+                    if not reason:
+                        raise HTTPException(status_code=422, detail={"code": "appointment_reason_required"})
+                    outcome = _cancel_command(
+                        connection, tenant_id, impact["appointment_id"],
+                        CancelIn(expected_version=payload.appointment_version,
+                                 reason=reason, idempotency_key=payload.idempotency_key),
+                        request, identity, insert_audit)
+                elif payload.resolution == "rescheduled":
+                    if not payload.starts_at:
+                        raise HTTPException(status_code=422, detail={"code": "reschedule_time_required"})
+                    from modules.booking.calendar import RescheduleIn, _reschedule_command
+
+                    outcome = _reschedule_command(
+                        connection, tenant_id, impact["appointment_id"],
+                        RescheduleIn(starts_at=payload.starts_at,
+                                     expected_version=payload.appointment_version,
+                                     idempotency_key=payload.idempotency_key),
+                        request, identity, insert_audit)
+                else:
+                    if appointment["status"] not in (
+                            "pending_approval", "confirmed", "checked_in", "in_service"):
+                        raise HTTPException(status_code=409,
+                                            detail={"code": "appointment_not_cancellable"})
+                    outcome = {"appointment_id": str(impact["appointment_id"]),
+                               "status": "left", "replayed": False}
 
                 updated = connection.execute(
                     text("""UPDATE closure_impacts
@@ -176,20 +276,31 @@ def register_closure_impacts_routes(
                             WHERE tenant_id=:tenant AND id=:impact_id
                             RETURNING *"""),
                     {"tenant": str(tenant_id), "impact_id": str(payload.impact_id),
-                     "resolution": payload.resolution, "resolved_by": str(payload.resolved_by),
+                     "resolution": payload.resolution,
+                     "resolved_by": str(resolved_by) if resolved_by else None,
                      "reason": payload.reason}).mappings().one()
                 insert_audit(connection, tenant_id, identity,
                              action="closure_impact.resolved", resource_type="closure",
                              resource_id=str(location_id),
                              reason=f"impact {payload.impact_id} resolved as {payload.resolution}",
                              request_id=request.state.request_id, changed_fields=["status", "resolution"])
-                return {
+                response = {
                     "id": str(updated["id"]), "appointment_id": str(updated["appointment_id"]),
                     "status": updated["status"], "resolution": updated["resolution"],
                     "resolved_at": str(updated["resolved_at"]),
-                    "resolved_by": str(updated["resolved_by"]),
-                    "resolution_reason": str(updated["resolution_reason"]),
+                    "resolved_by": str(updated["resolved_by"]) if updated["resolved_by"] else None,
+                    "resolution_reason": updated["resolution_reason"],
+                    "appointment_outcome": outcome,
                 }
+                connection.execute(
+                    text("""INSERT INTO closure_resolution_receipts
+                            (tenant_id, idempotency_key, impact_id, request_hash, response)
+                            VALUES (:tenant, :key, :impact_id, :fingerprint, CAST(:response AS jsonb))"""),
+                    {"tenant": str(tenant_id), "key": payload.idempotency_key,
+                     "impact_id": str(payload.impact_id), "fingerprint": fingerprint,
+                     "response": json.dumps(response)},
+                )
+                return response
         finally:
             engine.dispose()
     @app.get("/v1/tenants/{tenant_id}/closures/{location_id}/impacts/preview", tags=["closure"])
@@ -209,13 +320,25 @@ def register_closure_impacts_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "closures.read")
+                require_location_scope(connection, tenant_id, role, assigned, location_id)
+                published = connection.execute(
+                    text("""SELECT kind, opens_at, closes_at FROM location_exceptions
+                            WHERE tenant_id=:tenant AND location_id=:location
+                              AND exception_date=:date AND published_at IS NOT NULL"""),
+                    {"tenant": str(tenant_id), "location": str(location_id),
+                     "date": str(exception_date)},
+                ).mappings().one_or_none()
+                if published is None:
+                    raise HTTPException(status_code=404,
+                                        detail={"code": "published_closure_not_found"})
                 rows = connection.execute(
                     text("""SELECT a.id::text AS appointment_id, a.client_id::text AS client_id,
                                    a.staff_id::text AS staff_id, a.status,
-                                   a.starts_at, a.ends_at,
-                                   ci.id::text AS impact_id, ci.status AS impact_status
+                                   a.starts_at, a.ends_at, a.version AS appointment_version,
+                                   ci.id::text AS impact_id, ci.status AS impact_status,
+                                   ci.version AS impact_version
                             FROM appointments a
                             JOIN locations l ON l.tenant_id=a.tenant_id
                                             AND l.id=a.location_id
@@ -228,13 +351,20 @@ def register_closure_impacts_routes(
                               AND (a.starts_at AT TIME ZONE l.timezone)::date = :date
                               AND a.status IN ('pending_approval', 'confirmed',
                                                'checked_in', 'in_service')
+                              AND (:kind='closed' OR
+                                   CAST(a.starts_at AT TIME ZONE l.timezone AS time)<:opens_at OR
+                                   CAST(a.ends_at AT TIME ZONE l.timezone AS time)>:closes_at)
                             ORDER BY a.starts_at"""),
                     {"tenant": str(tenant_id), "location": str(location_id),
-                     "date": str(exception_date)}).mappings().all()
+                     "date": str(exception_date), "kind": published["kind"],
+                     "opens_at": published["opens_at"],
+                     "closes_at": published["closes_at"]}).mappings().all()
                 items = [
                     {"appointment_id": r["appointment_id"], "client_id": r["client_id"],
                      "staff_id": r["staff_id"], "status": r["status"],
                      "starts_at": r["starts_at"].isoformat(), "ends_at": r["ends_at"].isoformat(),
+                     "appointment_version": r["appointment_version"],
+                     "impact_version": r["impact_version"],
                      "impact_id": r["impact_id"], "impact_status": r["impact_status"]}
                     for r in rows
                 ]
@@ -253,8 +383,9 @@ def register_closure_impacts_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "closures.read")
+                require_location_scope(connection, tenant_id, role, assigned, location_id)
                 where_clause = (
                     "WHERE tenant_id=:tenant AND location_id=:location AND exception_date=:date"
                 )
@@ -303,8 +434,9 @@ def register_closure_impacts_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "closures.read")
+                require_location_scope(connection, tenant_id, role, assigned, location_id)
                 rows = connection.execute(
                     text("""SELECT id, appointment_id, location_id, exception_date,
                                 status, resolution, resolved_at, resolved_by,
@@ -372,14 +504,16 @@ def register_closure_impacts_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "communications.manage")
+                require_location_scope(connection, tenant_id, role, assigned, location_id)
                 impact = connection.execute(
                     text("""SELECT id::text AS id, appointment_id::text AS appointment_id,
                                    client_id::text AS client_id, status
                             FROM closure_impacts
-                            WHERE tenant_id=:tenant AND id=:id"""),
-                    {"tenant": str(tenant_id), "id": str(impact_id)}).mappings().one_or_none()
+                            WHERE tenant_id=:tenant AND location_id=:location AND id=:id"""),
+                    {"tenant": str(tenant_id), "location": str(location_id),
+                     "id": str(impact_id)}).mappings().one_or_none()
                 if impact is None:
                     raise HTTPException(status_code=404, detail={"code": "impact_not_found"})
                 contact = connection.execute(
@@ -452,8 +586,9 @@ def register_closure_impacts_routes(
         engine = app.state.engine_factory()
         try:
             with engine.begin() as connection:
-                role, _, _ = membership_scope(connection, tenant_id, identity)
+                role, _, assigned = membership_scope(connection, tenant_id, identity)
                 require_permission(role, "communications.manage")
+                require_location_scope(connection, tenant_id, role, assigned, location_id)
                 clients = connection.execute(
                     text("""SELECT DISTINCT c.id::text AS client_id FROM clients c
                             WHERE c.tenant_id=:tenant AND c.deleted_at IS NULL
@@ -463,13 +598,16 @@ def register_closure_impacts_routes(
                                        AND v.location_id=:loc))"""),
                     {"tenant": str(tenant_id), "loc": str(location_id)}).mappings().all()
                 recorded = skipped_consent = skipped_suppressed = unreachable = 0
+                contact_kind = "email" if channel == "email" else "phone"
                 for entry in clients:
                     contact = connection.execute(
                         text("""SELECT normalized_value FROM client_contacts
                                 WHERE tenant_id=:tenant AND client_id=:client
+                                  AND kind=:kind
                                 ORDER BY is_primary DESC, created_at LIMIT 1"""),
                         {"tenant": str(tenant_id),
-                         "client": entry["client_id"]}).mappings().one_or_none()
+                         "client": entry["client_id"],
+                         "kind": contact_kind}).mappings().one_or_none()
                     if contact is None:
                         unreachable += 1
                         continue

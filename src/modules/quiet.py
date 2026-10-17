@@ -5,10 +5,10 @@
   sends inside quiet defer to its end (still useful) or expire past it (the
   expired gate catches them next run); over-cap sends defer a day. The
   emergency stop defers everything, visibly.
-- AC-2: fallback fires only on defined failure — a message that exhausted
-  retries — and only to a separately eligible channel (its own consent and
-  suppression state). An ambiguous provider timeout takes the retry path,
-  never a fallback, so nothing blasts a second channel on a maybe. Manual
+- AC-2: fallback fires only after a provider's explicit definitive rejection,
+  and only to a separately eligible channel (its own consent and suppression
+  state). An ambiguous provider timeout takes the retry path, including after
+  retries exhaust, so nothing blasts a second channel on a maybe. Manual
   retries refuse opted-out contacts. Consent writes and dispatch checks share
   the dispatch transaction, so the unsubscribe race cannot slip between them.
 
@@ -37,6 +37,8 @@ __all__ = [
 ]
 
 DEFAULT_PRIMARY_CHANNEL = "email"
+DEFAULT_QUIET_START = time(21, 0)
+DEFAULT_QUIET_END = time(8, 0)
 
 
 class QuietModuleError(Exception):
@@ -44,14 +46,17 @@ class QuietModuleError(Exception):
 
 
 def load_messaging_settings(connection, *, tenant_id: str) -> dict:
-    """Tenant settings; an unset quiet window means no enforcement."""
+    """Tenant settings; absent rows use the product quiet-window default.
+
+    A persisted row with both quiet values NULL is the explicit opt-out.
+    """
     row = connection.execute(
         text("""SELECT quiet_start, quiet_end, emergency_stop,
                        max_per_recipient_per_day FROM messaging_settings
                 WHERE tenant_id=:tenant"""),
         {"tenant": tenant_id}).mappings().one_or_none()
     if row is None:
-        return {"quiet_start": None, "quiet_end": None,
+        return {"quiet_start": DEFAULT_QUIET_START, "quiet_end": DEFAULT_QUIET_END,
                 "emergency_stop": False, "max_per_recipient_per_day": None}
     return {"quiet_start": row["quiet_start"], "quiet_end": row["quiet_end"],
             "emergency_stop": row["emergency_stop"],
@@ -76,9 +81,10 @@ def resolve_primary_channel(connection, *, tenant_id: str, client_id: str,
                     WHERE tenant_id=:tenant AND client_id=:client AND purpose='default'"""),
             {"tenant": tenant_id, "client": client_id}).mappings().one_or_none()
     if row is None:
-        return {"primary_channel": DEFAULT_PRIMARY_CHANNEL, "fallback_channel": None}
+        return {"primary_channel": DEFAULT_PRIMARY_CHANNEL, "fallback_channel": None,
+                "configured": False}
     return {"primary_channel": row["primary_channel"],
-            "fallback_channel": row["fallback_channel"]}
+            "fallback_channel": row["fallback_channel"], "configured": True}
 
 
 def _location_now(connection, *, tenant_id: str, now: datetime):
@@ -97,8 +103,8 @@ def _location_now(connection, *, tenant_id: str, now: datetime):
 def in_quiet_hours(quiet_start: time | None, quiet_end: time | None, local_now) -> bool:
     """True inside the window, including overnight wraps (21:00-08:00).
 
-    An unset window (None) never quiets: sends proceed and no test depends
-    on the wall clock unless it configures a window explicitly.
+    Both values must be set; a persisted pair of None values explicitly turns
+    the default quiet window off.
     """
     if quiet_start is None or quiet_end is None:
         return False
@@ -127,13 +133,13 @@ def defer_past_quiet(connection, *, tenant_id: str, communication_id: str,
 
 def try_fallback_on_exhaustion(connection, *, tenant_id: str, comm: dict,
                                now: datetime) -> dict | None:
-    """Record a fallback-channel send after retries exhausted (AC-2).
+    """Record a fallback after the provider definitively rejected a send (AC-2).
 
     Returns the new communication row, or None when no fallback applies:
     none configured, same channel, or the fallback channel ineligible
     (consent/suppression checked separately here — never inherited from the
-    failed channel). Ambiguous timeouts never reach this function; they ride
-    the retry path instead.
+    failed channel). Ambiguous outcomes never reach this function, even after
+    retries exhaust; they remain in the dead-letter/manual-review path.
     """
     from modules.communications.consent import check_consented, check_suppressed
     prefs = resolve_primary_channel(connection, tenant_id=tenant_id,
@@ -148,8 +154,8 @@ def try_fallback_on_exhaustion(connection, *, tenant_id: str, comm: dict,
     want_kind = "phone" if fallback in ("sms", "whatsapp") else "email"
     contact = connection.execute(
         text("""SELECT normalized_value FROM client_contacts
-                WHERE tenant_id=:tenant AND client_id=:client
-                ORDER BY (kind = :kind) DESC, is_primary DESC, created_at LIMIT 1"""),
+                WHERE tenant_id=:tenant AND client_id=:client AND kind=:kind
+                ORDER BY is_primary DESC, created_at LIMIT 1"""),
         {"tenant": tenant_id, "client": comm["client_id"], "kind": want_kind},
     ).mappings().one_or_none()
     if contact is None:
@@ -160,20 +166,22 @@ def try_fallback_on_exhaustion(connection, *, tenant_id: str, comm: dict,
     if check_suppressed(connection, tenant_id=tenant_id,
                         contact_value=contact["normalized_value"], channel=fallback):
         return None
-    key = f"appointment:{comm['source_id']}:{comm['purpose']}:v{comm['expected_entity_version']}:{fallback}"
+    key = (f"{comm['source_type']}:{comm['source_id']}:{comm['purpose']}"
+           f":v{comm['expected_entity_version']}:{fallback}:{comm['client_id']}:fallback")
     row = connection.execute(
         text("""INSERT INTO communications
                 (tenant_id, id, client_id, contact_value, channel, purpose,
-                 source_type, source_id, expected_entity_version, state,
+                 source_type, source_id, expected_entity_version, fallback_of, state,
                  scheduled_at, expires_at, dedupe_key, trace_id)
                 VALUES (:tenant, :id, :client, :contact, :channel, :purpose,
-                        'appointment', :source, :version, 'recorded',
+                        :source_type, :source, :version, :fallback_of, 'recorded',
                         :scheduled, :expires, :dedupe, :trace)
                 ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
                 RETURNING id::text AS id"""),
         {"tenant": tenant_id, "id": str(uuid.uuid4()), "client": comm["client_id"],
          "contact": contact["normalized_value"], "channel": fallback,
-         "purpose": comm["purpose"], "source": comm["source_id"],
+         "purpose": comm["purpose"], "source_type": comm["source_type"],
+         "source": comm["source_id"], "fallback_of": comm["id"],
          "version": comm["expected_entity_version"], "scheduled": now.isoformat(),
          "expires": comm["expires_at"].isoformat() if comm["expires_at"] else None,
          "dedupe": key, "trace": comm.get("trace_id")},
