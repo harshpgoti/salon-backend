@@ -1,17 +1,19 @@
 """Run the QA-critical pytest subset and record reviewable evidence (TASK-056).
 
 The subset is the security/load/fault slice that G-QA acceptance depends on.
-Each file runs in its own pytest process so the combined run cannot leak
-session state between files (CI round 2, 2026-10-18: a single-process combined
-run showed 11 dispatch-dependent failures in later files while the full suite
-was green). Tests emit `[qa-evidence] {json}` lines; this runner forwards all
-output to the CI log, collects the metric lines, records the runner
-environment, per-file results, and writes `qa-evidence.json` for the workflow
-artifact.
+Each file runs in its own pytest process so results are attributable per file
+and one file's session state cannot leak into the next. Round 2's 11
+dispatch-dependent failures were not cross-file interference: this job lacked
+`WEB_BASE_URL`, which every email send requires to mint its unsubscribe link
+(the full suite only passed because an unrelated test sets it process-wide);
+the job now declares it, like production does. Tests emit `[qa-evidence] {json}`
+lines; this runner forwards all output to the CI log, collects the metric
+lines, records the runner environment, per-file results, and writes
+`qa-evidence.json` for the workflow artifact.
 
 Exit status is 0 only when every file passes and every required metric was
 emitted. Connection URLs are never printed or persisted; only the fact that
-DATABASE_URL was set is recorded.
+DATABASE_URL/WEB_BASE_URL were set is recorded.
 """
 
 from __future__ import annotations
@@ -59,6 +61,7 @@ def _runner_environment() -> dict:
         "cpu_count": os.cpu_count(),
         "memory_mb": _memory_mb(),
         "database_url_configured": bool(os.environ.get("DATABASE_URL")),
+        "web_base_url_configured": bool(os.environ.get("WEB_BASE_URL")),
     }
 
 
@@ -81,9 +84,10 @@ def main() -> int:
         for line in process.stdout:
             print(line, end="", flush=True)
             stripped = line.strip()
-            if stripped.startswith(MARKER):
+            marker_at = stripped.find(MARKER)
+            if marker_at >= 0:
                 try:
-                    metrics.append(json.loads(stripped[len(MARKER):]))
+                    metrics.append(json.loads(stripped[marker_at + len(MARKER):]))
                 except json.JSONDecodeError:
                     print(f"qa-evidence: unparsable metric line ignored: {stripped}", flush=True)
             elif " passed" in stripped or " failed" in stripped or " error" in stripped:
