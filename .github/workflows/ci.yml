@@ -65,6 +65,53 @@ jobs:
         run: |
           python -m pip install pip-audit
           pip-audit
+  qa-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DEMO_DATABASE_URL: postgresql+psycopg://salon_app:local-dev-only@127.0.0.1:5435/salon_demo
+      DATABASE_URL: postgresql+psycopg://salon_app:local-dev-only@127.0.0.1:5432/salon
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Start PostgreSQL 17 sized for the 100-contender race
+        run: |
+          docker run -d --name qa-postgres \
+            -e POSTGRES_DB=salon -e POSTGRES_USER=salon -e POSTGRES_PASSWORD=local-dev-only \
+            -p 5432:5432 -p 5435:5432 postgres:17 -c max_connections=300
+          for i in $(seq 1 30); do
+            if docker exec qa-postgres pg_isready -h 127.0.0.1 -U salon -d salon; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready" >&2
+          docker logs qa-postgres
+          exit 1
+      - run: python -m pip install --upgrade pip==26.2.1
+      - run: python -m pip install --constraint constraints.txt '.[test]'
+      - name: Apply every migration to both synthetic databases
+        env:
+          PGPASSWORD: local-dev-only
+        run: |
+          psql -h 127.0.0.1 -U salon -d salon -c 'CREATE DATABASE salon_demo;'
+          for migration in db/migrations/*.sql; do
+            psql -h 127.0.0.1 -U salon -d salon -v ON_ERROR_STOP=1 -f "$migration"
+          done
+          for migration in db/migrations/*.sql; do
+            psql -h 127.0.0.1 -p 5435 -U salon -d salon_demo -v ON_ERROR_STOP=1 -f "$migration"
+          done
+      - name: Verify non-owner runtime role
+        run: python scripts/check_database.py
+      - name: Run QA-critical subset and record load/fault evidence
+        run: python scripts/qa_evidence.py --output qa-evidence.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: qa-evidence
+          path: qa-evidence.json
   container:
     runs-on: ubuntu-latest
     steps:
