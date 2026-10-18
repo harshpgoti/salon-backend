@@ -1,11 +1,15 @@
 """Run the QA-critical pytest subset and record reviewable evidence (TASK-056).
 
 The subset is the security/load/fault slice that G-QA acceptance depends on.
-Tests emit `[qa-evidence] {json}` lines; this runner forwards all output to the
-CI log, collects the metric lines, records the runner environment next to them
-and writes `qa-evidence.json` for the workflow artifact.
+Each file runs in its own pytest process so the combined run cannot leak
+session state between files (CI round 2, 2026-10-18: a single-process combined
+run showed 11 dispatch-dependent failures in later files while the full suite
+was green). Tests emit `[qa-evidence] {json}` lines; this runner forwards all
+output to the CI log, collects the metric lines, records the runner
+environment, per-file results, and writes `qa-evidence.json` for the workflow
+artifact.
 
-Exit status is 0 only when the subset passes and every required metric was
+Exit status is 0 only when every file passes and every required metric was
 emitted. Connection URLs are never printed or persisted; only the fact that
 DATABASE_URL was set is recorded.
 """
@@ -63,24 +67,32 @@ def main() -> int:
     parser.add_argument("--output", default="qa-evidence.json")
     args = parser.parse_args()
 
-    command = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-s", *SUBSET]
-    print("qa-evidence: running", " ".join(command), flush=True)
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               text=True, encoding="utf-8", errors="replace")
     metrics: list[dict] = []
-    summary_lines: list[str] = []
-    assert process.stdout is not None
-    for line in process.stdout:
-        print(line, end="", flush=True)
-        stripped = line.strip()
-        if stripped.startswith(MARKER):
-            try:
-                metrics.append(json.loads(stripped[len(MARKER):]))
-            except json.JSONDecodeError:
-                print(f"qa-evidence: unparsable metric line ignored: {stripped}", flush=True)
-        elif " passed" in stripped or " failed" in stripped or " error" in stripped:
-            summary_lines.append(stripped)
-    exit_code = process.wait()
+    files: list[dict] = []
+    exit_code = 0
+    for path in SUBSET:
+        command = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                   "-s", path]
+        print("qa-evidence: running", " ".join(command), flush=True)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="replace")
+        summary_lines: list[str] = []
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            stripped = line.strip()
+            if stripped.startswith(MARKER):
+                try:
+                    metrics.append(json.loads(stripped[len(MARKER):]))
+                except json.JSONDecodeError:
+                    print(f"qa-evidence: unparsable metric line ignored: {stripped}", flush=True)
+            elif " passed" in stripped or " failed" in stripped or " error" in stripped:
+                summary_lines.append(stripped)
+        file_code = process.wait()
+        files.append({"path": path, "exit_code": file_code,
+                      "pytest_summary": summary_lines[-1:]})
+        if file_code != 0 and exit_code == 0:
+            exit_code = file_code
 
     names = {metric.get("metric") for metric in metrics}
     missing = sorted(REQUIRED_METRICS - names)
@@ -89,8 +101,9 @@ def main() -> int:
         "requirement": "FR-082",
         "runner": _runner_environment(),
         "subset": SUBSET,
+        "files": files,
         "pytest_exit_code": exit_code,
-        "pytest_summary": summary_lines[-3:],
+        "pytest_summary": [entry for f in files for entry in f["pytest_summary"]][-3:],
         "metrics": metrics,
         "missing_required_metrics": missing,
         "ok": exit_code == 0 and not missing,
