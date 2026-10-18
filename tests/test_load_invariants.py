@@ -160,7 +160,10 @@ def test_mixed_load_four_tenants_book_hold_read_without_starvation(database_url)
                 "service_id": service,
                 "date_from": (date.today() + timedelta(days=1)).isoformat(),
                 "date_to": (date.today() + timedelta(days=1)).isoformat()}).json()["slots"]
-            assert len(slots) >= 2, "fixture must expose at least two slots"
+            # slots[0] and slots[4] are four grid steps apart, so a 60-minute
+            # service booked at slots[0] never overlaps a hold at slots[4]
+            # (same pairing as test_booking_holds.py's management-scope test).
+            assert len(slots) >= 5, "fixture must expose at least five slots"
             tenants.append((issuer, engine, owner, tenant))
             seeders.append(seeder)
             fixtures.append({"slug": slug, "service": service, "staff": staff,
@@ -198,7 +201,7 @@ def test_mixed_load_four_tenants_book_hold_read_without_starvation(database_url)
             fixture = fixtures[index]
             resp = client.post(f"/v1/public/salons/{fixture['slug']}/holds", json={
                 "service_id": fixture["service"], "staff_id": fixture["staff"],
-                "starts_at": fixture["slots"][1]["starts_at"],
+                "starts_at": fixture["slots"][4]["starts_at"],
                 "idempotency_key": f"mixed-hold-{uuid.uuid4().hex}"})
             return resp.status_code
 
@@ -241,7 +244,7 @@ def test_mixed_load_four_tenants_book_hold_read_without_starvation(database_url)
         _evidence("qa_mixed.fairness", {
             "tenants": len(tenants), "threads": len(threads), "responses": len(results),
             "data_volume": {"tenants": len(tenants), "services_per_tenant": 1,
-                            "staff_per_tenant": 1, "slots_per_tenant": 2},
+                            "staff_per_tenant": 1, "slots_reserved_per_tenant": 2},
             "starved_tenants": starved, "server_errors": len(server_errors),
             "mutation_p95_ms": mutation_p95, "threshold_mutation_p95_ms": MUTATION_P95_MS,
             "read_p95_ms": read_p95, "threshold_read_p95_ms": READ_P95_MS,
